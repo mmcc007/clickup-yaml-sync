@@ -472,17 +472,24 @@ def _all_yaml_story_ids(data: dict) -> set[str]:
 
 def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
     """Push stories to ClickUp as flat top-level tasks with an epic tag.
-    Epics exist only in YAML — they are NOT created in ClickUp."""
+    Epics exist only in YAML — they are NOT created in ClickUp.
+    Uses a single bulk fetch to build an in-memory index, then only
+    makes PUT calls for stories that actually differ."""
     token = get_clickup_token()
     list_id = data["project"]["clickup_list_id"]
     status_map = data.get("status_map", {})
     stats = {"created": 0, "updated": 0, "unchanged": 0, "errors": 0}
 
+    # Bulk fetch all ClickUp tasks once — avoids N individual GET calls
+    log.info("Fetching all tasks from ClickUp...")
+    cu_tasks = clickup_list_tasks(token, list_id)
+    cu_by_id = {t["id"]: t for t in cu_tasks}
+    log.info(f"Fetched {len(cu_tasks)} tasks")
+
     for epic in data["epics"]:
         epic_name = epic["name"]
         tag = _epic_tag(epic)
         epic_priority = epic.get("priority")
-        log.info(f"--- Epic {epic.get('number', '?')}: {epic_name} [{tag}] ---")
 
         for story in epic.get("stories", []):
             story_name = story["name"]
@@ -498,7 +505,6 @@ def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
                         resp = clickup_create_task(token, list_id, body)
                         story["clickup_id"] = resp["id"]
                         story["task_id"] = resp.get("custom_id")
-                        # Inherit epic priority into story YAML
                         if "priority" not in story and epic_priority is not None:
                             story["priority"] = epic_priority
                         save_yaml(data, yaml_path)  # incremental save
@@ -509,34 +515,38 @@ def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
                         log.error(f"  Failed to create {story_name}: {e}")
                         stats["errors"] += 1
             else:
-                # UPDATE story if changed
-                try:
-                    cu_task = clickup_get_task(token, story["clickup_id"])
-                    _sync_metadata(story, cu_task)
-                    # Inherit epic priority if story has none
-                    if "priority" not in story and epic_priority is not None:
-                        story["priority"] = epic_priority
-                    diffs = compare_task(story, cu_task, status_map)
-                    if diffs:
-                        update_body = build_task_body(story, status_map,
-                                                      default_priority=epic_priority)
-                        if dry_run:
-                            for d in diffs:
-                                log.info(f"  [DRY RUN] Would update {story_name} "
-                                         f"field '{d['field']}': "
-                                         f"'{d['clickup']}' -> '{d['yaml']}'")
-                        else:
+                # UPDATE story if changed — compare against in-memory index
+                cu_task = cu_by_id.get(story["clickup_id"])
+                if cu_task is None:
+                    log.warning(f"  Story not found in ClickUp: {story_name} ({story['clickup_id']})")
+                    stats["errors"] += 1
+                    continue
+                _sync_metadata(story, cu_task)
+                if "priority" not in story and epic_priority is not None:
+                    story["priority"] = epic_priority
+                diffs = compare_task(story, cu_task, status_map)
+                if diffs:
+                    update_body = build_task_body(story, status_map,
+                                                  default_priority=epic_priority)
+                    if dry_run:
+                        for d in diffs:
+                            log.info(f"  [DRY RUN] Would update {story_name} "
+                                     f"field '{d['field']}': "
+                                     f"'{d['clickup']}' -> '{d['yaml']}'")
+                    else:
+                        try:
                             clickup_update_task(token, story["clickup_id"], update_body)
                             for d in diffs:
                                 log.info(f"  Updated {story_name} "
                                          f"field '{d['field']}': "
                                          f"'{d['clickup']}' -> '{d['yaml']}'")
-                        stats["updated"] += 1
-                    else:
-                        stats["unchanged"] += 1
-                except Exception as e:
-                    log.error(f"  Failed to update {story_name}: {e}")
-                    stats["errors"] += 1
+                        except Exception as e:
+                            log.error(f"  Failed to update {story_name}: {e}")
+                            stats["errors"] += 1
+                            continue
+                    stats["updated"] += 1
+                else:
+                    stats["unchanged"] += 1
 
     if not dry_run:
         save_yaml(data, yaml_path)
