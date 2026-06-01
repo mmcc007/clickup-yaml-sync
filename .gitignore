@@ -4,4 +4,5 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 ~/tmp/clickup_sync.log

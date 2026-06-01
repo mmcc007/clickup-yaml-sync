@@ -1,0 +1,226 @@
+# JSON Schema (YAML format) for clickup-yaml-sync project files
+# Validate with: python3 -c "import jsonschema, yaml; jsonschema.validate(yaml.safe_load(open('project.yaml')), yaml.safe_load(open('schema.yaml')))"
+# Or install: pip install jsonschema pyyaml
+
+$schema: "http://json-schema.org/draft-07/schema#"
+title: ClickUp YAML Project File
+description: Project definition file for bidirectional sync with ClickUp
+
+type: object
+required: [project, status_map, epics]
+additionalProperties: true
+
+properties:
+
+  project:
+    type: object
+    required: [name, clickup_list_id]
+    additionalProperties: true
+    properties:
+      name:
+        type: string
+        description: Human-readable project name
+        example: "Tim Draper Digital Persona"
+      clickup_list_id:
+        type: string
+        description: ClickUp list ID to sync with (find in the list URL)
+        pattern: "^[0-9]+$"
+        example: "901414096256"
+      last_synced:
+        type: [string, "null"]
+        description: ISO 8601 timestamp of last sync (auto-updated by the tool)
+        example: "2026-02-22T05:42:47+00:00"
+      epic_dropdown_field_id:
+        type: [string, "null"]
+        description: >
+          Optional UUID of a ClickUp single-select dropdown custom field that
+          mirrors the Epic axis (e.g., a PM-curated "Epic" field on the list).
+          When set together with epic_dropdown_options, push writes each
+          story's epic name to the matching option on every push.
+        example: "eb53bc71-c0c7-40ed-93cb-7f0b993900e6"
+      epic_dropdown_options:
+        type: object
+        description: >
+          Mapping from epic name (matches epics[].name, case-insensitive) to
+          the ClickUp dropdown option UUID. Skipped silently if not provided.
+          Story-level epic_dropdown_value overrides the epic name lookup.
+        additionalProperties:
+          type: string
+        example:
+          "Relationship Signal Automation": "f110326a-b184-44bd-8880-ddd503d3e8c9"
+          "Magnit Monitoring System": "85bf365b-d601-40a2-be5a-c5f1ba8ef280"
+          "Infrastructure + CRM": "de5b8e45-e45e-482e-9c05-5764e2d2b8f9"
+          "Kickoff / Access": "12d207f1-78c9-466f-9078-9ca726cd907e"
+      notes:
+        type: [string, "null"]
+        description: Free-form notes about the project (not pushed to ClickUp).
+
+  status_map:
+    type: object
+    description: >
+      Mapping from YAML status keys (used in this file) to ClickUp status names
+      (as they appear in ClickUp). Keys are used in story/epic status fields.
+    additionalProperties:
+      type: string
+    example:
+      done: "done"
+      in_progress: "current sprint"
+      upcoming_sprint: "upcoming sprint"
+      backlog: "backlog"
+
+  epics:
+    type: array
+    description: >
+      Epics are YAML-only groupings — they are NOT created in ClickUp.
+      Stories within epics become flat top-level ClickUp tasks, tagged with
+      their epic name for grouping.
+    items:
+      type: object
+      required: [name, status, points, stories]
+      additionalProperties: true
+      properties:
+
+        number:
+          type: [integer, "null"]
+          description: Epic sequence number (for display only)
+          example: 1
+
+        name:
+          type: string
+          description: >
+            Epic name. Also used as the ClickUp tag applied to all stories
+            in this epic. Must be unique across epics.
+          example: "Core RAG Pipeline"
+
+        status:
+          type: string
+          description: Epic status (must be a key defined in status_map)
+          enum: [done, in_progress, upcoming_sprint, backlog]
+
+        points:
+          type: integer
+          description: Story point total for the epic
+          minimum: 0
+          example: 21
+
+        priority:
+          type: [integer, "null"]
+          description: "ClickUp priority: 1=urgent, 2=high, 3=normal, 4=low"
+          enum: [1, 2, 3, 4, null]
+
+        sprint:
+          type: [integer, "null"]
+          description: Sprint number this epic is planned for
+          example: 1
+
+        pr:
+          type: [string, "null"]
+          description: PR reference(s) associated with this epic
+          example: "#1"
+
+        milestone:
+          type: boolean
+          description: Whether this epic is a milestone
+          default: false
+
+        description:
+          type: [string, "null"]
+          description: Epic description (markdown supported)
+
+        stories:
+          type: array
+          description: >
+            Stories within this epic. Each story becomes a flat top-level
+            ClickUp task tagged with the epic name.
+          items:
+            type: object
+            required: [name, status, points]
+            additionalProperties: true
+            properties:
+
+              name:
+                type: string
+                description: >
+                  Story title. Convention: "As a <role>, I want <feature>
+                  so that <benefit>"
+                example: "As a developer, I want X so that Y"
+
+              clickup_id:
+                type: [string, "null"]
+                description: >
+                  ClickUp internal task ID (e.g. "86b8f2a23"). Populated
+                  automatically after first push. Set to null for new stories
+                  not yet created in ClickUp. NEVER use placeholder values
+                  like "tbd" — use null.
+                example: "86b8f2a23"
+
+              task_id:
+                type: [string, "null"]
+                description: >
+                  ClickUp custom task ID (e.g. "TASK-6593"). Populated
+                  automatically after first push.
+                example: "TASK-6593"
+
+              points:
+                type: integer
+                description: Story point estimate
+                minimum: 0
+                example: 5
+
+              status:
+                type: string
+                description: Story status (must be a key defined in status_map)
+                enum: [done, in_progress, upcoming_sprint, backlog]
+
+              priority:
+                type: [integer, "null"]
+                description: "ClickUp priority: 1=urgent, 2=high, 3=normal, 4=low. Inherits from epic if not set."
+                enum: [1, 2, 3, 4, null]
+
+              milestone:
+                type: boolean
+                description: Whether this story is a milestone task in ClickUp
+                default: false
+
+              milestone_label:
+                type: [string, "null"]
+                description: >
+                  Optional SOW billing milestone slug (M0/M1/M2/M3). When set,
+                  push appends a lowercased tag (M1 -> `m1`) to the story's
+                  tag set, on top of the epic-name tag and any explicit tags[].
+                  Purely a convenience over manually adding the slug to tags[].
+                enum: [M0, M1, M2, M3, null]
+                example: "M1"
+
+              tags:
+                type: array
+                description: >
+                  Additional ClickUp tags to apply to the story (in addition
+                  to the epic-name tag and the milestone_label slug). All
+                  three sources merge; duplicates are removed case-insensitively.
+                  Pre-existing tags on the ClickUp task that ARE NOT in this
+                  set are preserved (so UI-added tags survive). The exception:
+                  tags that are part of the YAML's "managed tag universe"
+                  (epic names + milestone slugs) but not on THIS story are
+                  treated as stale and removed — that's how epic/milestone
+                  reassignments take effect.
+                items:
+                  type: string
+                example: ["signal-automation", "slack", "security"]
+
+              epic_dropdown_value:
+                type: [string, "null"]
+                description: >
+                  Optional override for the Epic dropdown lookup. If unset,
+                  the parent epic's name is used to find the dropdown option.
+                  Set this when a story belongs (visually) to one epic but
+                  should be tagged as a different epic in Clarisse's field.
+
+              archived_in_clickup:
+                type: boolean
+                description: Set to true by pull command when task is deleted from ClickUp but remains in YAML
+                default: false
+
+              description:
+                type: [string, "null"]
+                description: Story description (markdown supported)

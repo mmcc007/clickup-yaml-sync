@@ -202,6 +202,19 @@ def clickup_remove_tag(token: str, task_id: str, tag_name: str) -> dict:
     return _api_request("DELETE", url, token)
 
 
+def clickup_set_custom_field(
+    token: str, task_id: str, field_id: str, value: Any
+) -> dict:
+    """Set a custom field value on a task.
+
+    For dropdown fields, `value` is the option UUID string. ClickUp accepts
+    the same endpoint for checkbox, text, number, etc. — caller picks the
+    correct value shape.
+    """
+    url = f"{CLICKUP_BASE}/task/{task_id}/field/{field_id}"
+    return _api_request("POST", url, token, {"value": value})
+
+
 def clickup_list_tasks(token: str, list_id: str, page: int = 0) -> list[dict]:
     """Fetch all tasks from a ClickUp list (with pagination and subtasks)."""
     all_tasks: list[dict] = []
@@ -433,25 +446,195 @@ def _has_tag(cu_task: dict, tag_name: str) -> bool:
     return False
 
 
-def _sync_tags(token: str, task_id: str, cu_task: dict, desired_tag: str) -> None:
-    """Replace epic tags on a task with the desired tag.
-    Removes old epic-pattern tags (E<number>) and any stale epic name tags."""
-    current_tags = cu_task.get("tags", [])
-    for tag in current_tags:
+def _current_tag_names(cu_task: dict) -> list[str]:
+    """Extract the list of tag names currently on a ClickUp task."""
+    names: list[str] = []
+    for tag in cu_task.get("tags", []):
         name = tag.get("name", "") if isinstance(tag, dict) else str(tag)
-        # Remove old E<number> pattern tags
-        if name.upper().startswith("E") and name[1:].isdigit():
+        if name:
+            names.append(name)
+    return names
+
+
+def _sync_tags(
+    token: str,
+    task_id: str,
+    cu_task: dict,
+    desired_tags: list[str],
+    managed_known_tags: Optional[set[str]] = None,
+) -> None:
+    """Reconcile a ClickUp task's tags to match ``desired_tags`` additively.
+
+    Semantics (changed 2026-06-01 — multi-tag push):
+
+    - All tags in ``desired_tags`` are added if missing.
+    - Pre-existing ClickUp tags NOT in ``desired_tags`` are PRESERVED by
+      default — we don't strip tags a human added in the ClickUp UI.
+    - ``managed_known_tags`` (optional) names the universe of tags this tool
+      manages (e.g. every epic name + every milestone slug in the YAML). A
+      pre-existing tag that's IN this universe but NOT in ``desired_tags``
+      for THIS story IS treated as stale and removed. That's how an epic
+      reassignment in YAML removes the old epic tag.
+    - The legacy ``E<number>`` epic-pattern tags (E1, E2, …) are always
+      stripped — leftover from the pre-multi-tag schema.
+    """
+    desired_lower = {t.lower() for t in desired_tags}
+    managed_lower = {t.lower() for t in (managed_known_tags or set())}
+
+    current_names = _current_tag_names(cu_task)
+
+    # Remove stale tags
+    for name in current_names:
+        name_lower = name.lower()
+        if name_lower in desired_lower:
+            continue
+        is_legacy_epic = (
+            name.upper().startswith("E")
+            and len(name) > 1
+            and name[1:].isdigit()
+        )
+        is_managed_stale = name_lower in managed_lower
+        if is_legacy_epic or is_managed_stale:
             try:
                 clickup_remove_tag(token, task_id, name)
-                log.info(f"    Removed old tag '{name}'")
-            except Exception:
-                pass
-    # Add desired tag if not already present
-    if not _has_tag(cu_task, desired_tag):
+                log.info(f"    Removed stale tag '{name}'")
+            except Exception as e:
+                log.warning(f"    Failed to remove tag '{name}': {e}")
+
+    # Add desired tags
+    current_lower = {n.lower() for n in current_names}
+    for tag in desired_tags:
+        if tag.lower() in current_lower:
+            continue
         try:
-            clickup_add_tag(token, task_id, desired_tag)
+            clickup_add_tag(token, task_id, tag)
+            log.info(f"    Added tag '{tag}'")
         except Exception as e:
-            log.warning(f"    Failed to add tag '{desired_tag}': {e}")
+            log.warning(f"    Failed to add tag '{tag}': {e}")
+
+
+# ---------------------------------------------------------------------------
+# Tag + milestone + custom-field resolution
+# ---------------------------------------------------------------------------
+
+
+VALID_MILESTONE_LABELS = ("M0", "M1", "M2", "M3")
+
+
+def _story_desired_tags(story: dict, epic: dict) -> list[str]:
+    """Compute the desired tag set for one story (multi-tag, additive).
+
+    Order of precedence (deduped, case-insensitive, original case preserved):
+      1. epic name (always present — preserves prior behavior)
+      2. story.tags[] from YAML
+      3. lowercase milestone slug from story.milestone_label (M1 -> ``m1``)
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(tag: Optional[str]) -> None:
+        if not tag:
+            return
+        key = tag.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(tag)
+
+    _add(_epic_tag(epic))
+    for t in story.get("tags") or []:
+        if isinstance(t, str):
+            _add(t)
+    ms = story.get("milestone_label")
+    if isinstance(ms, str) and ms.strip():
+        _add(ms.strip().lower())
+    return out
+
+
+def _collect_managed_tag_universe(data: dict) -> set[str]:
+    """All tags this tool considers under its management — used to decide
+    which pre-existing ClickUp tags are stale vs untouched UI additions."""
+    universe: set[str] = set()
+    for epic in data.get("epics", []) or []:
+        ename = epic.get("name")
+        if ename:
+            universe.add(ename.lower())
+        for story in epic.get("stories", []) or []:
+            for t in story.get("tags") or []:
+                if isinstance(t, str) and t:
+                    universe.add(t.lower())
+            ms = story.get("milestone_label")
+            if isinstance(ms, str) and ms.strip():
+                universe.add(ms.strip().lower())
+    # Always treat lowercased milestone slugs as managed even if no story
+    # currently uses them — so removing a milestone_label from YAML strips
+    # the tag on next push.
+    for ms in VALID_MILESTONE_LABELS:
+        universe.add(ms.lower())
+    return universe
+
+
+def _epic_dropdown_value_for(story: dict, epic: dict, project_cfg: dict) -> Optional[tuple[str, str]]:
+    """Resolve (field_id, option_id) for the Epic custom dropdown, if any.
+
+    Returns None when the YAML doesn't configure the dropdown, when the epic
+    name has no matching option, or when the field id is missing.
+    """
+    field_id = project_cfg.get("epic_dropdown_field_id")
+    options = project_cfg.get("epic_dropdown_options") or {}
+    if not field_id or not options:
+        return None
+    # Story-level override wins; otherwise infer from epic.
+    epic_name = story.get("epic_dropdown_value") or epic.get("name")
+    if not epic_name:
+        return None
+    # Case-insensitive option lookup so YAML capitalization is forgiving.
+    options_lower = {k.lower(): v for k, v in options.items()}
+    option_id = options_lower.get(epic_name.lower())
+    if not option_id:
+        return None
+    return (field_id, option_id)
+
+
+def _current_custom_field_value(cu_task: dict, field_id: str) -> Optional[str]:
+    """Read the current value of a custom field off a ClickUp task payload."""
+    for f in cu_task.get("custom_fields", []) or []:
+        if f.get("id") == field_id:
+            return f.get("value")
+    return None
+
+
+def _push_epic_dropdown_if_needed(
+    token: str,
+    task_id: str,
+    cu_task: dict,
+    story: dict,
+    epic: dict,
+    project_cfg: dict,
+    dry_run: bool,
+) -> bool:
+    """Push the Epic dropdown option to ClickUp if YAML differs. Returns True
+    if a write was attempted (or would have been, in dry-run). Silently noop
+    when the YAML doesn't define the dropdown."""
+    resolved = _epic_dropdown_value_for(story, epic, project_cfg)
+    if not resolved:
+        return False
+    field_id, option_id = resolved
+    current = _current_custom_field_value(cu_task, field_id)
+    if current == option_id:
+        return False
+    if dry_run:
+        log.info(
+            f"    [DRY RUN] Would set Epic dropdown {field_id} -> {option_id}"
+        )
+        return True
+    try:
+        clickup_set_custom_field(token, task_id, field_id, option_id)
+        log.info(f"    Set Epic dropdown ({field_id}) -> {option_id}")
+        return True
+    except Exception as e:
+        log.warning(f"    Failed to set Epic dropdown: {e}")
+        return False
 
 
 def _all_yaml_story_ids(data: dict) -> set[str]:
@@ -466,11 +649,131 @@ def _all_yaml_story_ids(data: dict) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Backup-before-push
+# ---------------------------------------------------------------------------
+
+
+# Sentinel indicating ``--backup-to`` was passed with no explicit path —
+# resolve to the default location at write time.
+BACKUP_DEFAULT_SENTINEL = "__DEFAULT__"
+
+
+def _default_backup_path(list_id: str) -> Path:
+    """Default backup location: ``~/tmp/clickup-backup-<list_id>-<iso>.yaml``."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = Path.home() / "tmp"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    return backup_dir / f"clickup-backup-{list_id}-{ts}.yaml"
+
+
+def _build_backup_snapshot(data: dict, cu_tasks: list[dict]) -> dict:
+    """Convert a bulk-fetched ClickUp task list into a YAML-compatible snapshot.
+
+    The snapshot mirrors the input YAML's ``project`` + ``status_map`` blocks
+    so it can be fed back to ``pull --conflict remote`` as a source of truth.
+    """
+    status_map = data.get("status_map", {}) or {}
+    epic_name_map = build_epic_name_map(data)
+    epic_buckets: dict[int, list[dict]] = {ei: [] for ei in range(len(data.get("epics", [])))}
+    orphans: list[dict] = []
+    for cu_task in cu_tasks:
+        story = _clickup_task_to_yaml_story(cu_task, status_map)
+        epic_key = _extract_epic_name_from_tags(cu_task, epic_name_map)
+        if epic_key is not None:
+            epic_buckets[epic_name_map[epic_key]].append(story)
+        else:
+            orphans.append(story)
+
+    snapshot_epics: list[dict] = []
+    for ei, epic in enumerate(data.get("epics", []) or []):
+        snapshot_epics.append({
+            "number": epic.get("number"),
+            "name": epic.get("name"),
+            "status": epic.get("status", "backlog"),
+            "points": epic.get("points", 0),
+            "stories": epic_buckets[ei],
+        })
+    if orphans:
+        snapshot_epics.append({
+            "number": None,
+            "name": "_orphans",
+            "status": "backlog",
+            "points": 0,
+            "description": "Tasks fetched at backup time with no matching epic.",
+            "stories": orphans,
+        })
+
+    return {
+        "project": {
+            "name": (data.get("project", {}) or {}).get("name", "backup"),
+            "clickup_list_id": (data.get("project", {}) or {}).get("clickup_list_id", ""),
+            "backed_up_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "status_map": status_map,
+        "epics": snapshot_epics,
+    }
+
+
+def _resolve_backup_path(
+    backup_path: Optional[str],
+    backup_default: bool,
+    list_id: str,
+    cu_tasks: list[dict],
+) -> Optional[Path]:
+    """Pick the final backup destination Path, or None if we should skip.
+
+    Skip semantics:
+      - explicit None and ``backup_default`` False -> skip (caller opted out)
+      - explicit None and ``backup_default`` True but list is empty -> skip
+        (nothing to back up — a brand-new sandbox list)
+    """
+    if backup_path is None:
+        if not backup_default:
+            return None
+        if not cu_tasks:
+            log.info("Skipping backup — list is empty (no remote state to lose).")
+            return None
+        return _default_backup_path(list_id)
+    if backup_path == BACKUP_DEFAULT_SENTINEL:
+        return _default_backup_path(list_id)
+    return Path(backup_path)
+
+
+def _maybe_write_backup(
+    data: dict,
+    cu_tasks: list[dict],
+    list_id: str,
+    backup_path: Optional[str],
+    backup_default: bool,
+) -> Optional[Path]:
+    """Write a snapshot YAML of current ClickUp state before mutating it.
+
+    Returns the path written, or None if no backup was produced.
+    """
+    target = _resolve_backup_path(backup_path, backup_default, list_id, cu_tasks)
+    if target is None:
+        return None
+    snapshot = _build_backup_snapshot(data, cu_tasks)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w") as f:
+        yaml.dump(snapshot, f, default_flow_style=False, allow_unicode=True,
+                  sort_keys=False, width=120)
+    log.info(f"Backup written: {target}")
+    return target
+
+
+# ---------------------------------------------------------------------------
 # Push command (flat stories with epic tag)
 # ---------------------------------------------------------------------------
 
 
-def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
+def cmd_push(
+    data: dict,
+    yaml_path: str,
+    dry_run: bool = False,
+    backup_path: Optional[str] = None,
+    backup_default: bool = True,
+) -> dict:
     """Push stories to ClickUp as flat top-level tasks with an epic tag.
     Epics exist only in YAML — they are NOT created in ClickUp.
     Uses a single bulk fetch to build an in-memory index, then only
@@ -478,6 +781,7 @@ def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
     token = get_clickup_token()
     list_id = data["project"]["clickup_list_id"]
     status_map = data.get("status_map", {})
+    project_cfg = data.get("project", {})
     stats = {"created": 0, "updated": 0, "unchanged": 0, "errors": 0}
 
     # Bulk fetch all ClickUp tasks once — avoids N individual GET calls
@@ -486,19 +790,37 @@ def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
     cu_by_id = {t["id"]: t for t in cu_tasks}
     log.info(f"Fetched {len(cu_tasks)} tasks")
 
+    # Backup-before-push: snapshot remote state so a bad push is recoverable
+    # via `pull --conflict remote` from the backup file.
+    if not dry_run:
+        _maybe_write_backup(
+            data=data,
+            cu_tasks=cu_tasks,
+            list_id=list_id,
+            backup_path=backup_path,
+            backup_default=backup_default,
+        )
+
+    managed_universe = _collect_managed_tag_universe(data)
+
     for epic in data["epics"]:
-        epic_name = epic["name"]
         tag = _epic_tag(epic)
         epic_priority = epic.get("priority")
 
         for story in epic.get("stories", []):
             story_name = story["name"]
+            desired_tags = _story_desired_tags(story, epic)
             if not story.get("clickup_id"):
-                # CREATE story as top-level task with epic tag
-                body = build_task_body(story, status_map, tags=[tag],
-                                       default_priority=epic_priority)
+                # CREATE story as top-level task with all desired tags
+                body = build_task_body(
+                    story, status_map, tags=desired_tags,
+                    default_priority=epic_priority,
+                )
                 if dry_run:
-                    log.info(f"  [DRY RUN] Would create: {story_name} [{tag}]")
+                    log.info(
+                        f"  [DRY RUN] Would create: {story_name} "
+                        f"tags={desired_tags}"
+                    )
                     stats["created"] += 1
                 else:
                     try:
@@ -507,9 +829,15 @@ def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
                         story["task_id"] = resp.get("custom_id")
                         if "priority" not in story and epic_priority is not None:
                             story["priority"] = epic_priority
+                        # Push Epic dropdown if YAML configures it.
+                        _push_epic_dropdown_if_needed(
+                            token, resp["id"], resp, story, epic, project_cfg, dry_run
+                        )
                         save_yaml(data, yaml_path)  # incremental save
-                        log.info(f"  Created: {story_name} -> {resp['id']} "
-                                 f"({resp.get('custom_id')}) [{tag}]")
+                        log.info(
+                            f"  Created: {story_name} -> {resp['id']} "
+                            f"({resp.get('custom_id')}) tags={desired_tags}"
+                        )
                         stats["created"] += 1
                     except Exception as e:
                         log.error(f"  Failed to create {story_name}: {e}")
@@ -525,6 +853,8 @@ def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
                 if "priority" not in story and epic_priority is not None:
                     story["priority"] = epic_priority
                 diffs = compare_task(story, cu_task, status_map)
+                # Field-level diff drives the PUT; tags + custom-field are
+                # reconciled separately (their endpoints are different).
                 if diffs:
                     update_body = build_task_body(story, status_map,
                                                   default_priority=epic_priority)
@@ -547,6 +877,28 @@ def cmd_push(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
                     stats["updated"] += 1
                 else:
                     stats["unchanged"] += 1
+                # Reconcile tags (multi-tag, additive) on every update path
+                if dry_run:
+                    current = _current_tag_names(cu_task)
+                    if set(t.lower() for t in current) != set(
+                        t.lower() for t in desired_tags
+                    ):
+                        log.info(
+                            f"  [DRY RUN] Would reconcile tags on {story_name}: "
+                            f"{current} -> {desired_tags}"
+                        )
+                else:
+                    _sync_tags(
+                        token,
+                        story["clickup_id"],
+                        cu_task,
+                        desired_tags,
+                        managed_known_tags=managed_universe,
+                    )
+                # Push Epic dropdown if YAML configures it and value differs
+                _push_epic_dropdown_if_needed(
+                    token, story["clickup_id"], cu_task, story, epic, project_cfg, dry_run
+                )
 
     if not dry_run:
         save_yaml(data, yaml_path)
@@ -774,7 +1126,12 @@ def _truncate(s: str, max_len: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def cmd_merge(data: dict, yaml_path: str) -> dict:
+def cmd_merge(
+    data: dict,
+    yaml_path: str,
+    backup_path: Optional[str] = None,
+    backup_default: bool = False,
+) -> dict:
     token = get_clickup_token()
     openai_key = get_openai_key()
     list_id = data["project"]["clickup_list_id"]
@@ -784,6 +1141,14 @@ def cmd_merge(data: dict, yaml_path: str) -> dict:
     log.info("Fetching all tasks from ClickUp for merge...")
     cu_tasks = clickup_list_tasks(token, list_id)
     cu_by_id = {t["id"]: t for t in cu_tasks}
+
+    _maybe_write_backup(
+        data=data,
+        cu_tasks=cu_tasks,
+        list_id=list_id,
+        backup_path=backup_path,
+        backup_default=backup_default,
+    )
 
     all_items: list[tuple[dict, dict, str]] = []
     for epic in data["epics"]:
@@ -925,7 +1290,14 @@ def _pull_field_to_yaml(yaml_task: dict, cu_task: dict, field: str, status_map: 
 CONFLICT_STRATEGIES = ("ask", "local", "remote", "merge")
 
 
-def cmd_sync(data: dict, yaml_path: str, conflict: str = "ask", dry_run: bool = False) -> dict:
+def cmd_sync(
+    data: dict,
+    yaml_path: str,
+    conflict: str = "ask",
+    dry_run: bool = False,
+    backup_path: Optional[str] = None,
+    backup_default: bool = False,
+) -> dict:
     """Full bidirectional sync with per-conflict resolution.
     Stories are flat top-level tasks with epic tags. Epics are YAML-only."""
     token = get_clickup_token()
@@ -950,8 +1322,21 @@ def cmd_sync(data: dict, yaml_path: str, conflict: str = "ask", dry_run: bool = 
     cu_by_id = {t["id"]: t for t in cu_tasks}
     log.info(f"Fetched {len(cu_tasks)} tasks")
 
+    # Backup-before-sync (opt-in via --backup-to). Default off for sync
+    # because the user-facing semantic of sync is "reconcile", not "overwrite".
+    if not dry_run:
+        _maybe_write_backup(
+            data=data,
+            cu_tasks=cu_tasks,
+            list_id=list_id,
+            backup_path=backup_path,
+            backup_default=backup_default,
+        )
+
     seen_cu_ids: set[str] = set(t["id"] for t in cu_tasks)
     all_yaml_ids: set[str] = _all_yaml_story_ids(data)
+    project_cfg = data.get("project", {})
+    managed_universe = _collect_managed_tag_universe(data)
 
     # Phase 2 & 4: Walk YAML stories, create or reconcile
     for epic in data["epics"]:
@@ -962,20 +1347,30 @@ def cmd_sync(data: dict, yaml_path: str, conflict: str = "ask", dry_run: bool = 
 
         for story in epic.get("stories", []):
             story_name = story["name"]
+            desired_tags = _story_desired_tags(story, epic)
 
             if not story.get("clickup_id"):
                 # Create in ClickUp
-                body = build_task_body(story, status_map, tags=[tag],
-                                       default_priority=epic_priority)
+                body = build_task_body(
+                    story, status_map, tags=desired_tags,
+                    default_priority=epic_priority,
+                )
                 if dry_run:
-                    log.info(f"  [DRY RUN] Would create: {story_name} [{tag}]")
+                    log.info(
+                        f"  [DRY RUN] Would create: {story_name} tags={desired_tags}"
+                    )
                 else:
                     try:
                         resp = clickup_create_task(token, list_id, body)
                         story["clickup_id"] = resp["id"]
                         story["task_id"] = resp.get("custom_id")
-                        log.info(f"  Created: {story_name} -> {resp['id']} "
-                                 f"({resp.get('custom_id')}) [{tag}]")
+                        _push_epic_dropdown_if_needed(
+                            token, resp["id"], resp, story, epic, project_cfg, dry_run
+                        )
+                        log.info(
+                            f"  Created: {story_name} -> {resp['id']} "
+                            f"({resp.get('custom_id')}) tags={desired_tags}"
+                        )
                     except Exception as e:
                         log.error(f"  Failed to create {story_name}: {e}")
                         stats["errors"] += 1
@@ -992,6 +1387,18 @@ def cmd_sync(data: dict, yaml_path: str, conflict: str = "ask", dry_run: bool = 
                     )
                 else:
                     stats["unchanged"] += 1
+                # Reconcile multi-tag + Epic dropdown on every existing story.
+                if not dry_run:
+                    _sync_tags(
+                        token,
+                        story["clickup_id"],
+                        cu_task,
+                        desired_tags,
+                        managed_known_tags=managed_universe,
+                    )
+                _push_epic_dropdown_if_needed(
+                    token, story["clickup_id"], cu_task, story, epic, project_cfg, dry_run
+                )
 
     # Phase 3: ClickUp tasks not in YAML -> create in YAML
     epic_name_map = build_epic_name_map(data)
@@ -1245,6 +1652,24 @@ def main() -> None:
         default="ask",
         help="Conflict resolution strategy for sync (default: ask)",
     )
+    parser.add_argument(
+        "--backup-to",
+        nargs="?",
+        const=BACKUP_DEFAULT_SENTINEL,
+        default=None,
+        help=(
+            "Snapshot current ClickUp state to a YAML file before any "
+            "modifying call. Pass a path, or omit value to use "
+            "~/tmp/clickup-backup-<list_id>-<iso>.yaml. Applies to push, "
+            "sync, merge. push auto-backs-up by default for non-empty lists; "
+            "use --no-backup to opt out."
+        ),
+    )
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Disable the automatic backup-before-push (push only).",
+    )
 
     args = parser.parse_args()
 
@@ -1257,15 +1682,33 @@ def main() -> None:
     if args.command == "status":
         cmd_status(data)
     elif args.command == "push":
-        cmd_push(data, args.yaml_file, dry_run=args.dry_run)
+        cmd_push(
+            data,
+            args.yaml_file,
+            dry_run=args.dry_run,
+            backup_path=args.backup_to,
+            backup_default=not args.no_backup,
+        )
     elif args.command == "pull":
         cmd_pull(data, args.yaml_file, dry_run=args.dry_run)
     elif args.command == "diff":
         cmd_diff(data)
     elif args.command == "sync":
-        cmd_sync(data, args.yaml_file, conflict=args.conflict, dry_run=args.dry_run)
+        cmd_sync(
+            data,
+            args.yaml_file,
+            conflict=args.conflict,
+            dry_run=args.dry_run,
+            backup_path=args.backup_to,
+            backup_default=False,
+        )
     elif args.command == "merge":
-        cmd_merge(data, args.yaml_file)
+        cmd_merge(
+            data,
+            args.yaml_file,
+            backup_path=args.backup_to,
+            backup_default=False,
+        )
 
 
 if __name__ == "__main__":

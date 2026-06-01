@@ -27,6 +27,60 @@ epics:                        Tasks (flat list):
 | `merge` | Like sync but uses GPT-4o-mini to propose merged values |
 | `status` | Offline summary table (no API calls) |
 
+## Multi-Tag, Milestones, and Custom Dropdowns
+
+The tool maintains an additive multi-tag set per story. Sources merge in
+this order (deduped case-insensitively):
+
+1. The epic's `name` (always present — preserves the legacy single-tag behavior).
+2. Explicit `tags: [...]` on the story.
+3. The lowercased `milestone_label` slug (e.g., `M1` → `m1`).
+
+Pre-existing tags on the ClickUp task that are **not** in the YAML's
+"managed tag universe" (every epic name + every milestone slug + every
+explicit tag in YAML) are **preserved** on push — that means tags added
+manually in the ClickUp UI survive.
+
+Tags that **are** in the managed universe but not on the story being
+pushed are treated as stale and removed — that's how an epic or milestone
+reassignment in YAML actually takes effect.
+
+### Pushing a custom dropdown field (e.g., a PM-curated "Epic" field)
+
+If ClickUp has a single-select dropdown custom field that mirrors the epic
+axis (some teams prefer this to tags), declare the mapping in the YAML
+`project:` block and push will set it on every story automatically:
+
+```yaml
+project:
+  name: EM Marketing OS
+  clickup_list_id: '901416587639'
+  epic_dropdown_field_id: 'eb53bc71-c0c7-40ed-93cb-7f0b993900e6'
+  epic_dropdown_options:
+    'Relationship Signal Automation': 'f110326a-b184-44bd-8880-ddd503d3e8c9'
+    'Magnit Monitoring System': '85bf365b-d601-40a2-be5a-c5f1ba8ef280'
+    'Infrastructure + CRM': 'de5b8e45-e45e-482e-9c05-5764e2d2b8f9'
+    'Kickoff / Access': '12d207f1-78c9-466f-9078-9ca726cd907e'
+```
+
+If either field is missing, the dropdown push is skipped silently — old
+YAML files keep working unchanged. Per-story override via
+`epic_dropdown_value: "<epic name>"` on a single story.
+
+## Backup-before-push
+
+Before any modifying call, `push` snapshots the current ClickUp state to a
+YAML file you can `pull --conflict remote` from if a push goes sideways.
+
+- `push` runs the backup by **default** for any non-empty list. New empty
+  sandbox lists skip the backup.
+- `push --no-backup` disables it.
+- `push --backup-to /path/to/file.yaml` writes to a specific path.
+- `push --backup-to` (no value) uses
+  `~/tmp/clickup-backup-<list_id>-<iso>.yaml`.
+- `sync` and `merge` accept the same `--backup-to` flag but **don't**
+  auto-backup — pass the flag explicitly to opt in.
+
 ## Conflict Strategies
 
 Used with `sync --conflict`:
