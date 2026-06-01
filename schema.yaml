@@ -192,6 +192,19 @@ properties:
                 enum: [M0, M1, M2, M3, null]
                 example: "M1"
 
+              sprint_target:
+                type: [integer, "null"]
+                description: >
+                  Optional sprint number this story is planned for. When set,
+                  push appends a tag `s<N>` (e.g., sprint_target: 1 -> `s1`)
+                  to the story's tag set. Lets you filter ClickUp by any
+                  sprint, not just the current one — orthogonal to the
+                  `status` field, which carries the WIP state.
+                  Sprint slugs are part of the managed tag universe (removing
+                  sprint_target from a story strips its `s<N>` tag on next push).
+                minimum: 1
+                example: 2
+
               tags:
                 type: array
                 description: >

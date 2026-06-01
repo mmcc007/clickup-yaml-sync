@@ -528,6 +528,7 @@ def _story_desired_tags(story: dict, epic: dict) -> list[str]:
       1. epic name (always present — preserves prior behavior)
       2. story.tags[] from YAML
       3. lowercase milestone slug from story.milestone_label (M1 -> ``m1``)
+      4. lowercase sprint slug from story.sprint_target (1 -> ``s1``)
     """
     out: list[str] = []
     seen: set[str] = set()
@@ -548,6 +549,9 @@ def _story_desired_tags(story: dict, epic: dict) -> list[str]:
     ms = story.get("milestone_label")
     if isinstance(ms, str) and ms.strip():
         _add(ms.strip().lower())
+    sprint = story.get("sprint_target")
+    if isinstance(sprint, int) and sprint > 0:
+        _add(f"s{sprint}")
     return out
 
 
@@ -571,6 +575,19 @@ def _collect_managed_tag_universe(data: dict) -> set[str]:
     # the tag on next push.
     for ms in VALID_MILESTONE_LABELS:
         universe.add(ms.lower())
+    # Sprint slugs are also always managed — so removing sprint_target from
+    # a story strips the s<N> tag on next push. We add the slugs for any
+    # sprint number actually referenced in the YAML (either by stories or
+    # by the project's sprint registry).
+    for epic in data.get("epics", []) or []:
+        for story in epic.get("stories", []) or []:
+            sprint = story.get("sprint_target")
+            if isinstance(sprint, int) and sprint > 0:
+                universe.add(f"s{sprint}")
+    for sp in data.get("sprints", []) or []:
+        n = sp.get("number")
+        if isinstance(n, int) and n > 0:
+            universe.add(f"s{n}")
     return universe
 
 

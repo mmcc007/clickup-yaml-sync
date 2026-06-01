@@ -122,6 +122,56 @@ class TestDesiredTags:
         story = _story_with("s1", tags=["good", 42, None])
         assert clickup._story_desired_tags(story, epic) == ["E", "good"]
 
+    def test_sprint_target_appends_s_tag(self):
+        epic = _epic_with("Infra", [])
+        story = _story_with("s1", sprint_target=2)
+        assert clickup._story_desired_tags(story, epic) == ["Infra", "s2"]
+
+    def test_sprint_target_with_milestone_and_tags(self):
+        epic = _epic_with("Infra", [])
+        story = _story_with(
+            "s1",
+            milestone_label="M1",
+            sprint_target=3,
+            tags=["llm"],
+        )
+        # epic + explicit tags + milestone slug + sprint slug, in that order
+        assert clickup._story_desired_tags(story, epic) == ["Infra", "llm", "m1", "s3"]
+
+    def test_sprint_target_none_or_zero_no_tag(self):
+        epic = _epic_with("Infra", [])
+        for bad in (None, 0, -1, "1", 1.5):
+            story = _story_with("s1", sprint_target=bad)
+            tags = clickup._story_desired_tags(story, epic)
+            assert all(not t.startswith("s") or t.lower() == "security" for t in tags), (
+                f"sprint_target={bad!r} unexpectedly produced an s-tag: {tags}"
+            )
+
+    def test_sprint_target_deduped_against_explicit(self):
+        epic = _epic_with("Infra", [])
+        story = _story_with("s1", sprint_target=4, tags=["S4"])  # case-insensitive dup
+        tags = clickup._story_desired_tags(story, epic)
+        assert tags == ["Infra", "S4"]
+
+
+class TestManagedUniverseIncludesSprintSlugs:
+    def test_sprint_slug_added_from_story_sprint_target(self):
+        data = _data_with({
+            "Infra": [_story_with("a", sprint_target=2)],
+        })
+        universe = clickup._collect_managed_tag_universe(data)
+        assert "s2" in universe
+
+    def test_sprint_slug_added_from_sprints_registry(self):
+        data = _data_with({"Infra": [_story_with("a")]})
+        data["sprints"] = [
+            {"number": 1, "name": "Foundation", "start": "2026-06-01"},
+            {"number": 5, "name": "Magnit", "start": "2026-06-29"},
+        ]
+        universe = clickup._collect_managed_tag_universe(data)
+        assert "s1" in universe
+        assert "s5" in universe
+
 
 class TestManagedTagUniverse:
     def test_universe_includes_epic_names_milestones_and_user_tags(self):
