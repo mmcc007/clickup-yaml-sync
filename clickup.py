@@ -320,6 +320,35 @@ def normalize_description(desc: Optional[str]) -> str:
     return desc.strip()
 
 
+def _meta_prefix(story: dict) -> str:
+    """A one-line 'Points/Milestone/Sprint' header, so those YAML fields are
+    visible on the ClickUp card even without the Sprint-Points ClickApp.
+    The structured fields stay source-of-truth; this is display only."""
+    bits: list[str] = []
+    if story.get("points"):
+        bits.append(f"Points: {story['points']}")
+    ms = story.get("milestone_label")
+    if isinstance(ms, str) and ms.strip():
+        bits.append(f"Milestone: {ms.strip()}")
+    sp = story.get("sprint_target")
+    if isinstance(sp, int) and sp > 0:
+        bits.append(f"Sprint: s{sp}")
+    return " · ".join(bits)
+
+
+def description_with_meta(story: dict) -> str:
+    """Story description with the meta header prepended (generated, not stored).
+
+    Used identically by build_task_body (push) and compare_task (diff), so the
+    header round-trips without ever showing as a spurious description diff.
+    """
+    meta = _meta_prefix(story)
+    body = (story.get("description") or "").strip()
+    if not meta:
+        return body
+    return f"{meta}\n\n{body}".strip() if body else meta
+
+
 def compare_task(
     yaml_task: dict,
     clickup_task: dict,
@@ -344,7 +373,7 @@ def compare_task(
         diffs.append({"field": "status", "yaml": yaml_status, "clickup": cu_status})
 
     # Description
-    yaml_desc = normalize_description(yaml_task.get("description"))
+    yaml_desc = normalize_description(description_with_meta(yaml_task))
     cu_desc = normalize_description(clickup_task.get("description", "") or "")
     if yaml_desc != cu_desc:
         diffs.append({"field": "description", "yaml": yaml_desc, "clickup": cu_desc})
@@ -384,7 +413,7 @@ def build_task_body(
     body: dict[str, Any] = {
         "name": yaml_task["name"],
         "status": yaml_status_to_clickup(yaml_task.get("status", "backlog"), status_map),
-        "description": yaml_task.get("description", ""),
+        "description": description_with_meta(yaml_task),
     }
     priority = yaml_task.get("priority") or default_priority
     if priority is not None:
@@ -521,11 +550,14 @@ def _sync_tags(
 VALID_MILESTONE_LABELS = ("M0", "M1", "M2", "M3")
 
 
-def _story_desired_tags(story: dict, epic: dict) -> list[str]:
+def _story_desired_tags(
+    story: dict, epic: dict, push_epic_tag: bool = True
+) -> list[str]:
     """Compute the desired tag set for one story (multi-tag, additive).
 
     Order of precedence (deduped, case-insensitive, original case preserved):
-      1. epic name (always present — preserves prior behavior)
+      1. epic name (only when ``push_epic_tag`` — set project.push_epic_tag:
+         false to let a curated Epic dropdown own the workstream axis instead)
       2. story.tags[] from YAML
       3. lowercase milestone slug from story.milestone_label (M1 -> ``m1``)
       4. lowercase sprint slug from story.sprint_target (1 -> ``s1``)
@@ -542,7 +574,8 @@ def _story_desired_tags(story: dict, epic: dict) -> list[str]:
         seen.add(key)
         out.append(tag)
 
-    _add(_epic_tag(epic))
+    if push_epic_tag:
+        _add(_epic_tag(epic))
     for t in story.get("tags") or []:
         if isinstance(t, str):
             _add(t)
@@ -826,7 +859,9 @@ def cmd_push(
 
         for story in epic.get("stories", []):
             story_name = story["name"]
-            desired_tags = _story_desired_tags(story, epic)
+            desired_tags = _story_desired_tags(
+                story, epic, push_epic_tag=project_cfg.get("push_epic_tag", True)
+            )
             if not story.get("clickup_id"):
                 # CREATE story as top-level task with all desired tags
                 body = build_task_body(
@@ -1277,7 +1312,7 @@ def _push_field_to_clickup(
             "status": yaml_status_to_clickup(yaml_task.get("status", ""), status_map)
         })
     elif field == "description":
-        clickup_update_task(token, cu_id, {"description": yaml_task.get("description", "")})
+        clickup_update_task(token, cu_id, {"description": description_with_meta(yaml_task)})
     elif field == "priority":
         clickup_update_task(token, cu_id, {"priority": yaml_task.get("priority", 3)})
     elif field == "milestone":
@@ -1364,7 +1399,9 @@ def cmd_sync(
 
         for story in epic.get("stories", []):
             story_name = story["name"]
-            desired_tags = _story_desired_tags(story, epic)
+            desired_tags = _story_desired_tags(
+                story, epic, push_epic_tag=project_cfg.get("push_epic_tag", True)
+            )
 
             if not story.get("clickup_id"):
                 # Create in ClickUp

@@ -127,6 +127,29 @@ class TestDesiredTags:
         story = _story_with("s1", sprint_target=2)
         assert clickup._story_desired_tags(story, epic) == ["Infra", "s2"]
 
+    def test_description_meta_prefix_and_roundtrip(self):
+        story = {"name": "x", "description": "Do the thing.", "points": 5,
+                 "milestone_label": "M2", "sprint_target": 4}
+        out = clickup.description_with_meta(story)
+        assert out.startswith("Points: 5 · Milestone: M2 · Sprint: s4")
+        assert "Do the thing." in out
+        # compare_task must not flag a diff when ClickUp holds the meta'd body
+        cu = {"name": "x", "description": out, "status": {"status": "backlog"}}
+        diffs = clickup.compare_task(story, cu, {"backlog": "backlog"})
+        assert not any(d["field"] == "description" for d in diffs)
+        # no meta fields → plain body, no prefix
+        assert clickup.description_with_meta({"description": "bare"}) == "bare"
+
+    def test_push_epic_tag_false_omits_epic_name(self):
+        epic = _epic_with("Infrastructure + CRM", [])
+        story = _story_with("s1", milestone_label="M2", sprint_target=4, tags=["security"])
+        # epic dropdown owns workstream → epic name tag suppressed
+        assert clickup._story_desired_tags(story, epic, push_epic_tag=False) == [
+            "security", "m2", "s4",
+        ]
+        # default still includes the epic name (backwards-compatible)
+        assert clickup._story_desired_tags(story, epic)[0] == "Infrastructure + CRM"
+
     def test_sprint_target_with_milestone_and_tags(self):
         epic = _epic_with("Infra", [])
         story = _story_with(
