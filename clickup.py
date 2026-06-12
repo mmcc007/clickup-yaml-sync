@@ -215,6 +215,18 @@ def clickup_set_custom_field(
     return _api_request("POST", url, token, {"value": value})
 
 
+def clickup_get_list_members(token: str, list_id: str) -> list[dict]:
+    """Fetch the members who have access to a list.
+
+    Returns a list of ``{id, username, email, ...}`` dicts. Used to resolve
+    YAML assignee strings (emails/usernames) to the numeric ClickUp user ids
+    the task API expects.
+    """
+    url = f"{CLICKUP_BASE}/list/{list_id}/member"
+    resp = _api_request("GET", url, token)
+    return resp.get("members", [])
+
+
 def clickup_list_tasks(token: str, list_id: str, page: int = 0) -> list[dict]:
     """Fetch all tasks from a ClickUp list (with pagination and subtasks)."""
     all_tasks: list[dict] = []
@@ -408,8 +420,14 @@ def build_task_body(
     status_map: dict,
     tags: Optional[list[str]] = None,
     default_priority: Optional[int] = None,
+    assignee_ids: Optional[list[int]] = None,
 ) -> dict:
-    """Build a ClickUp API request body from a YAML task/story dict."""
+    """Build a ClickUp API request body from a YAML task/story dict.
+
+    ``assignee_ids`` are added only on the create path — ClickUp's create
+    endpoint takes a flat id array, whereas updates use the ``{add, rem}``
+    shape reconciled separately in ``_sync_assignees``.
+    """
     body: dict[str, Any] = {
         "name": yaml_task["name"],
         "status": yaml_status_to_clickup(yaml_task.get("status", "backlog"), status_map),
@@ -422,6 +440,8 @@ def build_task_body(
         body["custom_item_id"] = CUSTOM_ITEM_MILESTONE
     if tags:
         body["tags"] = tags
+    if assignee_ids:
+        body["assignees"] = assignee_ids
     return body
 
 
@@ -699,6 +719,173 @@ def _all_yaml_story_ids(data: dict) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Assignee resolution + reconcile (set-valued, modelled on tags)
+# ---------------------------------------------------------------------------
+#
+# YAML stores assignees as human-readable strings (emails preferred, usernames
+# accepted). ClickUp's task API speaks numeric user ids, so push resolves
+# string -> id via the list's member roster; pull writes the readable string
+# back. Like tags, assignees coexist with the ClickUp UI:
+#
+#   - story has no ``assignees`` key  -> UNMANAGED: ClickUp assignees untouched
+#     on push (UI-set assignees are preserved).
+#   - story has ``assignees: []``     -> MANAGED, empty: push clears assignees.
+#   - story has ``assignees: [...]``  -> MANAGED: ClickUp reconciled to match.
+#
+# Pull always reads the remote assignees back into YAML (the "someone changed
+# it in the ClickUp UI" path).
+
+
+def _build_assignee_resolver(members: list[dict]) -> dict[str, int]:
+    """Map lowercased {email, username, str(id)} -> ClickUp user id."""
+    resolver: dict[str, int] = {}
+    for m in members or []:
+        uid = m.get("id")
+        if uid is None:
+            continue
+        for key in (m.get("email"), m.get("username"), str(uid)):
+            if key:
+                resolver[str(key).strip().lower()] = int(uid)
+    return resolver
+
+
+def _resolve_assignee_ids(
+    assignees: Optional[list], resolver: dict[str, int]
+) -> tuple[list[int], list[str]]:
+    """Resolve YAML assignee strings to ClickUp ids (deduped, order-preserving).
+
+    Returns ``(ids, unresolved)`` — unresolved strings are names/emails not
+    found in the list roster; callers warn and skip them rather than failing.
+    """
+    ids: list[int] = []
+    unresolved: list[str] = []
+    seen: set[int] = set()
+    for a in assignees or []:
+        key = str(a).strip().lower()
+        if not key:
+            continue
+        uid = resolver.get(key)
+        if uid is None:
+            unresolved.append(str(a))
+            continue
+        if uid not in seen:
+            seen.add(uid)
+            ids.append(uid)
+    return ids, unresolved
+
+
+def _cu_assignee_ids(cu_task: dict) -> set[int]:
+    """The set of numeric assignee ids currently on a ClickUp task."""
+    out: set[int] = set()
+    for a in cu_task.get("assignees", []) or []:
+        uid = a.get("id") if isinstance(a, dict) else None
+        if uid is not None:
+            out.add(int(uid))
+    return out
+
+
+def _cu_assignee_keys(cu_task: dict) -> list[str]:
+    """Readable, stable assignee identifiers for YAML.
+
+    Prefers email, then username, then the stringified id — sorted
+    case-insensitively so the YAML serialisation is stable across pulls.
+    """
+    keys: list[str] = []
+    for a in cu_task.get("assignees", []) or []:
+        if not isinstance(a, dict):
+            continue
+        key = a.get("email") or a.get("username")
+        if not key and a.get("id") is not None:
+            key = str(a["id"])
+        if key:
+            keys.append(key)
+    return sorted(keys, key=str.lower)
+
+
+def _assignee_keyset(items: Optional[list]) -> set[str]:
+    """Lowercased set of assignee strings, for equality checks."""
+    return {str(x).strip().lower() for x in (items or []) if str(x).strip()}
+
+
+def _sync_assignees(
+    token: str,
+    task_id: str,
+    cu_task: dict,
+    story: dict,
+    resolver: dict[str, int],
+    dry_run: bool = False,
+) -> bool:
+    """Reconcile a task's ClickUp assignees to match the story's YAML.
+
+    No-op (preserves UI assignees) when the story has no ``assignees`` key.
+    Returns True if a change was made — or would be, under ``dry_run``.
+    """
+    if "assignees" not in story:
+        return False
+    desired_ids, unresolved = _resolve_assignee_ids(story.get("assignees"), resolver)
+    for u in unresolved:
+        log.warning(f"    Assignee not found in list members, skipping: '{u}'")
+    desired = set(desired_ids)
+    current = _cu_assignee_ids(cu_task)
+    add = sorted(desired - current)
+    rem = sorted(current - desired)
+    if not add and not rem:
+        return False
+    if dry_run:
+        log.info(f"    [DRY RUN] Would reconcile assignees: +{add} -{rem}")
+        return True
+    try:
+        clickup_update_task(token, task_id, {"assignees": {"add": add, "rem": rem}})
+        log.info(f"    Updated assignees: +{add} -{rem}")
+        return True
+    except Exception as e:
+        log.warning(f"    Failed to update assignees: {e}")
+        return False
+
+
+def _assignees_pull_target(story: dict, cu_task: dict) -> Optional[list[str]]:
+    """The assignee list a pull would write, or None if no change is needed.
+
+    Pure (no mutation) so both the dry-run preview and the real pull share one
+    change-detection rule. Returns the ClickUp keys when they differ from the
+    story; ``None`` when already equal or when both sides are empty (which would
+    only litter YAML with ``assignees: []``).
+    """
+    cu_keys = _cu_assignee_keys(cu_task)
+    if not cu_keys and "assignees" not in story:
+        return None
+    if _assignee_keyset(story.get("assignees")) == _assignee_keyset(cu_keys):
+        return None
+    return cu_keys
+
+
+def _pull_assignees(story: dict, cu_task: dict) -> bool:
+    """Read ClickUp assignees back into the YAML story. Returns True if changed.
+
+    Writes the ``assignees`` key when ClickUp has any, or when the story
+    already declares it (so a remote *removal* becomes an explicit empty list).
+    Leaves the key absent when both sides are empty — no YAML litter.
+    """
+    target = _assignees_pull_target(story, cu_task)
+    if target is None:
+        return False
+    story["assignees"] = target
+    return True
+
+
+def _assignees_differ(story: dict, cu_task: dict, resolver: dict[str, int]) -> bool:
+    """Whether the managed YAML assignees diverge from ClickUp's.
+
+    An unmanaged story (no key) "differs" only if ClickUp has assignees to
+    capture — so ``sync ask`` can offer to pull them into YAML.
+    """
+    if "assignees" not in story:
+        return bool(_cu_assignee_ids(cu_task))
+    desired_ids, _ = _resolve_assignee_ids(story.get("assignees"), resolver)
+    return set(desired_ids) != _cu_assignee_ids(cu_task)
+
+
+# ---------------------------------------------------------------------------
 # Backup-before-push
 # ---------------------------------------------------------------------------
 
@@ -852,6 +1039,9 @@ def cmd_push(
         )
 
     managed_universe = _collect_managed_tag_universe(data)
+    assignee_resolver = _build_assignee_resolver(
+        clickup_get_list_members(token, list_id)
+    )
 
     for epic in data["epics"]:
         tag = _epic_tag(epic)
@@ -864,9 +1054,17 @@ def cmd_push(
             )
             if not story.get("clickup_id"):
                 # CREATE story as top-level task with all desired tags
+                create_assignee_ids: list[int] = []
+                if "assignees" in story:
+                    create_assignee_ids, unresolved = _resolve_assignee_ids(
+                        story.get("assignees"), assignee_resolver
+                    )
+                    for u in unresolved:
+                        log.warning(f"  Assignee not found, skipping: '{u}'")
                 body = build_task_body(
                     story, status_map, tags=desired_tags,
                     default_priority=epic_priority,
+                    assignee_ids=create_assignee_ids,
                 )
                 if dry_run:
                     log.info(
@@ -951,6 +1149,11 @@ def cmd_push(
                 _push_epic_dropdown_if_needed(
                     token, story["clickup_id"], cu_task, story, epic, project_cfg, dry_run
                 )
+                # Reconcile assignees (YAML-authoritative when the key is present)
+                _sync_assignees(
+                    token, story["clickup_id"], cu_task, story,
+                    assignee_resolver, dry_run=dry_run,
+                )
 
     if not dry_run:
         save_yaml(data, yaml_path)
@@ -1001,6 +1204,17 @@ def cmd_pull(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
                 stats["updated"] += 1
             else:
                 stats["unchanged"] += 1
+            # Assignees aren't a compare_task field; reconcile directly so a
+            # UI-only assignee change still round-trips into YAML.
+            if dry_run:
+                target = _assignees_pull_target(story, cu_task)
+                if target is not None:
+                    log.info(f"  [DRY RUN] Would pull assignees for "
+                             f"'{story['name']}': "
+                             f"{story.get('assignees', '(none)')} -> {target}")
+            elif _pull_assignees(story, cu_task):
+                log.info(f"  Pulled assignees for '{story['name']}': "
+                         f"{story.get('assignees')}")
         else:
             # New task from ClickUp — place by epic tag
             new_story = _clickup_task_to_yaml_story(cu_task, status_map)
@@ -1058,7 +1272,7 @@ def _sync_metadata(yaml_task: dict, cu_task: dict) -> None:
 
 def _clickup_task_to_yaml_story(cu_task: dict, status_map: dict) -> dict:
     """Convert a ClickUp task to a YAML story dict."""
-    return {
+    story = {
         "name": cu_task.get("name", ""),
         "clickup_id": cu_task["id"],
         "task_id": cu_task.get("custom_id"),
@@ -1069,6 +1283,10 @@ def _clickup_task_to_yaml_story(cu_task: dict, status_map: dict) -> dict:
         "milestone": _is_clickup_milestone(cu_task),
         "description": cu_task.get("description") or "",
     }
+    cu_keys = _cu_assignee_keys(cu_task)
+    if cu_keys:
+        story["assignees"] = cu_keys
+    return story
 
 
 def _get_or_create_orphan_epic(data: dict) -> dict:
@@ -1105,6 +1323,9 @@ def cmd_diff(data: dict) -> dict:
     log.info("Fetching all tasks from ClickUp...")
     cu_tasks = clickup_list_tasks(token, list_id)
     cu_by_id = {t["id"]: t for t in cu_tasks}
+    assignee_resolver = _build_assignee_resolver(
+        clickup_get_list_members(token, list_id)
+    )
 
     log.info(f"\n{'='*80}")
     log.info("DIFF REPORT")
@@ -1134,8 +1355,10 @@ def cmd_diff(data: dict) -> dict:
                 stats["archived"] += 1
             else:
                 yaml_ids.add(scu_id)
-                diffs = compare_task(story, cu_by_id[scu_id], status_map)
-                if diffs:
+                cu_task = cu_by_id[scu_id]
+                diffs = compare_task(story, cu_task, status_map)
+                a_diff = _assignees_differ(story, cu_task, assignee_resolver)
+                if diffs or a_diff:
                     if not has_stories:
                         log.info(f"[{tag}] {epic['name']}:")
                         has_stories = True
@@ -1145,6 +1368,10 @@ def cmd_diff(data: dict) -> dict:
                         cu_val = _truncate(str(d["clickup"]), 60)
                         log.info(f"    {d['field']}: YAML='{yaml_val}' "
                                  f"vs ClickUp='{cu_val}'")
+                    if a_diff:
+                        y = story.get("assignees", "(unmanaged)")
+                        r = _cu_assignee_keys(cu_task)
+                        log.info(f"    assignees: YAML='{y}' vs ClickUp='{r}'")
                     stats["mismatches"] += 1
                 else:
                     stats["synced"] += 1
@@ -1389,6 +1616,9 @@ def cmd_sync(
     all_yaml_ids: set[str] = _all_yaml_story_ids(data)
     project_cfg = data.get("project", {})
     managed_universe = _collect_managed_tag_universe(data)
+    assignee_resolver = _build_assignee_resolver(
+        clickup_get_list_members(token, list_id)
+    )
 
     # Phase 2 & 4: Walk YAML stories, create or reconcile
     for epic in data["epics"]:
@@ -1405,9 +1635,17 @@ def cmd_sync(
 
             if not story.get("clickup_id"):
                 # Create in ClickUp
+                create_assignee_ids: list[int] = []
+                if "assignees" in story:
+                    create_assignee_ids, unresolved = _resolve_assignee_ids(
+                        story.get("assignees"), assignee_resolver
+                    )
+                    for u in unresolved:
+                        log.warning(f"  Assignee not found, skipping: '{u}'")
                 body = build_task_body(
                     story, status_map, tags=desired_tags,
                     default_priority=epic_priority,
+                    assignee_ids=create_assignee_ids,
                 )
                 if dry_run:
                     log.info(
@@ -1453,6 +1691,14 @@ def cmd_sync(
                 _push_epic_dropdown_if_needed(
                     token, story["clickup_id"], cu_task, story, epic, project_cfg, dry_run
                 )
+                # Reconcile assignees per the conflict strategy (set-level):
+                # local -> YAML wins, remote -> ClickUp wins, ask/merge ->
+                # prompt once when they diverge.
+                if not dry_run:
+                    _reconcile_assignees_sync(
+                        token, story, cu_task, assignee_resolver,
+                        conflict, story_name, stats,
+                    )
 
     # Phase 3: ClickUp tasks not in YAML -> create in YAML
     epic_name_map = build_epic_name_map(data)
@@ -1606,6 +1852,48 @@ def _resolve_conflicts(
             else:
                 log.info(f"    -> skipped")
                 stats["skipped"] += 1
+
+
+def _reconcile_assignees_sync(
+    token: str,
+    story: dict,
+    cu_task: dict,
+    resolver: dict[str, int],
+    conflict: str,
+    task_name: str,
+    stats: dict,
+) -> None:
+    """Reconcile assignees during ``sync``, honoring the conflict strategy.
+
+    Assignees are a set, not a scalar, so resolution is at the whole-set level
+    (one decision per task) rather than per ClickUp user.
+    """
+    if not _assignees_differ(story, cu_task, resolver):
+        return
+
+    if conflict == "local":
+        if _sync_assignees(token, story["clickup_id"], cu_task, story, resolver):
+            log.info(f"  Assignees on '{task_name}': local wins")
+            stats["resolved_local"] += 1
+    elif conflict == "remote":
+        if _pull_assignees(story, cu_task):
+            log.info(f"  Assignees on '{task_name}': remote wins")
+            stats["resolved_remote"] += 1
+    else:  # "ask" / "merge" — prompt once at the set level
+        y = story.get("assignees", "(unmanaged)")
+        r = _cu_assignee_keys(cu_task)
+        log.info(f"\n  Assignees differ on '{task_name}':")
+        log.info(f"    [L]ocal (YAML):     {y}")
+        log.info(f"    [R]emote (ClickUp): {r}")
+        choice = input("    Choose: [l(ocal)/r(emote)/s(kip)] ").strip().lower()
+        if choice == "l":
+            if _sync_assignees(token, story["clickup_id"], cu_task, story, resolver):
+                stats["resolved_local"] += 1
+        elif choice == "r":
+            if _pull_assignees(story, cu_task):
+                stats["resolved_remote"] += 1
+        else:
+            stats["skipped"] += 1
 
 
 # ---------------------------------------------------------------------------

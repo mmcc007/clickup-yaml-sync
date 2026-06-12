@@ -575,3 +575,214 @@ class TestPushIntegration:
         assert set_cf.call_args.args[1] == "NEW-1"
         assert set_cf.call_args.args[2] == "FIELD-UUID"
         assert set_cf.call_args.args[3] == "OPT-MAGNIT"
+
+
+# ---------------------------------------------------------------------------
+# 7. Assignees: resolution + bidirectional reconcile
+# ---------------------------------------------------------------------------
+
+MEMBERS = [
+    {"id": 100, "username": "Kathy Jung", "email": "kathy@e-m-marketing.com"},
+    {"id": 200, "username": "Charlie Mock", "email": "charliem@e-m-marketing.com"},
+    {"id": 300, "username": "Maurice McCabe", "email": "maurice@spark6.com"},
+]
+
+
+@pytest.fixture(autouse=True)
+def _no_real_member_fetch():
+    """cmd_push/sync/diff now fetch list members; default to an empty roster so
+    no test accidentally hits the network. Tests that exercise assignees patch
+    clickup_get_list_members explicitly to override this."""
+    with mock.patch.object(clickup, "clickup_get_list_members", return_value=[]):
+        yield
+
+
+def _cu_task_assignees(task_id: str, id_emails: list[tuple[int, str]]) -> dict:
+    base = _cu_task(task_id, [])
+    base["assignees"] = [
+        {"id": uid, "username": f"u{uid}", "email": email}
+        for uid, email in id_emails
+    ]
+    return base
+
+
+class TestAssigneeResolver:
+    def test_resolves_email_username_and_id(self):
+        r = clickup._build_assignee_resolver(MEMBERS)
+        ids, unresolved = clickup._resolve_assignee_ids(
+            ["kathy@e-m-marketing.com", "Charlie Mock", "300"], r
+        )
+        assert ids == [100, 200, 300]
+        assert unresolved == []
+
+    def test_case_insensitive_and_dedup(self):
+        r = clickup._build_assignee_resolver(MEMBERS)
+        ids, unresolved = clickup._resolve_assignee_ids(
+            ["KATHY@E-M-MARKETING.COM", "kathy@e-m-marketing.com"], r
+        )
+        assert ids == [100]
+        assert unresolved == []
+
+    def test_unknown_is_reported_not_fatal(self):
+        r = clickup._build_assignee_resolver(MEMBERS)
+        ids, unresolved = clickup._resolve_assignee_ids(["nobody@x.com"], r)
+        assert ids == []
+        assert unresolved == ["nobody@x.com"]
+
+
+class TestSyncAssignees:
+    def setup_method(self):
+        self.r = clickup._build_assignee_resolver(MEMBERS)
+
+    def test_absent_key_is_unmanaged_noop(self):
+        story = _story_with("s", clickup_id="T1")
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        with mock.patch.object(clickup, "clickup_update_task") as upd:
+            assert clickup._sync_assignees("tok", "T1", cu, story, self.r) is False
+        upd.assert_not_called()
+
+    def test_adds_and_removes_to_match_yaml(self):
+        story = _story_with("s", clickup_id="T1", assignees=["charliem@e-m-marketing.com"])
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        with mock.patch.object(clickup, "clickup_update_task") as upd:
+            assert clickup._sync_assignees("tok", "T1", cu, story, self.r) is True
+        assert upd.call_args.args[2] == {"assignees": {"add": [200], "rem": [100]}}
+
+    def test_empty_list_clears(self):
+        story = _story_with("s", clickup_id="T1", assignees=[])
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        with mock.patch.object(clickup, "clickup_update_task") as upd:
+            assert clickup._sync_assignees("tok", "T1", cu, story, self.r) is True
+        assert upd.call_args.args[2] == {"assignees": {"add": [], "rem": [100]}}
+
+    def test_no_change_when_already_matches(self):
+        story = _story_with("s", clickup_id="T1", assignees=["kathy@e-m-marketing.com"])
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        with mock.patch.object(clickup, "clickup_update_task") as upd:
+            assert clickup._sync_assignees("tok", "T1", cu, story, self.r) is False
+        upd.assert_not_called()
+
+
+class TestPullAssignees:
+    def test_reads_remote_into_yaml_sorted(self):
+        story = _story_with("s", clickup_id="T1")
+        cu = _cu_task_assignees("T1", [
+            (200, "charliem@e-m-marketing.com"), (100, "kathy@e-m-marketing.com")
+        ])
+        assert clickup._pull_assignees(story, cu) is True
+        assert story["assignees"] == [
+            "charliem@e-m-marketing.com", "kathy@e-m-marketing.com"
+        ]
+
+    def test_remote_removal_becomes_empty_list_when_managed(self):
+        story = _story_with("s", clickup_id="T1", assignees=["kathy@e-m-marketing.com"])
+        cu = _cu_task_assignees("T1", [])
+        assert clickup._pull_assignees(story, cu) is True
+        assert story["assignees"] == []
+
+    def test_no_litter_when_both_empty(self):
+        story = _story_with("s", clickup_id="T1")
+        cu = _cu_task_assignees("T1", [])
+        assert clickup._pull_assignees(story, cu) is False
+        assert "assignees" not in story
+
+    def test_idempotent_when_equal(self):
+        story = _story_with("s", clickup_id="T1", assignees=["kathy@e-m-marketing.com"])
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        assert clickup._pull_assignees(story, cu) is False
+
+
+class TestBuildTaskBodyAssignees:
+    def test_create_body_includes_ids(self):
+        body = clickup.build_task_body(
+            _story_with("s"), {"backlog": "backlog"}, assignee_ids=[100, 200]
+        )
+        assert body["assignees"] == [100, 200]
+
+    def test_create_body_omits_when_empty(self):
+        body = clickup.build_task_body(
+            _story_with("s"), {"backlog": "backlog"}, assignee_ids=[]
+        )
+        assert "assignees" not in body
+
+
+class TestPushAssigneesIntegration:
+    def test_create_resolves_emails_to_ids(self, tmp_path):
+        data = _data_with({
+            "Kickoff / Access": [
+                _story_with("new task", assignees=["kathy@e-m-marketing.com"]),
+            ],
+        })
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        created: dict = {}
+
+        def _fake_create(token, list_id, body):
+            created["body"] = body
+            return {"id": "NEW-1", "custom_id": None}
+
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[]), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=MEMBERS), \
+             mock.patch.object(clickup, "clickup_create_task", side_effect=_fake_create), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=False,
+                             backup_path=None, backup_default=False)
+        assert created["body"]["assignees"] == [100]
+
+    def test_update_reconciles_to_match_yaml(self, tmp_path):
+        data = _data_with({
+            "Kickoff / Access": [
+                _story_with("existing", clickup_id="T1",
+                            assignees=["charliem@e-m-marketing.com"]),
+            ],
+        })
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=MEMBERS), \
+             mock.patch.object(clickup, "clickup_update_task") as upd, \
+             mock.patch.object(clickup, "clickup_add_tag"), \
+             mock.patch.object(clickup, "clickup_remove_tag"), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=False,
+                             backup_path=None, backup_default=False)
+        assignee_calls = [c for c in upd.call_args_list if "assignees" in c.args[2]]
+        assert len(assignee_calls) == 1
+        assert assignee_calls[0].args[2]["assignees"] == {"add": [200], "rem": [100]}
+
+
+class TestPullAssigneesDryRunPreview:
+    def test_target_is_pure_and_matches_apply(self):
+        # _assignees_pull_target must NOT mutate, and must agree with _pull_assignees.
+        story = _story_with("s", clickup_id="T1")
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        target = clickup._assignees_pull_target(story, cu)
+        assert target == ["kathy@e-m-marketing.com"]
+        assert "assignees" not in story  # not mutated by the preview
+        # Applying yields the same value the preview reported.
+        assert clickup._pull_assignees(story, cu) is True
+        assert story["assignees"] == target
+
+    def test_target_none_when_equal(self):
+        story = _story_with("s", clickup_id="T1", assignees=["kathy@e-m-marketing.com"])
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        assert clickup._assignees_pull_target(story, cu) is None
+
+    def test_dry_run_pull_does_not_write_assignees(self, tmp_path):
+        data = _data_with({
+            "Kickoff / Access": [_story_with("s", clickup_id="T1")],
+        })
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "save_yaml") as save:
+            clickup.cmd_pull(data, str(yaml_path), dry_run=True)
+        # Dry run must not mutate the in-memory story nor save.
+        assert "assignees" not in data["epics"][0]["stories"][0]
+        save.assert_not_called()
