@@ -221,6 +221,23 @@ properties:
                   type: string
                 example: ["signal-automation", "slack", "security"]
 
+              assignees:
+                type: array
+                description: >
+                  ClickUp assignees for this story, as human-readable strings
+                  (emails preferred; usernames also accepted). Push resolves
+                  each to a ClickUp user id via the list's member roster and
+                  reconciles the task to match exactly; pull writes the remote
+                  assignees (as emails) back here. Semantics mirror tags' UI
+                  coexistence: OMIT this key to leave ClickUp assignees
+                  untouched (so UI-set assignees are preserved); set an EMPTY
+                  list to clear all assignees; set a list to make YAML
+                  authoritative. Names not found in the roster are warned and
+                  skipped, not fatal.
+                items:
+                  type: string
+                example: ["kathy@e-m-marketing.com", "charliem@e-m-marketing.com"]
+
               epic_dropdown_value:
                 type: [string, "null"]
                 description: >

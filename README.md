@@ -45,6 +45,39 @@ Tags that **are** in the managed universe but not on the story being
 pushed are treated as stale and removed — that's how an epic or milestone
 reassignment in YAML actually takes effect.
 
+## Assignees (bidirectional)
+
+Each story can carry an `assignees` list of human-readable strings — emails
+(preferred) or ClickUp usernames:
+
+```yaml
+stories:
+  - name: Slack workspace export
+    clickup_id: 86ba84bqa
+    points: 2
+    status: backlog
+    assignees:
+      - kathy@e-m-marketing.com
+```
+
+Resolution is automatic: `push` looks up the list's member roster and converts
+each string to the numeric ClickUp user id the API needs; `pull` writes the
+remote assignees (as emails) back into the YAML. Names not on the roster are
+**warned and skipped**, never fatal.
+
+Semantics mirror tags' coexistence with the ClickUp UI:
+
+| YAML on the story | Push behaviour |
+|---|---|
+| no `assignees` key | **Unmanaged** — ClickUp assignees left untouched (UI assignments preserved) |
+| `assignees: []` | **Clear** — all assignees removed |
+| `assignees: [a, b]` | **Authoritative** — ClickUp reconciled to exactly this set |
+
+`pull` always reads remote assignees back — so if someone reassigns a task in
+the ClickUp UI, the next `pull`/`sync` reflects it in YAML. Under `sync`, the
+`--conflict` strategy applies at the whole-set level (`local` = YAML wins,
+`remote` = ClickUp wins, `ask` = one prompt per task when they diverge).
+
 ### Pushing a custom dropdown field (e.g., a PM-curated "Epic" field)
 
 If ClickUp has a single-select dropdown custom field that mirrors the epic
@@ -91,6 +124,40 @@ Used with `sync --conflict`:
 | `remote` | ClickUp wins all conflicts (equivalent to pull) |
 | `ask` | Interactive per-field prompt (default) |
 | `merge` | LLM proposes a merged value; you confirm each |
+
+## Field coverage & limitations
+
+Which task fields the sync actually handles, and in which direction. **If a
+field is not listed as supported, the tool ignores it — it is neither pushed
+nor pulled, and a value set in the ClickUp UI will be invisible to the YAML
+(and vice-versa).**
+
+| Field | Push (YAML→ClickUp) | Pull (ClickUp→YAML) |
+|-------|:--:|:--:|
+| name | ✅ | ✅ |
+| status (via `status_map`) | ✅ | ✅ |
+| description (with `Points/Milestone/Sprint` meta header) | ✅ | ✅ |
+| priority (`1`=urgent, `2`=high, `3`=normal, `4`=low, `null`=none) | ✅ | ✅ |
+| milestone (`custom_item_id`) | ✅ | ✅ |
+| assignees | ✅ | ✅ |
+| tags | ✅ (additive; UI-added tags preserved) | ⚠️ epic placement only — UI tag *edits* are **not** pulled into YAML |
+| Epic dropdown (one configured custom field) | ✅ | ❌ |
+
+**Not implemented at all (silently ignored both directions):**
+
+- **`due_date` / `start_date`** — no deadline sync.
+- **`time_estimate`** — not synced.
+- **Native ClickUp `points` field** — the YAML `points` value is shown only as
+  `Points: N` text in the description; it does not populate ClickUp's Sprint
+  Points field.
+- **Arbitrary custom fields** — only the single configured Epic dropdown is
+  handled. Other custom fields (e.g. the **A–D deliverable-group field** on the
+  EM Marketing board) are not read or written.
+
+Caveat on `priority`: a YAML value only reaches the board on a `push`/`sync`
+that runs *after* the value is set — setting it in YAML and never pushing
+leaves the board unchanged (this is data drift, not a bug). Likewise, push
+cannot reliably *clear* a board priority back to none.
 
 ## Setup
 
