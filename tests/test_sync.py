@@ -786,3 +786,241 @@ class TestPullAssigneesDryRunPreview:
         # Dry run must not mutate the in-memory story nor save.
         assert "assignees" not in data["epics"][0]["stories"][0]
         save.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 3-way merge engine (feat/3way-merge)
+# ---------------------------------------------------------------------------
+
+SMAP = {"done": "done", "in_progress": "current sprint", "backlog": "backlog"}
+
+
+def test_classify_3way_none_when_local_equals_remote():
+    assert clickup.classify_3way("A", "A", "A") == "none"
+    # converged: both moved to same value, base stale -> still none
+    assert clickup.classify_3way("A", "B", "B") == "none"
+
+
+def test_classify_3way_push_when_only_local_changed():
+    assert clickup.classify_3way("A", "B", "A") == "push"
+
+
+def test_classify_3way_pull_when_only_remote_changed():
+    assert clickup.classify_3way("A", "A", "B") == "pull"
+
+
+def test_classify_3way_conflict_when_both_changed_differently():
+    assert clickup.classify_3way("A", "B", "C") == "conflict"
+
+
+def test_classify_3way_missing_base_is_conflict_when_sides_differ():
+    assert clickup.classify_3way(clickup._MISSING, "B", "C") == "conflict"
+    # ...but agreement still wins even with no base
+    assert clickup.classify_3way(clickup._MISSING, "B", "B") == "none"
+
+
+def test_comparable_local_uses_status_map_and_meta_header():
+    story = _story_with("T", status="in_progress", points=3,
+                        milestone_label="M2", description="body")
+    comp = clickup.comparable_local(story, SMAP)
+    assert comp["status"] == "current sprint"          # mapped + lowercased
+    assert comp["name"] == "T"
+    assert comp["milestone"] is False
+    assert "Points: 3" in comp["description"] and "body" in comp["description"]
+
+
+def test_comparable_remote_lowercases_status():
+    cu = _cu_task("x", [])
+    cu["status"] = {"status": "Current Sprint"}
+    cu["name"] = "R"
+    assert clickup.comparable_remote(cu, SMAP)["status"] == "current sprint"
+    assert clickup.comparable_remote(cu, SMAP)["name"] == "R"
+
+
+def test_three_way_plan_mixed_directions():
+    # base: status "backlog", name "orig"
+    base = {"status": "backlog", "name": "orig", "description": "",
+            "priority": None, "milestone": False}
+    # local moved status -> in_progress (push); remote moved name -> "new" (pull)
+    story = _story_with("orig", status="in_progress")
+    cu = _cu_task("x", [])
+    cu["name"] = "new"
+    cu["status"] = {"status": "backlog"}
+    plan = clickup.three_way_plan(base, story, cu, SMAP)
+    assert plan == {"status": "push", "name": "pull"}
+
+
+def test_three_way_plan_true_conflict():
+    base = {"status": "backlog", "name": "orig", "description": "",
+            "priority": None, "milestone": False}
+    story = _story_with("local-name", status="backlog")   # local changed name
+    cu = _cu_task("x", [])
+    cu["name"] = "remote-name"                              # remote changed name too
+    cu["status"] = {"status": "backlog"}
+    plan = clickup.three_way_plan(base, story, cu, SMAP)
+    assert plan == {"name": "conflict"}
+
+
+def test_base_snapshot_roundtrip(tmp_path):
+    data = {
+        "project": {"clickup_list_id": "999", "name": "p"},
+        "epics": [_epic_with("E", [
+            _story_with("S1", status="in_progress", clickup_id="aaa"),
+            _story_with("S2", status="backlog"),  # no clickup_id -> excluded
+        ])],
+    }
+    p = clickup.base_snapshot_path(str(tmp_path / "proj.yaml"), "999")
+    clickup.save_base_snapshot(p, data, SMAP)
+    assert p.exists()
+    loaded = clickup.load_base_snapshot(p)
+    assert set(loaded.keys()) == {"aaa"}
+    assert loaded["aaa"]["status"] == "current sprint"
+
+
+def test_load_base_snapshot_absent_returns_empty(tmp_path):
+    assert clickup.load_base_snapshot(tmp_path / "nope.json") == {}
+
+
+# ---------------------------------------------------------------------------
+# 3-way sync integration (mocked API) — feat/3way-merge
+# ---------------------------------------------------------------------------
+
+
+def _3way_fixture(tmp_path, local_name, remote_name, remote_status="to do"):
+    """Build a 1-story project, establish a base at name='orig'/status backlog,
+    then apply a local rename and return (data, story, cu, yaml_path)."""
+    smap = {"backlog": "to do", "done": "complete"}
+    story = _story_with("orig", clickup_id="T1", status="backlog")
+    data = {
+        "project": {"name": "p", "clickup_list_id": "L1", "push_epic_tag": False},
+        "status_map": smap,
+        "epics": [_epic_with("E", [story])],
+    }
+    yaml_path = tmp_path / "p.yaml"
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(data, f)
+    # establish base = the pre-edit agreed state
+    clickup.save_base_snapshot(
+        clickup.base_snapshot_path(str(yaml_path), "L1"), data, smap
+    )
+    story["name"] = local_name           # local edit
+    cu = _cu_task("T1", [])
+    cu["name"] = remote_name             # remote edit
+    cu["status"] = {"status": remote_status}
+    return data, story, cu, yaml_path
+
+
+def _run_sync(data, cu, yaml_path, **kw):
+    updates: list[dict] = []
+    with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+         mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+         mock.patch.object(clickup, "clickup_update_task",
+                           side_effect=lambda t, i, b: updates.append(b) or {}), \
+         mock.patch.object(clickup, "clickup_add_tag"), \
+         mock.patch.object(clickup, "clickup_remove_tag"), \
+         mock.patch.object(clickup, "clickup_set_custom_field"):
+        stats = clickup.cmd_sync(data, str(yaml_path), **kw)
+    return stats, updates
+
+
+def test_sync_3way_one_sided_auto_resolve(tmp_path):
+    # local changed name (->push); remote changed status to complete (->pull)
+    data, story, cu, yp = _3way_fixture(tmp_path, "local-name", "orig",
+                                        remote_status="complete")
+    stats, updates = _run_sync(data, cu, yp, on_conflict="stop")
+    assert stats["conflicts"] == 0
+    assert any(u.get("name") == "local-name" for u in updates)  # name pushed
+    assert story["status"] == "done"                            # status pulled
+
+
+def test_sync_3way_true_conflict_stops_no_mutation(tmp_path):
+    # both sides changed name -> true conflict; default stop aborts
+    data, story, cu, yp = _3way_fixture(tmp_path, "local", "remote")
+    stats, updates = _run_sync(data, cu, yp, on_conflict="stop")
+    assert stats["conflicts"] == 1
+    assert updates == []            # nothing pushed
+    assert story["name"] == "local" # YAML untouched
+
+
+def test_sync_3way_conflict_policy_remote_resolves(tmp_path):
+    data, story, cu, yp = _3way_fixture(tmp_path, "local", "remote")
+    stats, updates = _run_sync(data, cu, yp, on_conflict="remote")
+    assert story["name"] == "remote"      # pulled
+    assert stats["resolved_remote"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# H1 regression: description meta-header must not double across pull->push
+# ---------------------------------------------------------------------------
+
+
+def test_pull_strips_meta_header_no_doubling():
+    story = _story_with("T", points=3, description="hello")
+    pushed = clickup.description_with_meta(story)            # "Points: 3\n\nhello"
+    cu = _cu_task("x", []); cu["description"] = pushed
+    clickup._pull_field_to_yaml(story, cu, "description", SMAP)
+    assert story["description"] == "hello"                   # header stripped on pull
+    assert clickup.description_with_meta(story) == pushed    # no doubling on re-push
+
+
+def test_pull_strips_meta_header_with_remote_body_edit():
+    story = _story_with("T", points=3, description="hello")
+    cu = _cu_task("x", []); cu["description"] = "Points: 3\n\nhello world"  # remote edited body
+    clickup._pull_field_to_yaml(story, cu, "description", SMAP)
+    assert story["description"] == "hello world"
+    assert clickup.description_with_meta(story) == "Points: 3\n\nhello world"
+
+
+def test_pull_no_meta_passes_through():
+    story = _story_with("T", points=0, description="x")      # no meta header
+    cu = _cu_task("x", []); cu["description"] = "remote body"
+    clickup._pull_field_to_yaml(story, cu, "description", SMAP)
+    assert story["description"] == "remote body"
+
+
+def test_pull_does_not_eat_user_body_that_lacks_the_header():
+    story = _story_with("T", points=3, description="hello")
+    cu = _cu_task("x", []); cu["description"] = "a real body with no header line"
+    clickup._pull_field_to_yaml(story, cu, "description", SMAP)
+    assert story["description"] == "a real body with no header line"
+
+
+# ---------------------------------------------------------------------------
+# M3: corrupt base must NOT silently degrade to interactive 2-way
+# ---------------------------------------------------------------------------
+
+
+def test_load_base_snapshot_corrupt_raises(tmp_path):
+    p = tmp_path / "base.json"
+    p.write_text("{not valid json")
+    with pytest.raises(clickup.BaseSnapshotCorrupt):
+        clickup.load_base_snapshot(p)
+
+
+def test_load_base_snapshot_bad_shape_raises(tmp_path):
+    p = tmp_path / "base.json"
+    p.write_text('{"tasks": [1, 2, 3]}')  # tasks must be a mapping
+    with pytest.raises(clickup.BaseSnapshotCorrupt):
+        clickup.load_base_snapshot(p)
+
+
+def test_sync_corrupt_base_refuses_no_mutation(tmp_path):
+    smap = {"backlog": "to do", "done": "complete"}
+    story = _story_with("orig", clickup_id="T1", status="backlog")
+    data = {
+        "project": {"name": "p", "clickup_list_id": "L1", "push_epic_tag": False},
+        "status_map": smap,
+        "epics": [_epic_with("E", [story])],
+    }
+    yaml_path = tmp_path / "p.yaml"
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(data, f)
+    bp = clickup.base_snapshot_path(str(yaml_path), "L1")
+    bp.parent.mkdir(parents=True, exist_ok=True)
+    bp.write_text("{corrupt")  # exists but unparseable
+    cu = _cu_task("T1", [])
+    cu["name"] = "remote-name"
+    stats, updates = _run_sync(data, cu, yaml_path, on_conflict="stop")
+    assert stats["errors"] >= 1
+    assert updates == []              # refused -> nothing pushed
+    assert story["name"] == "orig"    # ...and nothing pulled either
