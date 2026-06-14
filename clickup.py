@@ -130,6 +130,94 @@ def save_yaml(data: dict, path: str) -> None:
     with open(path, "w") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False, width=120)
     log.info(f"YAML saved to {path}")
+    # Refresh the 3-way base snapshot so the next sync can tell who-changed-what.
+    # Persisting here (the single chokepoint for push/pull/sync) keeps the base
+    # fresh even under interleaved pull->edit->push workflows. Best-effort: a
+    # base-write failure must never fail the YAML save.
+    try:
+        list_id = data.get("project", {}).get("clickup_list_id")
+        if list_id:
+            save_base_snapshot(
+                base_snapshot_path(path, str(list_id)),
+                data,
+                data.get("status_map", {}),
+            )
+    except Exception as e:  # pragma: no cover - defensive
+        log.warning(f"Could not write base snapshot: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 3-way base snapshot persistence (sidecar JSON per list)
+# ---------------------------------------------------------------------------
+#
+# Stored next to the project YAML at .clickup-sync/base-<list_id>.json. Holds
+# the comparable scalar fields of every story with a clickup_id, as of the
+# last successful reconcile. Written by push/pull/sync; read by sync to drive
+# the 3-way merge. Absent file => sync falls back to 2-way (and writes one).
+
+
+class BaseSnapshotCorrupt(Exception):
+    """A base snapshot file exists but cannot be parsed. Distinct from 'absent'
+    so the caller can refuse to silently degrade to interactive 2-way."""
+
+
+def base_snapshot_path(yaml_path: str, list_id: str) -> Path:
+    return Path(yaml_path).resolve().parent / ".clickup-sync" / f"base-{list_id}.json"
+
+
+def load_base_snapshot(path: Path) -> dict:
+    """Return {clickup_id: {field: value}}.
+
+    Absent file -> {} (a legitimate first run; caller falls back to 2-way).
+    Present-but-unparseable -> raise BaseSnapshotCorrupt, so the caller does NOT
+    silently lose the 3-way safety model (M3).
+    """
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise BaseSnapshotCorrupt(f"{path}: {e}") from e
+    tasks = doc.get("tasks", {})
+    if not isinstance(tasks, dict):
+        raise BaseSnapshotCorrupt(f"{path}: 'tasks' is not a mapping")
+    return tasks
+
+
+def build_base_from_yaml(data: dict, status_map: dict) -> dict:
+    """Comparable scalar snapshot for every story that has a clickup_id."""
+    tasks: dict = {}
+    for epic in data.get("epics", []):
+        for story in epic.get("stories", []):
+            cid = story.get("clickup_id")
+            if cid:
+                tasks[cid] = comparable_local(story, status_map)
+    return tasks
+
+
+def save_base_snapshot(path: Path, data: dict, status_map: dict) -> None:
+    """Write the base snapshot from the (post-reconcile) YAML state, atomically."""
+    tasks = build_base_from_yaml(data, status_map)
+    doc = {
+        "version": 1,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "tasks": tasks,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(doc, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+    log.info(f"Base snapshot saved to {path} ({len(tasks)} tasks)")
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +449,27 @@ def description_with_meta(story: dict) -> str:
     return f"{meta}\n\n{body}".strip() if body else meta
 
 
+def strip_meta_prefix(raw: Optional[str], story: dict) -> str:
+    """Inverse of description_with_meta: remove the leading Points/Milestone/
+    Sprint header this tool would have prepended, so a description pulled from
+    ClickUp doesn't re-accumulate the header on the next push (the H1 bug).
+
+    Anchored to the EXACT header generated for *this* story — never a loose
+    regex — so a user's own first line is left untouched unless it byte-matches
+    the header we would have written.
+    """
+    raw = raw or ""
+    meta = _meta_prefix(story)
+    if not meta or not raw:
+        return raw
+    if raw == meta:
+        return ""
+    prefix = f"{meta}\n\n"
+    if raw.startswith(prefix):
+        return raw[len(prefix):]
+    return raw
+
+
 def compare_task(
     yaml_task: dict,
     clickup_task: dict,
@@ -408,6 +517,91 @@ def compare_task(
 def _is_clickup_milestone(cu_task: dict) -> bool:
     """Check if a ClickUp task is a milestone (custom_item_id == 1)."""
     return cu_task.get("custom_item_id") == CUSTOM_ITEM_MILESTONE
+
+
+# ---------------------------------------------------------------------------
+# 3-way merge engine (base snapshot)
+# ---------------------------------------------------------------------------
+#
+# The 2-way diff (YAML vs ClickUp) cannot tell WHICH side changed a field — a
+# difference could be a local edit or a remote edit, so every difference looks
+# like a conflict. A persisted *base* snapshot (the agreed field values as of
+# the last successful reconcile) makes it a 3-way merge: a field that moved on
+# only one side auto-resolves toward that side; a field that moved on BOTH
+# sides to different values is a true conflict that no policy can resolve
+# correctly without human judgement.
+#
+# Scope (v1): the scalar SYNCED_FIELDS only (name/status/description/priority/
+# milestone). Assignees and tags keep their existing set-level reconcile.
+
+_MISSING = object()
+
+
+def comparable_local(story: dict, status_map: dict) -> dict:
+    """Scalar fields of a YAML story in the same comparable form compare_task uses."""
+    return {
+        "name": story.get("name", ""),
+        "status": yaml_status_to_clickup(story.get("status", ""), status_map).lower(),
+        "description": normalize_description(description_with_meta(story)),
+        "priority": story.get("priority"),
+        "milestone": bool(story.get("milestone")),
+    }
+
+
+def comparable_remote(cu_task: dict, status_map: dict) -> dict:
+    """Scalar fields of a ClickUp task in the same comparable form compare_task uses."""
+    return {
+        "name": cu_task.get("name", ""),
+        "status": (cu_task.get("status", {}).get("status", "") or "").lower(),
+        "description": normalize_description(cu_task.get("description", "") or ""),
+        "priority": clickup_priority_to_yaml(cu_task.get("priority")),
+        "milestone": _is_clickup_milestone(cu_task),
+    }
+
+
+def classify_3way(base_v: Any, local_v: Any, remote_v: Any) -> str:
+    """Classify one field's 3-way state.
+
+    Returns:
+      'none'     — local and remote already agree (nothing to do)
+      'push'     — only the local side changed since base -> write to ClickUp
+      'pull'     — only the remote side changed since base -> write to YAML
+      'conflict' — both sides changed to different values, or base is unknown
+    """
+    if local_v == remote_v:
+        return "none"
+    changed_local = local_v != base_v
+    changed_remote = remote_v != base_v
+    if changed_local and not changed_remote:
+        return "push"
+    if changed_remote and not changed_local:
+        return "pull"
+    # Both moved (to different values, since local != remote), or base is
+    # missing for this field -> cannot safely auto-resolve.
+    return "conflict"
+
+
+def three_way_plan(
+    base_fields: dict,
+    story: dict,
+    cu_task: dict,
+    status_map: dict,
+    fields: Optional[list] = None,
+) -> dict:
+    """Per-field 3-way classification for one matched task.
+
+    Returns {field: action} only for fields whose local/remote differ.
+    ``base_fields`` is the snapshot for this task's clickup_id (may be ``{}``).
+    """
+    fields = fields or SYNCED_FIELDS
+    loc = comparable_local(story, status_map)
+    rem = comparable_remote(cu_task, status_map)
+    plan: dict = {}
+    for f in fields:
+        action = classify_3way(base_fields.get(f, _MISSING), loc.get(f), rem.get(f))
+        if action != "none":
+            plan[f] = action
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -1255,7 +1449,7 @@ def _apply_clickup_to_yaml(yaml_task: dict, cu_task: dict, status_map: dict) -> 
     yaml_task["name"] = cu_task.get("name", yaml_task.get("name", ""))
     cu_status = cu_task.get("status", {}).get("status", "")
     yaml_task["status"] = clickup_status_to_yaml(cu_status, status_map)
-    yaml_task["description"] = cu_task.get("description") or ""
+    yaml_task["description"] = strip_meta_prefix(cu_task.get("description"), yaml_task)
     cu_priority = clickup_priority_to_yaml(cu_task.get("priority"))
     if cu_priority is not None:
         yaml_task["priority"] = cu_priority
@@ -1555,7 +1749,7 @@ def _pull_field_to_yaml(yaml_task: dict, cu_task: dict, field: str, status_map: 
         cu_status = cu_task.get("status", {}).get("status", "")
         yaml_task["status"] = clickup_status_to_yaml(cu_status, status_map)
     elif field == "description":
-        yaml_task["description"] = cu_task.get("description") or ""
+        yaml_task["description"] = strip_meta_prefix(cu_task.get("description"), yaml_task)
     elif field == "priority":
         yaml_task["priority"] = clickup_priority_to_yaml(cu_task.get("priority"))
     elif field == "milestone":
@@ -1573,12 +1767,19 @@ def cmd_sync(
     data: dict,
     yaml_path: str,
     conflict: str = "ask",
+    on_conflict: str = "stop",
     dry_run: bool = False,
     backup_path: Optional[str] = None,
     backup_default: bool = False,
 ) -> dict:
-    """Full bidirectional sync with per-conflict resolution.
-    Stories are flat top-level tasks with epic tags. Epics are YAML-only."""
+    """Full bidirectional sync.
+
+    When a base snapshot exists (written by a prior push/pull/sync), this is a
+    3-way merge: one-sided scalar-field changes auto-resolve toward the side
+    that moved; true conflicts (both sides changed the same field) are handled
+    per ``on_conflict`` (stop|local|remote). When no base exists yet, it falls
+    back to the legacy 2-way reconcile driven by ``conflict`` and writes a base
+    for next time. Stories are flat top-level tasks with epic tags."""
     token = get_clickup_token()
     list_id = data["project"]["clickup_list_id"]
     status_map = data.get("status_map", {})
@@ -1589,6 +1790,7 @@ def cmd_sync(
         "resolved_local": 0,
         "resolved_remote": 0,
         "resolved_merge": 0,
+        "conflicts": 0,
         "skipped": 0,
         "unchanged": 0,
         "archived": 0,
@@ -1619,6 +1821,42 @@ def cmd_sync(
     assignee_resolver = _build_assignee_resolver(
         clickup_get_list_members(token, list_id)
     )
+
+    # 3-way base: when present, drives auto-resolution; when absent, fall back
+    # to legacy 2-way and write a base at the end for next time.
+    try:
+        base = load_base_snapshot(base_snapshot_path(yaml_path, list_id))
+    except BaseSnapshotCorrupt as e:
+        log.error(f"Base snapshot is unreadable: {e}")
+        log.error(
+            "Refusing to sync — falling back here would silently switch to "
+            "interactive 2-way and lose the 3-way safety model. Delete the base "
+            "file to re-establish it (a `pull` or `push` rewrites it), then sync again."
+        )
+        stats["errors"] += 1
+        return stats
+    base_exists = bool(base)
+    if base_exists:
+        log.info(f"3-way mode: base snapshot has {len(base)} task(s).")
+        conflicts = _collect_3way_conflicts(
+            data, cu_by_id, base, status_map, assignee_resolver
+        )
+        if conflicts and on_conflict == "stop":
+            log.info(f"\n{'='*80}")
+            log.info(f"SYNC ABORTED — {len(conflicts)} true conflict(s); NO changes made.")
+            log.info(f"{'='*80}")
+            for c in conflicts:
+                log.info(f"  [CONFLICT] '{c['task']}' {c['field']}:")
+                log.info(f"      local:  {_truncate(str(c['local']), 60)}")
+                log.info(f"      remote: {_truncate(str(c['remote']), 60)}")
+            log.info(
+                "Resolve each (set the YAML to the intended value, or re-run with "
+                "--on-conflict local|remote), then sync again."
+            )
+            stats["conflicts"] = len(conflicts)
+            return stats
+    else:
+        log.info("No base snapshot yet — 2-way sync this run; base written for next time.")
 
     # Phase 2 & 4: Walk YAML stories, create or reconcile
     for epic in data["epics"]:
@@ -1673,10 +1911,16 @@ def cmd_sync(
                 _sync_metadata(story, cu_task)
                 diffs = compare_task(story, cu_task, status_map)
                 if diffs:
-                    _resolve_conflicts(
-                        story, cu_task, diffs, story_name, "Story",
-                        conflict, status_map, token, openai_key, stats, dry_run,
-                    )
+                    if base_exists:
+                        _resolve_conflicts_3way(
+                            story, cu_task, base.get(story["clickup_id"], {}),
+                            story_name, on_conflict, status_map, token, stats, dry_run,
+                        )
+                    else:
+                        _resolve_conflicts(
+                            story, cu_task, diffs, story_name, "Story",
+                            conflict, status_map, token, openai_key, stats, dry_run,
+                        )
                 else:
                     stats["unchanged"] += 1
                 # Reconcile multi-tag + Epic dropdown on every existing story.
@@ -1695,9 +1939,22 @@ def cmd_sync(
                 # local -> YAML wins, remote -> ClickUp wins, ask/merge ->
                 # prompt once when they diverge.
                 if not dry_run:
+                    # In 3-way mode, assignees aren't base-tracked; the pre-pass
+                    # has already flagged any divergence as a conflict (so under
+                    # 'stop' we never reach here with a difference). Under
+                    # local/remote we apply that direction, but warn loudly since
+                    # it can overwrite the side that didn't actually change (M1).
+                    assignee_strategy = on_conflict if base_exists else conflict
+                    if base_exists and _assignees_differ(story, cu_task, assignee_resolver):
+                        log.warning(
+                            f"  Assignees on '{story_name}' differ and are NOT base-tracked; "
+                            f"applying --on-conflict={on_conflict} may overwrite the unchanged "
+                            f"side. local={story.get('assignees', '(unmanaged)')} "
+                            f"remote={_cu_assignee_keys(cu_task)}"
+                        )
                     _reconcile_assignees_sync(
                         token, story, cu_task, assignee_resolver,
-                        conflict, story_name, stats,
+                        assignee_strategy, story_name, stats,
                     )
 
     # Phase 3: ClickUp tasks not in YAML -> create in YAML
@@ -1738,6 +1995,7 @@ def cmd_sync(
     log.info(f"  Resolved (local):   {stats['resolved_local']}")
     log.info(f"  Resolved (remote):  {stats['resolved_remote']}")
     log.info(f"  Resolved (merge):   {stats['resolved_merge']}")
+    log.info(f"  Conflicts:          {stats['conflicts']}")
     log.info(f"  Skipped:            {stats['skipped']}")
     log.info(f"  Unchanged:          {stats['unchanged']}")
     log.info(f"  Archived:           {stats['archived']}")
@@ -1852,6 +2110,88 @@ def _resolve_conflicts(
             else:
                 log.info(f"    -> skipped")
                 stats["skipped"] += 1
+
+
+def _collect_3way_conflicts(
+    data: dict,
+    cu_by_id: dict,
+    base: dict,
+    status_map: dict,
+    assignee_resolver: dict,
+) -> list[dict]:
+    """Read-only pre-pass: list true conflicts across all matched stories.
+
+    A true conflict is a scalar field that changed on BOTH sides since base
+    (three_way_plan -> 'conflict'), or an assignee-set divergence (assignees
+    aren't base-tracked, so any difference is surfaced rather than silently
+    resolved). Used to abort before any mutation when on_conflict='stop'.
+    """
+    conflicts: list[dict] = []
+    for epic in data.get("epics", []):
+        for story in epic.get("stories", []):
+            cid = story.get("clickup_id")
+            if not cid or cid not in cu_by_id:
+                continue
+            cu_task = cu_by_id[cid]
+            base_task = base.get(cid, {})
+            plan = three_way_plan(base_task, story, cu_task, status_map)
+            loc = comparable_local(story, status_map)
+            rem = comparable_remote(cu_task, status_map)
+            for field, action in plan.items():
+                if action == "conflict":
+                    conflicts.append({
+                        "task": story.get("name", "?"),
+                        "field": field,
+                        "local": loc.get(field),
+                        "remote": rem.get(field),
+                    })
+            if _assignees_differ(story, cu_task, assignee_resolver):
+                conflicts.append({
+                    "task": story.get("name", "?"),
+                    "field": "assignees",
+                    "local": story.get("assignees", "(unmanaged)"),
+                    "remote": _cu_assignee_keys(cu_task),
+                })
+    return conflicts
+
+
+def _resolve_conflicts_3way(
+    yaml_task: dict,
+    cu_task: dict,
+    base_task: dict,
+    task_name: str,
+    on_conflict: str,
+    status_map: dict,
+    token: str,
+    stats: dict,
+    dry_run: bool,
+) -> None:
+    """Apply 3-way directional resolution for one task's scalar fields.
+
+    One-sided change -> auto push/pull; true conflict -> on_conflict policy
+    (local=push, remote=pull). 'stop' conflicts never reach here because the
+    pre-pass aborts the whole sync first.
+    """
+    cu_id = yaml_task.get("clickup_id") or cu_task.get("id")
+    plan = three_way_plan(base_task, yaml_task, cu_task, status_map)
+    for field, action in plan.items():
+        if action == "conflict":
+            action = {"local": "push", "remote": "pull"}.get(on_conflict)
+            if action is None:
+                log.info(f"  [conflict] '{task_name}' {field}: skipped (no policy)")
+                stats["conflicts"] += 1
+                stats["skipped"] += 1
+                continue
+        if action == "push":
+            if not dry_run and cu_id:
+                _push_field_to_clickup(yaml_task, cu_task, field, status_map, token)
+            log.info(f"  3way '{task_name}' {field}: push (local wins)")
+            stats["resolved_local"] += 1
+        elif action == "pull":
+            if not dry_run:
+                _pull_field_to_yaml(yaml_task, cu_task, field, status_map)
+            log.info(f"  3way '{task_name}' {field}: pull (remote wins)")
+            stats["resolved_remote"] += 1
 
 
 def _reconcile_assignees_sync(
@@ -1992,7 +2332,16 @@ def main() -> None:
         "--conflict",
         choices=CONFLICT_STRATEGIES,
         default="ask",
-        help="Conflict resolution strategy for sync (default: ask)",
+        help="Legacy 2-way strategy for sync when no base snapshot exists yet "
+             "(default: ask)",
+    )
+    parser.add_argument(
+        "--on-conflict",
+        choices=("stop", "local", "remote"),
+        default="stop",
+        help="3-way true-conflict policy for sync when a base exists "
+             "(stop=abort & report, local=YAML wins, remote=ClickUp wins; "
+             "default: stop)",
     )
     parser.add_argument(
         "--backup-to",
@@ -2040,6 +2389,7 @@ def main() -> None:
             data,
             args.yaml_file,
             conflict=args.conflict,
+            on_conflict=args.on_conflict,
             dry_run=args.dry_run,
             backup_path=args.backup_to,
             backup_default=False,

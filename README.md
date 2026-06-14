@@ -114,14 +114,47 @@ YAML file you can `pull --conflict remote` from if a push goes sideways.
 - `sync` and `merge` accept the same `--backup-to` flag but **don't**
   auto-backup — pass the flag explicitly to opt in.
 
-## Conflict Strategies
+## 3-way merge (sync)
+
+`sync` is a **3-way merge** whenever a base snapshot exists. The base — the
+field values as of the last successful reconcile — lives in a sidecar file per
+list at `<yaml-dir>/.clickup-sync/base-<list_id>.json`, written automatically
+by every `push`, `pull`, and `sync`. With a base, `sync` can tell *which* side
+changed a field instead of treating every difference as a conflict:
+
+| Field changed since base | Action |
+|---|---|
+| only in YAML | push to ClickUp (auto) |
+| only in ClickUp | pull into YAML (auto) |
+| both sides, same value | nothing |
+| both sides, **different** values | true conflict → `--on-conflict` |
+
+True conflicts are handled by `--on-conflict`:
+
+| `--on-conflict` | Behaviour |
+|---|---|
+| `stop` (default) | abort the whole sync, change nothing, print the conflict list |
+| `local` | YAML wins the conflicting fields |
+| `remote` | ClickUp wins the conflicting fields |
+
+`stop` is fail-safe — no silent data loss. With **no base** (e.g. the first
+run), `sync` falls back to the legacy 2-way reconcile below and writes a base
+for next time.
+
+**Scope:** 3-way covers the scalar synced fields (name, status, description,
+priority, milestone). Assignees and tags are not base-tracked — assignee
+divergence is surfaced as a conflict (so `stop` catches it; `local`/`remote`
+applies that direction). Keep `status_map` 1:1 — a many-to-one mapping makes
+the pull-side reverse-lookup ambiguous.
+
+## Conflict Strategies (legacy 2-way — only when no base exists yet)
 
 Used with `sync --conflict`:
 
 | Strategy | Behaviour |
 |----------|-----------|
-| `local` | YAML wins all conflicts (equivalent to push) |
-| `remote` | ClickUp wins all conflicts (equivalent to pull) |
+| `local` | YAML wins all differences (equivalent to push) |
+| `remote` | ClickUp wins all differences (equivalent to pull) |
 | `ask` | Interactive per-field prompt (default) |
 | `merge` | LLM proposes a merged value; you confirm each |
 
