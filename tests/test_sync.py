@@ -1024,3 +1024,92 @@ def test_sync_corrupt_base_refuses_no_mutation(tmp_path):
     assert stats["errors"] >= 1
     assert updates == []              # refused -> nothing pushed
     assert story["name"] == "orig"    # ...and nothing pulled either
+
+
+# ---------------------------------------------------------------------------
+# Date fields (due_date / start_date) — feat/date-fields
+# ---------------------------------------------------------------------------
+
+import datetime as _dt
+from datetime import timezone as _tz
+
+
+def test_yaml_date_roundtrip_noon_utc():
+    ms = clickup.yaml_date_to_clickup_ms("2026-06-20")
+    assert _dt.datetime.fromtimestamp(ms / 1000, _tz.utc).strftime("%Y-%m-%d %H:%M") == "2026-06-20 12:00"
+    assert clickup.clickup_ms_to_yaml_date(ms) == "2026-06-20"
+
+
+def test_norm_yaml_date_accepts_date_objects():
+    assert clickup._norm_yaml_date(_dt.date(2026, 6, 20)) == "2026-06-20"
+    assert clickup._norm_yaml_date(_dt.datetime(2026, 6, 20, 9, 30)) == "2026-06-20"
+    assert clickup._norm_yaml_date("2026-06-20") == "2026-06-20"
+    assert clickup._norm_yaml_date(None) is None
+    assert clickup._norm_yaml_date("") is None
+
+
+def test_date_conversions_none_safe():
+    assert clickup.yaml_date_to_clickup_ms(None) is None
+    assert clickup.clickup_ms_to_yaml_date(None) is None
+    assert clickup.clickup_ms_to_yaml_date("") is None
+
+
+def test_comparable_includes_dates():
+    story = _story_with("T", due_date="2026-06-20")
+    assert clickup.comparable_local(story, SMAP)["due_date"] == "2026-06-20"
+    cu = _cu_task("x", []); cu["due_date"] = clickup.yaml_date_to_clickup_ms("2026-07-01")
+    assert clickup.comparable_remote(cu, SMAP)["due_date"] == "2026-07-01"
+
+
+def test_compare_task_detects_and_matches_dates():
+    story = _story_with("T", clickup_id="x", status="backlog", due_date="2026-06-20")
+    cu = _cu_task("x", []); cu["name"] = "T"; cu["status"] = {"status": "backlog"}; cu["due_date"] = None
+    assert "due_date" in {d["field"] for d in clickup.compare_task(story, cu, SMAP)}
+    cu["due_date"] = clickup.yaml_date_to_clickup_ms("2026-06-20")  # now equal at date granularity
+    assert "due_date" not in {d["field"] for d in clickup.compare_task(story, cu, SMAP)}
+
+
+def test_three_way_due_date_one_sided_push():
+    base = {"name": "T", "status": "to do", "description": "", "priority": None,
+            "milestone": False, "due_date": None, "start_date": None}
+    story = _story_with("T", due_date="2026-06-20")
+    cu = _cu_task("x", []); cu["name"] = "T"; cu["status"] = {"status": "to do"}
+    assert clickup.three_way_plan(base, story, cu, SMAP).get("due_date") == "push"
+
+
+def test_push_due_date_sends_date_time_false():
+    story = _story_with("T", clickup_id="x", due_date="2026-06-20")
+    cu = _cu_task("x", [])
+    sent = []
+    with mock.patch.object(clickup, "clickup_update_task",
+                           side_effect=lambda t, i, b: sent.append(b) or {}):
+        clickup._push_field_to_clickup(story, cu, "due_date", SMAP, "tok")
+    assert sent and sent[0]["due_date_time"] is False
+    assert sent[0]["due_date"] == clickup.yaml_date_to_clickup_ms("2026-06-20")
+
+
+def test_pull_due_date_writes_date_string():
+    story = _story_with("T", clickup_id="x")
+    cu = _cu_task("x", []); cu["due_date"] = clickup.yaml_date_to_clickup_ms("2026-07-04")
+    clickup._pull_field_to_yaml(story, cu, "due_date", SMAP)
+    assert story["due_date"] == "2026-07-04"
+
+
+def test_build_task_body_includes_due_date():
+    story = _story_with("T", due_date="2026-06-20")
+    body = clickup.build_task_body(story, SMAP)
+    assert body["due_date"] == clickup.yaml_date_to_clickup_ms("2026-06-20")
+    assert body["due_date_time"] is False
+
+
+def test_apply_merged_value_handles_due_date():
+    # H1-class gap: the LLM accept-merge path must not silently drop dates.
+    story = _story_with("T", clickup_id="x", due_date="2026-06-20")
+    cu = _cu_task("x", [])
+    sent = []
+    with mock.patch.object(clickup, "clickup_update_task",
+                           side_effect=lambda t, i, b: sent.append(b) or {}):
+        clickup._apply_merged_value(story, cu, "due_date", "2026-07-04", SMAP, "tok")
+    assert story["due_date"] == "2026-07-04"
+    assert sent and sent[0]["due_date"] == clickup.yaml_date_to_clickup_ms("2026-07-04")
+    assert sent[0]["due_date_time"] is False
