@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Any, Optional
 
@@ -402,11 +402,49 @@ def clickup_priority_to_yaml(priority_obj: Optional[dict]) -> Optional[int]:
     return None
 
 
+def _norm_yaml_date(v: Any) -> Optional[str]:
+    """Normalize a YAML date value to 'YYYY-MM-DD'. YAML auto-parses an
+    unquoted 2026-06-20 into a date object, so accept str / date / datetime."""
+    if v in (None, ""):
+        return None
+    if isinstance(v, datetime):
+        return v.date().isoformat()
+    if isinstance(v, date):
+        return v.isoformat()
+    return str(v).strip()[:10]
+
+
+def yaml_date_to_clickup_ms(v: Any) -> Optional[int]:
+    """'YYYY-MM-DD' -> epoch ms at 12:00 UTC. Noon (not midnight) keeps the
+    calendar day stable when ClickUp normalizes a date-only value into the
+    workspace timezone — verified in sandbox: midnight drifts a day, noon does
+    not. Paired with due_date_time=false so ClickUp displays date-only.
+
+    Stable for workspaces UTC-12..UTC+11. YAML-originated dates are exact in
+    every tz; only a date set in the ClickUp UI of a UTC+12-or-east workspace
+    may pull back one calendar day earlier (it does NOT oscillate)."""
+    d = _norm_yaml_date(v)
+    if not d:
+        return None
+    dt = datetime.strptime(d, "%Y-%m-%d").replace(hour=12, tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def clickup_ms_to_yaml_date(ms: Any) -> Optional[str]:
+    """ClickUp epoch-ms (str/int/None) -> 'YYYY-MM-DD' (UTC calendar date).
+    Comparing at date granularity absorbs ClickUp's sub-day time nudge so the
+    value round-trips without a phantom diff."""
+    if ms in (None, ""):
+        return None
+    return datetime.fromtimestamp(int(ms) / 1000, timezone.utc).date().isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Diff engine
 # ---------------------------------------------------------------------------
 
-SYNCED_FIELDS = ["name", "status", "description", "priority", "milestone"]
+SYNCED_FIELDS = ["name", "status", "description", "priority", "milestone",
+                 "due_date", "start_date"]
 
 # ClickUp custom_item_id values
 CUSTOM_ITEM_TASK = 0
@@ -511,6 +549,13 @@ def compare_task(
     if yaml_milestone != cu_milestone:
         diffs.append({"field": "milestone", "yaml": yaml_milestone, "clickup": cu_milestone})
 
+    # Dates — compared at YYYY-MM-DD granularity (see clickup_ms_to_yaml_date)
+    for fld in ("due_date", "start_date"):
+        yv = _norm_yaml_date(yaml_task.get(fld))
+        cv = clickup_ms_to_yaml_date(clickup_task.get(fld))
+        if yv != cv:
+            diffs.append({"field": fld, "yaml": yv, "clickup": cv})
+
     return diffs
 
 
@@ -545,6 +590,8 @@ def comparable_local(story: dict, status_map: dict) -> dict:
         "description": normalize_description(description_with_meta(story)),
         "priority": story.get("priority"),
         "milestone": bool(story.get("milestone")),
+        "due_date": _norm_yaml_date(story.get("due_date")),
+        "start_date": _norm_yaml_date(story.get("start_date")),
     }
 
 
@@ -556,6 +603,8 @@ def comparable_remote(cu_task: dict, status_map: dict) -> dict:
         "description": normalize_description(cu_task.get("description", "") or ""),
         "priority": clickup_priority_to_yaml(cu_task.get("priority")),
         "milestone": _is_clickup_milestone(cu_task),
+        "due_date": clickup_ms_to_yaml_date(cu_task.get("due_date")),
+        "start_date": clickup_ms_to_yaml_date(cu_task.get("start_date")),
     }
 
 
@@ -632,6 +681,14 @@ def build_task_body(
         body["priority"] = priority
     if yaml_task.get("milestone"):
         body["custom_item_id"] = CUSTOM_ITEM_MILESTONE
+    dd = yaml_date_to_clickup_ms(yaml_task.get("due_date"))
+    if dd is not None:
+        body["due_date"] = dd
+        body["due_date_time"] = False
+    sd = yaml_date_to_clickup_ms(yaml_task.get("start_date"))
+    if sd is not None:
+        body["start_date"] = sd
+        body["start_date_time"] = False
     if tags:
         body["tags"] = tags
     if assignee_ids:
@@ -1454,6 +1511,10 @@ def _apply_clickup_to_yaml(yaml_task: dict, cu_task: dict, status_map: dict) -> 
     if cu_priority is not None:
         yaml_task["priority"] = cu_priority
     yaml_task["milestone"] = _is_clickup_milestone(cu_task)
+    for _fld in ("due_date", "start_date"):
+        _cv = clickup_ms_to_yaml_date(cu_task.get(_fld))
+        if _cv is not None or _fld in yaml_task:
+            yaml_task[_fld] = _cv
     _sync_metadata(yaml_task, cu_task)
 
 
@@ -1717,6 +1778,14 @@ def _apply_merged_value(
         if cu_id:
             cid = CUSTOM_ITEM_MILESTONE if is_ms else CUSTOM_ITEM_TASK
             clickup_update_task(token, cu_id, {"custom_item_id": cid})
+    elif field in ("due_date", "start_date"):
+        d = _norm_yaml_date(merged_value)
+        yaml_task[field] = d
+        if cu_id:
+            clickup_update_task(token, cu_id, {
+                field: yaml_date_to_clickup_ms(d),
+                f"{field}_time": False,
+            })
 
 
 def _push_field_to_clickup(
@@ -1739,6 +1808,16 @@ def _push_field_to_clickup(
     elif field == "milestone":
         cid = CUSTOM_ITEM_MILESTONE if yaml_task.get("milestone") else CUSTOM_ITEM_TASK
         clickup_update_task(token, cu_id, {"custom_item_id": cid})
+    elif field == "due_date":
+        clickup_update_task(token, cu_id, {
+            "due_date": yaml_date_to_clickup_ms(yaml_task.get("due_date")),
+            "due_date_time": False,
+        })
+    elif field == "start_date":
+        clickup_update_task(token, cu_id, {
+            "start_date": yaml_date_to_clickup_ms(yaml_task.get("start_date")),
+            "start_date_time": False,
+        })
 
 
 def _pull_field_to_yaml(yaml_task: dict, cu_task: dict, field: str, status_map: dict) -> None:
@@ -1754,6 +1833,10 @@ def _pull_field_to_yaml(yaml_task: dict, cu_task: dict, field: str, status_map: 
         yaml_task["priority"] = clickup_priority_to_yaml(cu_task.get("priority"))
     elif field == "milestone":
         yaml_task["milestone"] = _is_clickup_milestone(cu_task)
+    elif field == "due_date":
+        yaml_task["due_date"] = clickup_ms_to_yaml_date(cu_task.get("due_date"))
+    elif field == "start_date":
+        yaml_task["start_date"] = clickup_ms_to_yaml_date(cu_task.get("start_date"))
 
 
 # ---------------------------------------------------------------------------

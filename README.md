@@ -142,10 +142,15 @@ run), `sync` falls back to the legacy 2-way reconcile below and writes a base
 for next time.
 
 **Scope:** 3-way covers the scalar synced fields (name, status, description,
-priority, milestone). Assignees and tags are not base-tracked — assignee
-divergence is surfaced as a conflict (so `stop` catches it; `local`/`remote`
-applies that direction). Keep `status_map` 1:1 — a many-to-one mapping makes
-the pull-side reverse-lookup ambiguous.
+priority, milestone, due_date, start_date). Assignees and tags are not
+base-tracked — assignee divergence is surfaced as a conflict (so `stop` catches
+it; `local`/`remote` applies that direction). Keep `status_map` 1:1 — a
+many-to-one mapping makes the pull-side reverse-lookup ambiguous.
+
+**Dates** are date-only (`YYYY-MM-DD`), pushed at noon UTC. Stable for
+workspaces UTC−12…UTC+11; a date set in the **ClickUp UI** of a UTC+12-or-east
+workspace may pull back one calendar day earlier (stable, never oscillates).
+YAML-originated dates are exact in every timezone.
 
 ## Conflict Strategies (legacy 2-way — only when no base exists yet)
 
@@ -172,17 +177,18 @@ nor pulled, and a value set in the ClickUp UI will be invisible to the YAML
 | description (with `Points/Milestone/Sprint` meta header) | ✅ | ✅ |
 | priority (`1`=urgent, `2`=high, `3`=normal, `4`=low, `null`=none) | ✅ | ✅ |
 | milestone (`custom_item_id`) | ✅ | ✅ |
+| due_date / start_date (`YYYY-MM-DD`, date-only) | ✅ | ✅ |
 | assignees | ✅ | ✅ |
 | tags | ✅ (additive; UI-added tags preserved) | ⚠️ epic placement only — UI tag *edits* are **not** pulled into YAML |
 | Epic dropdown (one configured custom field) | ✅ | ❌ |
 
 **Not implemented at all (silently ignored both directions):**
 
-- **`due_date` / `start_date`** — no deadline sync.
 - **`time_estimate`** — not synced.
-- **Native ClickUp `points` field** — the YAML `points` value is shown only as
-  `Points: N` text in the description; it does not populate ClickUp's Sprint
-  Points field.
+- **Native ClickUp `points` field** — not synced. The YAML `points` value is
+  shown only as `Points: N` text in the description. Native points also require
+  the **Sprint Points ClickApp** enabled on the list (a `PUT {points: N}`
+  otherwise 400s with `ITEM_225`), so it stays out of scope until that's on.
 - **Arbitrary custom fields** — only the single configured Epic dropdown is
   handled. Other custom fields (e.g. the **A–D deliverable-group field** on the
   EM Marketing board) are not read or written.

@@ -254,3 +254,17 @@ properties:
               description:
                 type: [string, "null"]
                 description: Story description (markdown supported)
+
+              due_date:
+                type: [string, "null"]
+                description: >
+                  Due date as YYYY-MM-DD (date-only). Pushed to ClickUp at noon
+                  UTC with due_date_time=false; pulled back as the UTC calendar
+                  date. Compared at day granularity.
+                example: "2026-06-20"
+
+              start_date:
+                type: [string, "null"]
+                description: >
+                  Start date as YYYY-MM-DD (date-only). Same handling as due_date.
+                example: "2026-06-15"
