@@ -198,6 +198,25 @@ that runs *after* the value is set — setting it in YAML and never pushing
 leaves the board unchanged (this is data drift, not a bug). Likewise, push
 cannot reliably *clear* a board priority back to none.
 
+## Tags & milestones (read this — two "milestone" concepts)
+
+There are **two unrelated things both called "milestone"**:
+
+| YAML | Becomes in ClickUp | Use |
+|---|---|---|
+| `milestone_label: M1` | a **tag** `m1` (lowercased) | group tasks into a milestone (a tag set, e.g. all `m2` tasks) |
+| `milestone: true` | a **native Milestone task** (`custom_item_id=1`, the ◆ diamond) | a single milestone marker task (can carry its own due date) |
+
+They're independent: a task can be tagged `m2` *and/or* be a ◆ milestone. To give a milestone a **due date on the board**, either date every member task or add one `milestone: true` marker task (tag it `milestone_label` too so it sits in the group). Native milestone creation requires the **Milestones ClickApp** enabled on the Space (sandbox-verified); native `points` similarly requires the **Sprint Points ClickApp** (else `PUT` 400s `ITEM_225`).
+
+### Tag sync is push-authoritative, NOT pull-tracked (the limit)
+
+Sandbox-verified behavior:
+
+- **Push (YAML→ClickUp):** the tag set on a story = epic name (if `push_epic_tag`) + `milestone_label` slug (`m1`) + `sprint_target` slug (`s2`) + explicit `tags:[]`. Additive. Tags in the **managed universe** (all epic names + all milestone slugs + all explicit tags across the YAML) that are *not* on a story are stripped as stale — that's how a milestone/sprint reassignment takes effect. Tags **outside** the managed universe (added in the ClickUp UI) are **preserved**.
+- **Pull (ClickUp→YAML): tags are read only for epic placement.** A tag added or removed **in the ClickUp UI does NOT come back into the YAML** — and on the next push a managed tag missing from YAML is reverted. Tags are also **not** part of the 3-way merge (no conflict detection on tags).
+- **Rule of thumb:** manage `m`/`s`/milestone tags **from the YAML**; don't edit them in the ClickUp UI expecting them to round-trip. Ad-hoc UI tags outside the managed set are safe.
+
 ## Setup
 
 ```bash
