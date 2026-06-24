@@ -1113,3 +1113,316 @@ def test_apply_merged_value_handles_due_date():
     assert story["due_date"] == "2026-07-04"
     assert sent and sent[0]["due_date"] == clickup.yaml_date_to_clickup_ms("2026-07-04")
     assert sent[0]["due_date_time"] is False
+
+
+# ---------------------------------------------------------------------------
+# 9. Dependencies (waiting_on edges): reconcile + bidirectional sync
+# ---------------------------------------------------------------------------
+
+
+def _cu_task_deps(task_id: str, waiting_on: list[str], extra_edges: list[dict] | None = None) -> dict:
+    """A ClickUp task carrying waiting_on edges (type 1) for ``task_id``.
+
+    ``extra_edges`` injects raw edge dicts (e.g. blocking-side mirrors where
+    ``task_id`` != our id) to prove they're ignored by the reader.
+    """
+    base = _cu_task(task_id, [])
+    edges = [
+        {"task_id": task_id, "depends_on": d, "type": clickup.DEP_TYPE_WAITING_ON}
+        for d in waiting_on
+    ]
+    if extra_edges:
+        edges.extend(extra_edges)
+    base["dependencies"] = edges
+    return base
+
+
+class TestCuWaitingOnIds:
+    def test_extracts_waiting_on_for_self(self):
+        cu = _cu_task_deps("T1", ["A", "B"])
+        assert clickup._cu_waiting_on_ids(cu) == {"A", "B"}
+
+    def test_ignores_blocking_side_mirror(self):
+        # Edge where T1 is the depends_on (i.e. T1 blocks T9) must NOT count as
+        # something T1 waits on.
+        cu = _cu_task_deps(
+            "T1",
+            ["A"],
+            extra_edges=[{"task_id": "T9", "depends_on": "T1", "type": clickup.DEP_TYPE_WAITING_ON}],
+        )
+        assert clickup._cu_waiting_on_ids(cu) == {"A"}
+
+    def test_ignores_non_waiting_on_types(self):
+        cu = _cu_task_deps(
+            "T1",
+            ["A"],
+            extra_edges=[{"task_id": "T1", "depends_on": "Z", "type": 2}],  # blocking type
+        )
+        assert clickup._cu_waiting_on_ids(cu) == {"A"}
+
+    def test_empty_when_no_dependencies(self):
+        assert clickup._cu_waiting_on_ids(_cu_task("T1", [])) == set()
+
+
+class TestResolveDependencyIds:
+    def test_dedup_order_preserving(self):
+        desired, unresolved = clickup._resolve_dependency_ids(["A", "B", "A"], "SELF")
+        assert desired == ["A", "B"]
+        assert unresolved == []
+
+    def test_drops_blanks(self):
+        desired, _ = clickup._resolve_dependency_ids(["A", "", "  ", "B"], "SELF")
+        assert desired == ["A", "B"]
+
+    def test_rejects_self_dependency(self):
+        desired, unresolved = clickup._resolve_dependency_ids(["SELF", "A"], "SELF")
+        assert desired == ["A"]
+        assert unresolved == ["SELF"]
+
+    def test_none_input(self):
+        assert clickup._resolve_dependency_ids(None, "SELF") == ([], [])
+
+
+class TestSyncDependencies:
+    def test_no_key_is_noop(self):
+        story = _story_with("s", clickup_id="T1")  # no depends_on key
+        cu = _cu_task_deps("T1", ["A"])
+        with mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency") as rm:
+            changed = clickup._sync_dependencies("tok", "T1", cu, story)
+        assert changed is False
+        add.assert_not_called()
+        rm.assert_not_called()
+
+    def test_adds_missing_edges(self):
+        story = _story_with("s", clickup_id="T1", depends_on=["A", "B"])
+        cu = _cu_task_deps("T1", ["A"])  # B is missing
+        with mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency") as rm:
+            changed = clickup._sync_dependencies("tok", "T1", cu, story)
+        assert changed is True
+        add.assert_called_once_with("tok", "T1", "B")
+        rm.assert_not_called()
+
+    def test_empty_list_clears_all_edges(self):
+        story = _story_with("s", clickup_id="T1", depends_on=[])
+        cu = _cu_task_deps("T1", ["A", "B"])
+        with mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency") as rm:
+            changed = clickup._sync_dependencies("tok", "T1", cu, story)
+        assert changed is True
+        add.assert_not_called()
+        assert {c.args[2] for c in rm.call_args_list} == {"A", "B"}
+
+    def test_mixed_add_and_remove(self):
+        story = _story_with("s", clickup_id="T1", depends_on=["A", "C"])
+        cu = _cu_task_deps("T1", ["A", "B"])  # add C, remove B
+        with mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency") as rm:
+            clickup._sync_dependencies("tok", "T1", cu, story)
+        add.assert_called_once_with("tok", "T1", "C")
+        rm.assert_called_once_with("tok", "T1", "B")
+
+    def test_already_in_sync_is_noop(self):
+        story = _story_with("s", clickup_id="T1", depends_on=["A"])
+        cu = _cu_task_deps("T1", ["A"])
+        with mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency") as rm:
+            changed = clickup._sync_dependencies("tok", "T1", cu, story)
+        assert changed is False
+        add.assert_not_called()
+        rm.assert_not_called()
+
+    def test_dry_run_makes_no_calls(self):
+        story = _story_with("s", clickup_id="T1", depends_on=["A", "B"])
+        cu = _cu_task_deps("T1", [])
+        with mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency") as rm:
+            changed = clickup._sync_dependencies("tok", "T1", cu, story, dry_run=True)
+        assert changed is True
+        add.assert_not_called()
+        rm.assert_not_called()
+
+    def test_self_dependency_skipped(self):
+        story = _story_with("s", clickup_id="T1", depends_on=["T1", "A"])
+        cu = _cu_task_deps("T1", [])
+        with mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency"):
+            clickup._sync_dependencies("tok", "T1", cu, story)
+        add.assert_called_once_with("tok", "T1", "A")
+
+
+class TestPullDependencies:
+    def test_pulls_edges_into_unmanaged_story(self):
+        story = _story_with("s", clickup_id="T1")  # no depends_on key
+        cu = _cu_task_deps("T1", ["B", "A"])
+        assert clickup._pull_dependencies(story, cu) is True
+        assert story["depends_on"] == ["A", "B"]  # sorted
+
+    def test_no_change_when_equal(self):
+        story = _story_with("s", clickup_id="T1", depends_on=["A", "B"])
+        cu = _cu_task_deps("T1", ["A", "B"])
+        assert clickup._pull_dependencies(story, cu) is False
+
+    def test_remote_removal_writes_empty_list(self):
+        story = _story_with("s", clickup_id="T1", depends_on=["A"])
+        cu = _cu_task_deps("T1", [])  # edge removed in UI
+        assert clickup._pull_dependencies(story, cu) is True
+        assert story["depends_on"] == []
+
+    def test_both_empty_no_key_added(self):
+        story = _story_with("s", clickup_id="T1")  # no key
+        cu = _cu_task_deps("T1", [])
+        assert clickup._pull_dependencies(story, cu) is False
+        assert "depends_on" not in story
+
+    def test_clickup_task_to_story_captures_edges(self):
+        cu = _cu_task_deps("T1", ["B", "A"])
+        story = clickup._clickup_task_to_yaml_story(cu, SMAP)
+        assert story["depends_on"] == ["A", "B"]
+
+
+class TestApiHelperShapes:
+    def test_add_dependency_payload(self):
+        with mock.patch.object(clickup, "_api_request") as api:
+            clickup.clickup_add_dependency("tok", "T1", "A")
+        api.assert_called_once()
+        assert api.call_args.args[0] == "POST"
+        assert api.call_args.args[1].endswith("/task/T1/dependency")
+        assert api.call_args.args[3] == {"depends_on": "A"}
+
+    def test_remove_dependency_uses_query_param(self):
+        with mock.patch.object(clickup, "_api_request") as api:
+            clickup.clickup_remove_dependency("tok", "T1", "A")
+        assert api.call_args.args[0] == "DELETE"
+        assert "/task/T1/dependency?depends_on=A" in api.call_args.args[1]
+
+
+class TestPushDependencyPass:
+    def test_existing_task_gets_dependency_added(self, tmp_path):
+        data = _data_with(
+            {"Magnit Monitoring System": [
+                _story_with("dev task", clickup_id="T1", depends_on=["GATE"])
+            ]},
+        )
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu_tasks = [_cu_task_deps("T1", []), _cu_task("GATE", [])]
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_update_task"), \
+             mock.patch.object(clickup, "clickup_add_tag"), \
+             mock.patch.object(clickup, "clickup_remove_tag"), \
+             mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency"), \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=False,
+                             backup_path=None, backup_default=False)
+        add.assert_called_once_with(clickup.get_clickup_token(), "T1", "GATE")
+
+    def test_newly_created_task_gets_dependency_in_second_pass(self, tmp_path):
+        data = _data_with(
+            {"Magnit Monitoring System": [
+                _story_with("new dev task", depends_on=["GATE"])  # no clickup_id
+            ]},
+        )
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[_cu_task("GATE", [])]), \
+             mock.patch.object(clickup, "clickup_create_task",
+                               return_value={"id": "NEW-1", "custom_id": None}), \
+             mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=False,
+                             backup_path=None, backup_default=False)
+        # Second pass uses the clickup_id written back from the create call.
+        add.assert_called_once_with(clickup.get_clickup_token(), "NEW-1", "GATE")
+
+    def test_dry_run_makes_no_dependency_calls(self, tmp_path):
+        data = _data_with(
+            {"Magnit Monitoring System": [
+                _story_with("dev task", clickup_id="T1", depends_on=["GATE"])
+            ]},
+        )
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu_tasks = [_cu_task_deps("T1", []), _cu_task("GATE", [])]
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_add_dependency") as add, \
+             mock.patch.object(clickup, "clickup_remove_dependency") as rm, \
+             mock.patch.object(clickup, "clickup_set_custom_field"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=True,
+                             backup_path=None, backup_default=False)
+        add.assert_not_called()
+        rm.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 10. Markdown descriptions: preserve embedded task-mention tiles
+# ---------------------------------------------------------------------------
+
+
+class TestCuDescription:
+    def test_prefers_markdown_over_flattened_plain(self):
+        cu = {"description": "see  here", "markdown_description": "see [T](https://app.clickup.com/t/abc) here"}
+        assert clickup._cu_description(cu) == "see [T](https://app.clickup.com/t/abc) here"
+
+    def test_falls_back_to_plain_when_markdown_absent(self):
+        assert clickup._cu_description({"description": "plain only"}) == "plain only"
+
+    def test_empty_markdown_string_is_used_not_skipped(self):
+        # markdown_description present but '' (board description cleared) -> use it
+        assert clickup._cu_description({"description": "stale", "markdown_description": ""}) == ""
+
+    def test_empty_task(self):
+        assert clickup._cu_description({}) == ""
+
+
+class TestMarkdownPushPull:
+    def test_build_task_body_emits_markdown_content(self):
+        story = _story_with("T", description="hi", points=3)
+        body = clickup.build_task_body(story, SMAP)
+        assert "markdown_content" in body
+        assert "description" not in body
+        assert body["markdown_content"].startswith("Points: 3")
+        assert "hi" in body["markdown_content"]
+
+    def test_no_false_diff_when_markdown_matches_yaml(self):
+        # Plain field is flattened (tile -> whitespace) but markdown matches YAML.
+        story = _story_with("T", clickup_id="x", description="see [T](https://app.clickup.com/t/u)")
+        cu = _cu_task("x", [])
+        cu["description"] = "see"  # ClickUp flattened the tile
+        cu["markdown_description"] = "see [T](https://app.clickup.com/t/u)"
+        diffs = clickup.compare_task(story, cu, SMAP)
+        assert not any(d["field"] == "description" for d in diffs)
+
+    def test_pull_writes_markdown_form(self):
+        story = _story_with("T", clickup_id="x")
+        cu = _cu_task("x", [])
+        cu["markdown_description"] = "body [T](https://app.clickup.com/t/u)"
+        clickup._apply_clickup_to_yaml(story, cu, SMAP)
+        assert story["description"] == "body [T](https://app.clickup.com/t/u)"
+
+    def test_list_fetch_requests_markdown(self):
+        with mock.patch.object(clickup, "_api_request",
+                               return_value={"tasks": [], "last_page": True}) as api:
+            clickup.clickup_list_tasks("tok", "999")
+        assert "include_markdown_description=true" in api.call_args.args[1]
+
+    def test_get_task_requests_markdown(self):
+        with mock.patch.object(clickup, "_api_request", return_value={}) as api:
+            clickup.clickup_get_task("tok", "T1")
+        assert "include_markdown_description=true" in api.call_args.args[1]
+
+    def test_push_field_sends_markdown_content(self):
+        story = _story_with("T", clickup_id="x", description="body", points=2)
+        sent = []
+        with mock.patch.object(clickup, "clickup_update_task",
+                               side_effect=lambda t, i, b: sent.append(b) or {}):
+            clickup._push_field_to_clickup(story, _cu_task("x", []), "description", SMAP, "tok")
+        assert "markdown_content" in sent[0]
+        assert "description" not in sent[0]

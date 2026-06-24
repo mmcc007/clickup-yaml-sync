@@ -238,6 +238,24 @@ properties:
                   type: string
                 example: ["kathy@e-m-marketing.com", "charliem@e-m-marketing.com"]
 
+              depends_on:
+                type: array
+                description: >
+                  ClickUp tasks this story waits on (a "waiting on" dependency).
+                  Each entry is the target task's ClickUp id — the same id stored
+                  in another story's clickup_id. Semantics mirror assignees: OMIT
+                  this key to leave ClickUp dependencies untouched (UI-added edges
+                  survive); set an EMPTY list to clear the task's waiting_on edges;
+                  set a list to make YAML authoritative (push adds/removes to
+                  match exactly). Only the waiting_on direction is modeled —
+                  ClickUp maintains the mirrored "blocking" edge automatically. A
+                  target not yet created (no clickup_id) can't be referenced until
+                  it exists; the edge resolves on the next push. Reconciled by
+                  push/pull/diff; not yet handled by sync/merge.
+                items:
+                  type: string
+                example: ["86badrnmt"]
+
               epic_dropdown_value:
                 type: [string, "null"]
                 description: >

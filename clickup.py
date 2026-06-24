@@ -21,6 +21,7 @@ import copy
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -271,7 +272,7 @@ def clickup_create_task(token: str, list_id: str, task_data: dict) -> dict:
 
 
 def clickup_get_task(token: str, task_id: str) -> dict:
-    url = f"{CLICKUP_BASE}/task/{task_id}"
+    url = f"{CLICKUP_BASE}/task/{task_id}?include_markdown_description=true"
     return _api_request("GET", url, token)
 
 
@@ -287,6 +288,21 @@ def clickup_add_tag(token: str, task_id: str, tag_name: str) -> dict:
 
 def clickup_remove_tag(token: str, task_id: str, tag_name: str) -> dict:
     url = f"{CLICKUP_BASE}/task/{task_id}/tag/{urllib.parse.quote(tag_name)}"
+    return _api_request("DELETE", url, token)
+
+
+def clickup_add_dependency(token: str, task_id: str, depends_on: str) -> dict:
+    """Add a waiting-on dependency: ``task_id`` waits on ``depends_on``."""
+    url = f"{CLICKUP_BASE}/task/{task_id}/dependency"
+    return _api_request("POST", url, token, {"depends_on": depends_on})
+
+
+def clickup_remove_dependency(token: str, task_id: str, depends_on: str) -> dict:
+    """Remove a waiting-on dependency between ``task_id`` and ``depends_on``."""
+    url = (
+        f"{CLICKUP_BASE}/task/{task_id}/dependency"
+        f"?depends_on={urllib.parse.quote(depends_on)}"
+    )
     return _api_request("DELETE", url, token)
 
 
@@ -319,7 +335,11 @@ def clickup_list_tasks(token: str, list_id: str, page: int = 0) -> list[dict]:
     """Fetch all tasks from a ClickUp list (with pagination and subtasks)."""
     all_tasks: list[dict] = []
     while True:
-        url = f"{CLICKUP_BASE}/list/{list_id}/task?subtasks=true&include_closed=true&page={page}"
+        url = (
+            f"{CLICKUP_BASE}/list/{list_id}/task"
+            f"?subtasks=true&include_closed=true"
+            f"&include_markdown_description=true&page={page}"
+        )
         resp = _api_request("GET", url, token)
         tasks = resp.get("tasks", [])
         if not tasks:
@@ -458,6 +478,68 @@ def normalize_description(desc: Optional[str]) -> str:
     return desc.strip()
 
 
+# ClickUp escapes ASCII-punctuation markdown metacharacters in
+# ``markdown_description`` (e.g. ``Article_type`` -> ``Article\_type``). We
+# author/store the unescaped form in YAML, so reads must reverse it or every
+# description with an underscore/asterisk would look like a spurious diff.
+_MD_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
+
+# ClickUp also auto-linkifies bare URLs/emails/domains in markdown, e.g.
+# ``maurice@spark6.com`` -> ``[maurice@spark6.com](mailto:maurice@spark6.com)``.
+# We collapse such *self-referential* links (label == url, ignoring the
+# mailto:/http(s):// scheme) back to bare text. A genuine mention or labeled
+# link — where the label differs from the url — is left untouched.
+_MD_AUTOLINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_URL_SCHEMES = ("mailto:", "https://", "http://")
+
+
+def _unescape_markdown(text: str) -> str:
+    """Drop CommonMark backslash-escapes before ASCII punctuation.
+
+    Leaves real syntax intact — a ``[label](url)`` link has no backslashes —
+    while normalizing ``\\_`` -> ``_`` etc. back to the authored text.
+    """
+    return _MD_ESCAPE_RE.sub(r"\1", text)
+
+
+def _strip_url_scheme(s: str) -> str:
+    for pre in _URL_SCHEMES:
+        if s.startswith(pre):
+            return s[len(pre):]
+    return s
+
+
+def _collapse_self_links(text: str) -> str:
+    """Reverse ClickUp's auto-linkification of bare URLs/emails/domains.
+
+    Collapses ``[X](X)`` (modulo url scheme) to ``X``; preserves real links
+    where the label and url differ (task mentions, labeled links).
+    """
+    def repl(m: "re.Match") -> str:
+        label, url = m.group(1), m.group(2)
+        if label == url or _strip_url_scheme(label) == _strip_url_scheme(url):
+            return label
+        return m.group(0)
+    return _MD_AUTOLINK_RE.sub(repl, text)
+
+
+def _cu_description(cu_task: dict) -> str:
+    """A ClickUp task's description, preferring the markdown form.
+
+    ClickUp's plain ``description``/``text_content`` flattens an embedded
+    task-mention tile to whitespace (losing the reference), whereas
+    ``markdown_description`` preserves it as a ``[label](url)`` link — and
+    round-trips through ``markdown_content`` on write. The markdown form
+    backslash-escapes punctuation, so we unescape it back to the authored text
+    for a clean compare/pull. Falls back to the plain field when the markdown
+    form wasn't requested or returned (e.g. an old cached task dict).
+    """
+    md = cu_task.get("markdown_description")
+    if md is not None:
+        return _collapse_self_links(_unescape_markdown(md))
+    return cu_task.get("description") or ""
+
+
 def _meta_prefix(story: dict) -> str:
     """A one-line 'Points/Milestone/Sprint' header, so those YAML fields are
     visible on the ClickUp card even without the Sprint-Points ClickApp.
@@ -533,7 +615,7 @@ def compare_task(
 
     # Description
     yaml_desc = normalize_description(description_with_meta(yaml_task))
-    cu_desc = normalize_description(clickup_task.get("description", "") or "")
+    cu_desc = normalize_description(_cu_description(clickup_task))
     if yaml_desc != cu_desc:
         diffs.append({"field": "description", "yaml": yaml_desc, "clickup": cu_desc})
 
@@ -600,7 +682,7 @@ def comparable_remote(cu_task: dict, status_map: dict) -> dict:
     return {
         "name": cu_task.get("name", ""),
         "status": (cu_task.get("status", {}).get("status", "") or "").lower(),
-        "description": normalize_description(cu_task.get("description", "") or ""),
+        "description": normalize_description(_cu_description(cu_task)),
         "priority": clickup_priority_to_yaml(cu_task.get("priority")),
         "milestone": _is_clickup_milestone(cu_task),
         "due_date": clickup_ms_to_yaml_date(cu_task.get("due_date")),
@@ -674,7 +756,7 @@ def build_task_body(
     body: dict[str, Any] = {
         "name": yaml_task["name"],
         "status": yaml_status_to_clickup(yaml_task.get("status", "backlog"), status_map),
-        "description": description_with_meta(yaml_task),
+        "markdown_content": description_with_meta(yaml_task),
     }
     priority = yaml_task.get("priority") or default_priority
     if priority is not None:
@@ -1137,6 +1219,146 @@ def _assignees_differ(story: dict, cu_task: dict, resolver: dict[str, int]) -> b
 
 
 # ---------------------------------------------------------------------------
+# Dependencies (waiting_on edges) — relationship-reconcile, mirrors assignees
+# ---------------------------------------------------------------------------
+#
+# Semantics (mirror assignees — YAML-authoritative when the key is present):
+#   - story has no ``depends_on`` key  -> UNMANAGED: ClickUp edges untouched
+#                                          (a UI-added dependency survives).
+#   - story has ``depends_on: []``     -> MANAGED, empty: push clears the
+#                                          task's waiting_on edges.
+#   - story has ``depends_on: [...]``  -> MANAGED: ClickUp reconciled to match
+#                                          exactly (add missing, remove extra).
+#
+# Targets are referenced by ClickUp id (the same id stored in ``clickup_id`` /
+# indexed by ``build_story_id_index``). A target not yet created (no clickup_id)
+# cannot be referenced — declare the edge once both tasks exist and it resolves
+# on the next push. Only the waiting_on direction (ClickUp type 1) is modeled;
+# ClickUp maintains the mirrored "blocking" edge automatically.
+#
+# Scope (v1): reconciled by ``cmd_push`` (second pass), ``cmd_pull``, and shown
+# in ``cmd_diff``. NOT yet handled by ``cmd_sync`` / ``cmd_merge`` — dependencies
+# are deliberately excluded from the 3-way/base-snapshot machinery.
+
+DEP_TYPE_WAITING_ON = 1  # ClickUp dependency ``type``: task_id waits on depends_on
+
+
+def _cu_waiting_on_ids(cu_task: dict) -> set[str]:
+    """The set of task ids THIS task waits on, read from ClickUp's edges.
+
+    ClickUp returns the same edge on both endpoints; we keep only the edges
+    where this task is the dependent (``task_id`` == our id) and the type is
+    waiting_on, so the mirrored blocking edges on other tasks are ignored.
+    """
+    self_id = cu_task.get("id")
+    out: set[str] = set()
+    for dep in cu_task.get("dependencies") or []:
+        if (
+            dep.get("type") == DEP_TYPE_WAITING_ON
+            and dep.get("task_id") == self_id
+            and dep.get("depends_on")
+        ):
+            out.add(str(dep["depends_on"]))
+    return out
+
+
+def _resolve_dependency_ids(
+    raw: Optional[list], self_id: Optional[str]
+) -> tuple[list[str], list[str]]:
+    """Normalize a YAML ``depends_on`` list to ``(desired_ids, unresolved)``.
+
+    Drops blanks, dedups (order-preserving), and refuses a self-dependency.
+    Rejected entries come back as ``unresolved`` so the caller can warn.
+    """
+    desired: list[str] = []
+    unresolved: list[str] = []
+    seen: set[str] = set()
+    for entry in raw or []:
+        s = str(entry).strip()
+        if not s:
+            continue
+        if s == self_id:
+            unresolved.append(s)
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        desired.append(s)
+    return desired, unresolved
+
+
+def _sync_dependencies(
+    token: str,
+    task_id: str,
+    cu_task: dict,
+    story: dict,
+    dry_run: bool = False,
+) -> bool:
+    """Reconcile a task's waiting_on edges to match the story's ``depends_on``.
+
+    No-op (preserves UI edges) when the story has no ``depends_on`` key.
+    Returns True if a change was made — or would be, under ``dry_run``.
+    """
+    if "depends_on" not in story:
+        return False
+    desired_ids, unresolved = _resolve_dependency_ids(story.get("depends_on"), task_id)
+    for u in unresolved:
+        log.warning(f"    Invalid depends_on target, skipping: '{u}'")
+    desired = set(desired_ids)
+    current = _cu_waiting_on_ids(cu_task)
+    add = sorted(desired - current)
+    rem = sorted(current - desired)
+    if not add and not rem:
+        return False
+    if dry_run:
+        log.info(f"    [DRY RUN] Would reconcile dependencies: +{add} -{rem}")
+        return True
+    changed = False
+    for dep_id in add:
+        try:
+            clickup_add_dependency(token, task_id, dep_id)
+            log.info(f"    Added dependency: waits on {dep_id}")
+            changed = True
+        except Exception as e:
+            log.warning(f"    Failed to add dependency on {dep_id}: {e}")
+    for dep_id in rem:
+        try:
+            clickup_remove_dependency(token, task_id, dep_id)
+            log.info(f"    Removed dependency: no longer waits on {dep_id}")
+            changed = True
+        except Exception as e:
+            log.warning(f"    Failed to remove dependency on {dep_id}: {e}")
+    return changed
+
+
+def _dependencies_pull_target(story: dict, cu_task: dict) -> Optional[list[str]]:
+    """The ``depends_on`` list a pull would write, or None if no change needed.
+
+    Pure (no mutation) so the dry-run preview and the real pull share one rule.
+    Returns the sorted ClickUp ids when they differ from the story; ``None``
+    when already equal, or when both sides are empty (avoids YAML litter).
+    """
+    cu_ids = _cu_waiting_on_ids(cu_task)
+    if not cu_ids and "depends_on" not in story:
+        return None
+    current = {
+        str(x).strip() for x in (story.get("depends_on") or []) if str(x).strip()
+    }
+    if current == cu_ids:
+        return None
+    return sorted(cu_ids)
+
+
+def _pull_dependencies(story: dict, cu_task: dict) -> bool:
+    """Read ClickUp waiting_on edges back into the YAML story. True if changed."""
+    target = _dependencies_pull_target(story, cu_task)
+    if target is None:
+        return False
+    story["depends_on"] = target
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Backup-before-push
 # ---------------------------------------------------------------------------
 
@@ -1406,6 +1628,24 @@ def cmd_push(
                     assignee_resolver, dry_run=dry_run,
                 )
 
+    # Second pass: reconcile dependencies. Runs after the create/update pass so
+    # every story created this run already has its clickup_id written back —
+    # dependency targets reference tasks by id and must resolve. A new task
+    # isn't in cu_by_id (fetched before creates), so it starts with no edges.
+    for epic in data["epics"]:
+        for story in epic.get("stories", []):
+            cid = story.get("clickup_id")
+            if not cid or "depends_on" not in story:
+                continue
+            cu_task = cu_by_id.get(cid) or {"id": cid, "dependencies": []}
+            try:
+                _sync_dependencies(token, cid, cu_task, story, dry_run=dry_run)
+            except Exception as e:
+                log.error(
+                    f"  Failed to reconcile dependencies for {story['name']}: {e}"
+                )
+                stats["errors"] += 1
+
     if not dry_run:
         save_yaml(data, yaml_path)
 
@@ -1466,6 +1706,17 @@ def cmd_pull(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
             elif _pull_assignees(story, cu_task):
                 log.info(f"  Pulled assignees for '{story['name']}': "
                          f"{story.get('assignees')}")
+            # Dependencies are likewise not a compare_task field — reconcile
+            # them directly so a UI-set waiting_on edge round-trips into YAML.
+            if dry_run:
+                dtarget = _dependencies_pull_target(story, cu_task)
+                if dtarget is not None:
+                    log.info(f"  [DRY RUN] Would pull dependencies for "
+                             f"'{story['name']}': "
+                             f"{story.get('depends_on', '(none)')} -> {dtarget}")
+            elif _pull_dependencies(story, cu_task):
+                log.info(f"  Pulled dependencies for '{story['name']}': "
+                         f"{story.get('depends_on')}")
         else:
             # New task from ClickUp — place by epic tag
             new_story = _clickup_task_to_yaml_story(cu_task, status_map)
@@ -1506,7 +1757,7 @@ def _apply_clickup_to_yaml(yaml_task: dict, cu_task: dict, status_map: dict) -> 
     yaml_task["name"] = cu_task.get("name", yaml_task.get("name", ""))
     cu_status = cu_task.get("status", {}).get("status", "")
     yaml_task["status"] = clickup_status_to_yaml(cu_status, status_map)
-    yaml_task["description"] = strip_meta_prefix(cu_task.get("description"), yaml_task)
+    yaml_task["description"] = strip_meta_prefix(_cu_description(cu_task), yaml_task)
     cu_priority = clickup_priority_to_yaml(cu_task.get("priority"))
     if cu_priority is not None:
         yaml_task["priority"] = cu_priority
@@ -1536,11 +1787,14 @@ def _clickup_task_to_yaml_story(cu_task: dict, status_map: dict) -> dict:
             cu_task.get("status", {}).get("status", ""), status_map
         ),
         "milestone": _is_clickup_milestone(cu_task),
-        "description": cu_task.get("description") or "",
+        "description": _cu_description(cu_task),
     }
     cu_keys = _cu_assignee_keys(cu_task)
     if cu_keys:
         story["assignees"] = cu_keys
+    dep_ids = _cu_waiting_on_ids(cu_task)
+    if dep_ids:
+        story["depends_on"] = sorted(dep_ids)
     return story
 
 
@@ -1613,7 +1867,9 @@ def cmd_diff(data: dict) -> dict:
                 cu_task = cu_by_id[scu_id]
                 diffs = compare_task(story, cu_task, status_map)
                 a_diff = _assignees_differ(story, cu_task, assignee_resolver)
-                if diffs or a_diff:
+                dep_target = _dependencies_pull_target(story, cu_task)
+                d_diff = dep_target is not None
+                if diffs or a_diff or d_diff:
                     if not has_stories:
                         log.info(f"[{tag}] {epic['name']}:")
                         has_stories = True
@@ -1627,6 +1883,10 @@ def cmd_diff(data: dict) -> dict:
                         y = story.get("assignees", "(unmanaged)")
                         r = _cu_assignee_keys(cu_task)
                         log.info(f"    assignees: YAML='{y}' vs ClickUp='{r}'")
+                    if d_diff:
+                        y = story.get("depends_on", "(unmanaged)")
+                        r = sorted(_cu_waiting_on_ids(cu_task))
+                        log.info(f"    depends_on: YAML='{y}' vs ClickUp='{r}'")
                     stats["mismatches"] += 1
                 else:
                     stats["synced"] += 1
@@ -1763,7 +2023,7 @@ def _apply_merged_value(
     elif field == "description":
         yaml_task["description"] = merged_value
         if cu_id:
-            clickup_update_task(token, cu_id, {"description": merged_value})
+            clickup_update_task(token, cu_id, {"markdown_content": merged_value})
     elif field == "priority":
         try:
             p = int(merged_value)
@@ -1802,7 +2062,7 @@ def _push_field_to_clickup(
             "status": yaml_status_to_clickup(yaml_task.get("status", ""), status_map)
         })
     elif field == "description":
-        clickup_update_task(token, cu_id, {"description": description_with_meta(yaml_task)})
+        clickup_update_task(token, cu_id, {"markdown_content": description_with_meta(yaml_task)})
     elif field == "priority":
         clickup_update_task(token, cu_id, {"priority": yaml_task.get("priority", 3)})
     elif field == "milestone":
@@ -1828,7 +2088,7 @@ def _pull_field_to_yaml(yaml_task: dict, cu_task: dict, field: str, status_map: 
         cu_status = cu_task.get("status", {}).get("status", "")
         yaml_task["status"] = clickup_status_to_yaml(cu_status, status_map)
     elif field == "description":
-        yaml_task["description"] = strip_meta_prefix(cu_task.get("description"), yaml_task)
+        yaml_task["description"] = strip_meta_prefix(_cu_description(cu_task), yaml_task)
     elif field == "priority":
         yaml_task["priority"] = clickup_priority_to_yaml(cu_task.get("priority"))
     elif field == "milestone":

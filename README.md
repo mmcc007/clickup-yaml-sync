@@ -78,6 +78,65 @@ the ClickUp UI, the next `pull`/`sync` reflects it in YAML. Under `sync`, the
 `--conflict` strategy applies at the whole-set level (`local` = YAML wins,
 `remote` = ClickUp wins, `ask` = one prompt per task when they diverge).
 
+## Dependencies (waiting_on edges)
+
+Each story can declare a `depends_on` list — the ClickUp ids of tasks it
+**waits on** (a "waiting on" dependency). Targets are referenced by the same id
+stored in another story's `clickup_id`:
+
+```yaml
+stories:
+  - name: Magnit ingestion adapter
+    clickup_id: 86ba84c7d
+    points: 3
+    status: backlog
+    depends_on:
+      - 86badrnmt   # waits on Charlie's design-doc sign-off
+```
+
+Only the **waiting_on** direction is modeled; ClickUp maintains the mirrored
+"blocking" edge on the other task automatically. Semantics mirror assignees:
+
+| YAML on the story | Push behaviour |
+|---|---|
+| no `depends_on` key | **Unmanaged** — ClickUp dependencies left untouched (UI-added edges preserved) |
+| `depends_on: []` | **Clear** — the task's waiting_on edges removed |
+| `depends_on: [id, …]` | **Authoritative** — ClickUp reconciled to exactly this set |
+
+`push` reconciles dependencies in a **second pass**, after the create/update
+pass, so a task created in the same run already has its `clickup_id` and can be
+referenced. A target that doesn't exist yet (no `clickup_id`) can't be
+referenced — declare the edge once both tasks exist and it resolves on the next
+push. `pull` reads remote waiting_on edges back into `depends_on`; `diff` shows
+mismatches. Requires the **Dependencies ClickApp** enabled on the Space.
+
+**Limitation:** dependencies are reconciled by `push`/`pull`/`diff` only —
+**not** by `sync`/`merge` (they're deliberately excluded from the 3-way /
+base-snapshot machinery). Use `pull` then `push` to round-trip them.
+
+## Descriptions (markdown / task-mention safe)
+
+Descriptions are read as `markdown_description` and written as `markdown_content`,
+so an **embedded task-mention tile survives the round-trip** as a `[label](url)`
+link. (ClickUp's plain `description`/`text_content` flattens a mention to
+whitespace — silently dropping the reference — which is why the markdown form is
+used.) ClickUp is **not** storing two separate fields: a description is stored
+once and rendered both ways, so existing tasks need no migration — every task
+already returns a valid `markdown_description`.
+
+The markdown rendering applies two transformations that the tool normalizes on
+read so they never show as spurious diffs:
+
+- **Backslash-escaped punctuation** — `Article_type` comes back as
+  `Article\_type`; unescaped back to the authored text.
+- **Auto-linkified bare URLs/emails/domains** — `maurice@spark6.com` comes back
+  as `[maurice@spark6.com](mailto:maurice@spark6.com)`; *self-referential* links
+  (label == url, ignoring scheme) are collapsed to the bare text. A genuine
+  mention or labeled link — where the label differs from the url — is preserved.
+
+The `Points · Milestone · Sprint` meta-header behaves exactly as before; it's
+prepended on push and stripped on pull regardless of markdown.
+
 ### Pushing a custom dropdown field (e.g., a PM-curated "Epic" field)
 
 If ClickUp has a single-select dropdown custom field that mirrors the epic
@@ -179,6 +238,7 @@ nor pulled, and a value set in the ClickUp UI will be invisible to the YAML
 | milestone (`custom_item_id`) | ✅ | ✅ |
 | due_date / start_date (`YYYY-MM-DD`, date-only) | ✅ | ✅ |
 | assignees | ✅ | ✅ |
+| `depends_on` (waiting_on edges) | ✅ (push/diff; UI-added edges preserved) | ✅ (push/pull/diff only — **not** sync/merge) |
 | tags | ✅ (additive; UI-added tags preserved) | ⚠️ epic placement only — UI tag *edits* are **not** pulled into YAML |
 | Epic dropdown (one configured custom field) | ✅ | ❌ |
 
