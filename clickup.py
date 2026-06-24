@@ -2237,6 +2237,11 @@ def cmd_sync(
                         resp = clickup_create_task(token, list_id, body)
                         story["clickup_id"] = resp["id"]
                         story["task_id"] = resp.get("custom_id")
+                        # A task created during this run now exists in ClickUp;
+                        # record its id so Phase 5 archive-detection doesn't
+                        # false-flag it as archived (it was absent from the
+                        # pre-run fetch that seeded seen_cu_ids).
+                        seen_cu_ids.add(resp["id"])
                         _push_epic_dropdown_if_needed(
                             token, resp["id"], resp, story, epic, project_cfg, dry_run
                         )

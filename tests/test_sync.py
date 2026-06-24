@@ -1426,3 +1426,34 @@ class TestMarkdownPushPull:
             clickup._push_field_to_clickup(story, _cu_task("x", []), "description", SMAP, "tok")
         assert "markdown_content" in sent[0]
         assert "description" not in sent[0]
+
+
+def test_sync_created_task_not_flagged_archived(tmp_path):
+    """Regression: a task created during a sync run must NOT be marked
+    archived_in_clickup.
+
+    Phase-5 archive-detection flags any story whose clickup_id is absent from
+    seen_cu_ids, which is seeded from the pre-run fetch. A task created mid-run
+    isn't in that fetch, so without recording its new id it was false-flagged
+    as archived even though it is live in ClickUp."""
+    story = _story_with("brand new task")  # no clickup_id -> will be created
+    data = _data_with({"Kickoff / Access": [story]})
+    yaml_path = tmp_path / "p.yaml"
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(data, f)
+
+    with mock.patch.object(clickup, "clickup_list_tasks", return_value=[]), \
+         mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+         mock.patch.object(clickup, "clickup_create_task",
+                           return_value={"id": "NEW-1", "custom_id": None}), \
+         mock.patch.object(clickup, "clickup_add_tag"), \
+         mock.patch.object(clickup, "clickup_remove_tag"), \
+         mock.patch.object(clickup, "clickup_set_custom_field"):
+        stats = clickup.cmd_sync(data, str(yaml_path), on_conflict="stop")
+
+    # The story was created in ClickUp...
+    assert story["clickup_id"] == "NEW-1"
+    assert stats["created_in_clickup"] == 1
+    # ...and must NOT be false-flagged as archived.
+    assert "archived_in_clickup" not in story
+    assert stats["archived"] == 0
