@@ -112,7 +112,14 @@ mismatches. Requires the **Dependencies ClickApp** enabled on the Space.
 
 **Limitation:** dependencies are reconciled by `push`/`pull`/`diff` only —
 **not** by `sync`/`merge` (they're deliberately excluded from the 3-way /
-base-snapshot machinery). Use `pull` then `push` to round-trip them.
+base-snapshot machinery). Use `pull` then `push` to round-trip them. (Both
+limitations — and non-blocking relations — are on the [Roadmap](#roadmap).)
+
+**Relations (non-blocking "linked tasks") are not modeled.** ClickUp's
+relate/link feature (`POST /task/{id}/link/{links_to}`) has no YAML field yet —
+only `depends_on` (a *blocking* dependency) exists. A non-blocking association
+currently has to be faked with a markdown link in the task description. See the
+[Roadmap](#roadmap).
 
 ## Descriptions (markdown / task-mention safe)
 
@@ -345,6 +352,27 @@ python3 clickup.py status project.yaml
 # Dry run (show what would happen)
 python3 clickup.py push project.yaml --dry-run
 ```
+
+## Roadmap
+
+- **Native relations (non-blocking "linked tasks").** Add a `related: [<clickup_id>, …]`
+  story field backed by ClickUp's link API (`POST /task/{id}/link/{links_to}`,
+  `DELETE …/link/…`), reconciled with the same managed/clear/authoritative
+  semantics as `depends_on`. Today only `depends_on` (a blocking dependency)
+  exists, so a non-blocking association has to be faked with a markdown link in
+  the description.
+- **Apply link edges during `sync` (so the sync-only workflow covers them).**
+  Today `depends_on` — and any future `related` edges — are reconciled by
+  `push`/`pull`/`diff` only, never by `sync`/`merge`. Goal: have `sync` run the
+  same relationship-reconcile second pass after its create/update pass, so
+  adding a relation, dependency, or blocker needs nothing beyond `sync`. (A
+  dependency *is* a blocker — ClickUp's `waiting_on` edge auto-creates the
+  mirrored `blocking` edge on the target.)
+- **Subtasks.** The ClickUp API supports them (create a task with a
+  `parent: <task_id>` field; read via `?include_subtasks=true`). Model them
+  either as a `parent:` reference on a story or as a nested `subtasks:` list,
+  reconciled like the create/update pass. Today stories are flat top-level tasks
+  only.
 
 ## Credentials
 
