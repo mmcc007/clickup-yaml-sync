@@ -52,12 +52,12 @@ Each story can carry an `assignees` list of human-readable strings — emails
 
 ```yaml
 stories:
-  - name: Slack workspace export
-    clickup_id: 86ba84bqa
+  - name: Example task
+    clickup_id: 860000001
     points: 2
     status: backlog
     assignees:
-      - kathy@e-m-marketing.com
+      - alice@example.com
 ```
 
 Resolution is automatic: `push` looks up the list's member roster and converts
@@ -86,12 +86,12 @@ stored in another story's `clickup_id`:
 
 ```yaml
 stories:
-  - name: Magnit ingestion adapter
-    clickup_id: 86ba84c7d
+  - name: Ingestion adapter
+    clickup_id: 860000002
     points: 3
     status: backlog
     depends_on:
-      - 86badrnmt   # waits on Charlie's design-doc sign-off
+      - 860000003   # waits on the design-doc sign-off
 ```
 
 Only the **waiting_on** direction is modeled; ClickUp maintains the mirrored
@@ -125,10 +125,10 @@ association. Targets are referenced by `clickup_id`, exactly like `depends_on`:
 
 ```yaml
 stories:
-  - name: Magnit ingestion adapter
-    clickup_id: 86ba84c7d
+  - name: Ingestion adapter
+    clickup_id: 860000002
     related:
-      - 86bade1f9   # see-also: the schema-mapping spike
+      - 860000004   # see-also: a related spike
 ```
 
 A link is **non-directional** — ClickUp records it on both endpoints — so the
@@ -168,8 +168,8 @@ read so they never show as spurious diffs:
 
 - **Backslash-escaped punctuation** — `Article_type` comes back as
   `Article\_type`; unescaped back to the authored text.
-- **Auto-linkified bare URLs/emails/domains** — `maurice@spark6.com` comes back
-  as `[maurice@spark6.com](mailto:maurice@spark6.com)`; *self-referential* links
+- **Auto-linkified bare URLs/emails/domains** — `alice@example.com` comes back
+  as `[alice@example.com](mailto:alice@example.com)`; *self-referential* links
   (label == url, ignoring scheme) are collapsed to the bare text. A genuine
   mention or labeled link — where the label differs from the url — is preserved.
 
@@ -184,14 +184,14 @@ axis (some teams prefer this to tags), declare the mapping in the YAML
 
 ```yaml
 project:
-  name: EM Marketing OS
-  clickup_list_id: '901416587639'
-  epic_dropdown_field_id: 'eb53bc71-c0c7-40ed-93cb-7f0b993900e6'
+  name: My Project
+  clickup_list_id: '900000000000'
+  epic_dropdown_field_id: '00000000-0000-0000-0000-000000000000'
   epic_dropdown_options:
-    'Relationship Signal Automation': 'f110326a-b184-44bd-8880-ddd503d3e8c9'
-    'Magnit Monitoring System': '85bf365b-d601-40a2-be5a-c5f1ba8ef280'
-    'Infrastructure + CRM': 'de5b8e45-e45e-482e-9c05-5764e2d2b8f9'
-    'Kickoff / Access': '12d207f1-78c9-466f-9078-9ca726cd907e'
+    'Epic One': '11111111-1111-1111-1111-111111111111'
+    'Epic Two': '22222222-2222-2222-2222-222222222222'
+    'Epic Three': '33333333-3333-3333-3333-333333333333'
+    'Epic Four': '44444444-4444-4444-4444-444444444444'
 ```
 
 If either field is missing, the dropdown push is skipped silently — old
@@ -290,8 +290,8 @@ nor pulled, and a value set in the ClickUp UI will be invisible to the YAML
   the **Sprint Points ClickApp** enabled on the list (a `PUT {points: N}`
   otherwise 400s with `ITEM_225`), so it stays out of scope until that's on.
 - **Arbitrary custom fields** — only the single configured Epic dropdown is
-  handled. Other custom fields (e.g. the **A–D deliverable-group field** on the
-  EM Marketing board) are not read or written.
+  handled. Other custom fields (any other single-select or text field on the
+  board) are not read or written.
 
 Caveat on `priority`: a YAML value only reaches the board on a `push`/`sync`
 that runs *after* the value is set — setting it in YAML and never pushing
