@@ -113,9 +113,9 @@ class TestDesiredTags:
         assert len(tags) == len(set(t.lower() for t in tags))
 
     def test_no_milestone_label_no_extra_tag(self):
-        epic = _epic_with("Magnit", [])
+        epic = _epic_with("VendorX", [])
         story = _story_with("s1", tags=["llm"])
-        assert clickup._story_desired_tags(story, epic) == ["Magnit", "llm"]
+        assert clickup._story_desired_tags(story, epic) == ["VendorX", "llm"]
 
     def test_invalid_tags_entries_ignored(self):
         epic = _epic_with("E", [])
@@ -189,7 +189,7 @@ class TestManagedUniverseIncludesSprintSlugs:
         data = _data_with({"Infra": [_story_with("a")]})
         data["sprints"] = [
             {"number": 1, "name": "Foundation", "start": "2026-06-01"},
-            {"number": 5, "name": "Magnit", "start": "2026-06-29"},
+            {"number": 5, "name": "VendorX", "start": "2026-06-29"},
         ]
         universe = clickup._collect_managed_tag_universe(data)
         assert "s1" in universe
@@ -200,12 +200,12 @@ class TestManagedTagUniverse:
     def test_universe_includes_epic_names_milestones_and_user_tags(self):
         data = _data_with({
             "Kickoff / Access": [_story_with("a", milestone_label="M0", tags=["security"])],
-            "Magnit": [_story_with("b", tags=["llm", "slack"])],
+            "VendorX": [_story_with("b", tags=["llm", "slack"])],
         })
         universe = clickup._collect_managed_tag_universe(data)
         # All names lowercased
         assert "kickoff / access" in universe
-        assert "magnit" in universe
+        assert "vendorx" in universe
         assert "security" in universe
         assert "llm" in universe
         assert "slack" in universe
@@ -288,12 +288,12 @@ class TestEpicDropdownPush:
         "epic_dropdown_field_id": "FIELD-UUID",
         "epic_dropdown_options": {
             "Kickoff / Access": "OPT-KICKOFF",
-            "Magnit Monitoring System": "OPT-MAGNIT",
+            "VendorX Monitoring System": "OPT-VENDORX",
         },
     }
 
     def test_skips_when_no_field_id_configured(self):
-        epic = _epic_with("Magnit Monitoring System", [])
+        epic = _epic_with("VendorX Monitoring System", [])
         story = _story_with("s1")
         with mock.patch.object(clickup, "clickup_set_custom_field") as set_cf:
             attempted = clickup._push_epic_dropdown_if_needed(
@@ -303,7 +303,7 @@ class TestEpicDropdownPush:
         set_cf.assert_not_called()
 
     def test_pushes_matching_option_id(self):
-        epic = _epic_with("Magnit Monitoring System", [])
+        epic = _epic_with("VendorX Monitoring System", [])
         story = _story_with("s1")
         cu_task = _cu_task("T1", [])
         with mock.patch.object(clickup, "clickup_set_custom_field") as set_cf:
@@ -311,10 +311,10 @@ class TestEpicDropdownPush:
                 "tok", "T1", cu_task, story, epic, project_cfg=self.PROJECT_CFG, dry_run=False
             )
         assert attempted is True
-        set_cf.assert_called_once_with("tok", "T1", "FIELD-UUID", "OPT-MAGNIT")
+        set_cf.assert_called_once_with("tok", "T1", "FIELD-UUID", "OPT-VENDORX")
 
     def test_case_insensitive_option_lookup(self):
-        epic = _epic_with("magnit monitoring system", [])
+        epic = _epic_with("vendorx monitoring system", [])
         story = _story_with("s1")
         cu_task = _cu_task("T1", [])
         with mock.patch.object(clickup, "clickup_set_custom_field") as set_cf:
@@ -322,23 +322,23 @@ class TestEpicDropdownPush:
                 "tok", "T1", cu_task, story, epic, project_cfg=self.PROJECT_CFG, dry_run=False
             )
         set_cf.assert_called_once()
-        assert set_cf.call_args.args[3] == "OPT-MAGNIT"
+        assert set_cf.call_args.args[3] == "OPT-VENDORX"
 
     def test_story_override_wins(self):
         epic = _epic_with("Kickoff / Access", [])
-        story = _story_with("s1", epic_dropdown_value="Magnit Monitoring System")
+        story = _story_with("s1", epic_dropdown_value="VendorX Monitoring System")
         cu_task = _cu_task("T1", [])
         with mock.patch.object(clickup, "clickup_set_custom_field") as set_cf:
             clickup._push_epic_dropdown_if_needed(
                 "tok", "T1", cu_task, story, epic, project_cfg=self.PROJECT_CFG, dry_run=False
             )
         set_cf.assert_called_once()
-        assert set_cf.call_args.args[3] == "OPT-MAGNIT"
+        assert set_cf.call_args.args[3] == "OPT-VENDORX"
 
     def test_noop_when_value_already_matches(self):
-        epic = _epic_with("Magnit Monitoring System", [])
+        epic = _epic_with("VendorX Monitoring System", [])
         story = _story_with("s1")
-        cu_task = _cu_task("T1", [], custom_fields=[{"id": "FIELD-UUID", "value": "OPT-MAGNIT"}])
+        cu_task = _cu_task("T1", [], custom_fields=[{"id": "FIELD-UUID", "value": "OPT-VENDORX"}])
         with mock.patch.object(clickup, "clickup_set_custom_field") as set_cf:
             attempted = clickup._push_epic_dropdown_if_needed(
                 "tok", "T1", cu_task, story, epic, project_cfg=self.PROJECT_CFG, dry_run=False
@@ -357,7 +357,7 @@ class TestEpicDropdownPush:
         set_cf.assert_not_called()
 
     def test_dry_run_does_not_call_api(self):
-        epic = _epic_with("Magnit Monitoring System", [])
+        epic = _epic_with("VendorX Monitoring System", [])
         story = _story_with("s1")
         cu_task = _cu_task("T1", [])
         with mock.patch.object(clickup, "clickup_set_custom_field") as set_cf:
@@ -531,18 +531,18 @@ class TestPushIntegration:
     def test_create_path_emits_multi_tag_body_and_dropdown_call(self, tmp_path):
         data = _data_with(
             {
-                "Magnit Monitoring System": [
+                "VendorX Monitoring System": [
                     _story_with(
-                        "Magnit ingestion adapter",
+                        "VendorX ingestion adapter",
                         milestone_label="M2",
-                        tags=["magnit"],
+                        tags=["vendorx"],
                     )
                 ],
             },
             project_extra={
                 "epic_dropdown_field_id": "FIELD-UUID",
                 "epic_dropdown_options": {
-                    "Magnit Monitoring System": "OPT-MAGNIT",
+                    "VendorX Monitoring System": "OPT-VENDORX",
                 },
             },
         )
@@ -569,12 +569,12 @@ class TestPushIntegration:
 
         assert stats["created"] == 1
         # All three sources merged on create:
-        assert created["body"]["tags"] == ["Magnit Monitoring System", "magnit", "m2"]
+        assert created["body"]["tags"] == ["VendorX Monitoring System", "vendorx", "m2"]
         # Epic dropdown pushed in the same push call:
         set_cf.assert_called_once()
         assert set_cf.call_args.args[1] == "NEW-1"
         assert set_cf.call_args.args[2] == "FIELD-UUID"
-        assert set_cf.call_args.args[3] == "OPT-MAGNIT"
+        assert set_cf.call_args.args[3] == "OPT-VENDORX"
 
 
 # ---------------------------------------------------------------------------
@@ -582,9 +582,9 @@ class TestPushIntegration:
 # ---------------------------------------------------------------------------
 
 MEMBERS = [
-    {"id": 100, "username": "Kathy Jung", "email": "kathy@e-m-marketing.com"},
-    {"id": 200, "username": "Charlie Mock", "email": "charliem@e-m-marketing.com"},
-    {"id": 300, "username": "Maurice McCabe", "email": "maurice@spark6.com"},
+    {"id": 100, "username": "Bob Jung", "email": "bob@example.com"},
+    {"id": 200, "username": "Alice Mock", "email": "alice@example.com"},
+    {"id": 300, "username": "Maurice McCabe", "email": "dave@example.com"},
 ]
 
 
@@ -610,7 +610,7 @@ class TestAssigneeResolver:
     def test_resolves_email_username_and_id(self):
         r = clickup._build_assignee_resolver(MEMBERS)
         ids, unresolved = clickup._resolve_assignee_ids(
-            ["kathy@e-m-marketing.com", "Charlie Mock", "300"], r
+            ["bob@example.com", "Alice Mock", "300"], r
         )
         assert ids == [100, 200, 300]
         assert unresolved == []
@@ -618,7 +618,7 @@ class TestAssigneeResolver:
     def test_case_insensitive_and_dedup(self):
         r = clickup._build_assignee_resolver(MEMBERS)
         ids, unresolved = clickup._resolve_assignee_ids(
-            ["KATHY@E-M-MARKETING.COM", "kathy@e-m-marketing.com"], r
+            ["BOB@EXAMPLE.COM", "bob@example.com"], r
         )
         assert ids == [100]
         assert unresolved == []
@@ -636,28 +636,28 @@ class TestSyncAssignees:
 
     def test_absent_key_is_unmanaged_noop(self):
         story = _story_with("s", clickup_id="T1")
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
         with mock.patch.object(clickup, "clickup_update_task") as upd:
             assert clickup._sync_assignees("tok", "T1", cu, story, self.r) is False
         upd.assert_not_called()
 
     def test_adds_and_removes_to_match_yaml(self):
-        story = _story_with("s", clickup_id="T1", assignees=["charliem@e-m-marketing.com"])
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        story = _story_with("s", clickup_id="T1", assignees=["alice@example.com"])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
         with mock.patch.object(clickup, "clickup_update_task") as upd:
             assert clickup._sync_assignees("tok", "T1", cu, story, self.r) is True
         assert upd.call_args.args[2] == {"assignees": {"add": [200], "rem": [100]}}
 
     def test_empty_list_clears(self):
         story = _story_with("s", clickup_id="T1", assignees=[])
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
         with mock.patch.object(clickup, "clickup_update_task") as upd:
             assert clickup._sync_assignees("tok", "T1", cu, story, self.r) is True
         assert upd.call_args.args[2] == {"assignees": {"add": [], "rem": [100]}}
 
     def test_no_change_when_already_matches(self):
-        story = _story_with("s", clickup_id="T1", assignees=["kathy@e-m-marketing.com"])
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        story = _story_with("s", clickup_id="T1", assignees=["bob@example.com"])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
         with mock.patch.object(clickup, "clickup_update_task") as upd:
             assert clickup._sync_assignees("tok", "T1", cu, story, self.r) is False
         upd.assert_not_called()
@@ -667,15 +667,15 @@ class TestPullAssignees:
     def test_reads_remote_into_yaml_sorted(self):
         story = _story_with("s", clickup_id="T1")
         cu = _cu_task_assignees("T1", [
-            (200, "charliem@e-m-marketing.com"), (100, "kathy@e-m-marketing.com")
+            (200, "alice@example.com"), (100, "bob@example.com")
         ])
         assert clickup._pull_assignees(story, cu) is True
         assert story["assignees"] == [
-            "charliem@e-m-marketing.com", "kathy@e-m-marketing.com"
+            "alice@example.com", "bob@example.com"
         ]
 
     def test_remote_removal_becomes_empty_list_when_managed(self):
-        story = _story_with("s", clickup_id="T1", assignees=["kathy@e-m-marketing.com"])
+        story = _story_with("s", clickup_id="T1", assignees=["bob@example.com"])
         cu = _cu_task_assignees("T1", [])
         assert clickup._pull_assignees(story, cu) is True
         assert story["assignees"] == []
@@ -687,8 +687,8 @@ class TestPullAssignees:
         assert "assignees" not in story
 
     def test_idempotent_when_equal(self):
-        story = _story_with("s", clickup_id="T1", assignees=["kathy@e-m-marketing.com"])
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        story = _story_with("s", clickup_id="T1", assignees=["bob@example.com"])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
         assert clickup._pull_assignees(story, cu) is False
 
 
@@ -710,7 +710,7 @@ class TestPushAssigneesIntegration:
     def test_create_resolves_emails_to_ids(self, tmp_path):
         data = _data_with({
             "Kickoff / Access": [
-                _story_with("new task", assignees=["kathy@e-m-marketing.com"]),
+                _story_with("new task", assignees=["bob@example.com"]),
             ],
         })
         yaml_path = tmp_path / "p.yaml"
@@ -734,13 +734,13 @@ class TestPushAssigneesIntegration:
         data = _data_with({
             "Kickoff / Access": [
                 _story_with("existing", clickup_id="T1",
-                            assignees=["charliem@e-m-marketing.com"]),
+                            assignees=["alice@example.com"]),
             ],
         })
         yaml_path = tmp_path / "p.yaml"
         with open(yaml_path, "w") as f:
             yaml.safe_dump(data, f)
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
 
         with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
              mock.patch.object(clickup, "clickup_get_list_members", return_value=MEMBERS), \
@@ -759,17 +759,17 @@ class TestPullAssigneesDryRunPreview:
     def test_target_is_pure_and_matches_apply(self):
         # _assignees_pull_target must NOT mutate, and must agree with _pull_assignees.
         story = _story_with("s", clickup_id="T1")
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
         target = clickup._assignees_pull_target(story, cu)
-        assert target == ["kathy@e-m-marketing.com"]
+        assert target == ["bob@example.com"]
         assert "assignees" not in story  # not mutated by the preview
         # Applying yields the same value the preview reported.
         assert clickup._pull_assignees(story, cu) is True
         assert story["assignees"] == target
 
     def test_target_none_when_equal(self):
-        story = _story_with("s", clickup_id="T1", assignees=["kathy@e-m-marketing.com"])
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        story = _story_with("s", clickup_id="T1", assignees=["bob@example.com"])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
         assert clickup._assignees_pull_target(story, cu) is None
 
     def test_dry_run_pull_does_not_write_assignees(self, tmp_path):
@@ -779,7 +779,7 @@ class TestPullAssigneesDryRunPreview:
         yaml_path = tmp_path / "p.yaml"
         with open(yaml_path, "w") as f:
             yaml.safe_dump(data, f)
-        cu = _cu_task_assignees("T1", [(100, "kathy@e-m-marketing.com")])
+        cu = _cu_task_assignees("T1", [(100, "bob@example.com")])
         with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
              mock.patch.object(clickup, "save_yaml") as save:
             clickup.cmd_pull(data, str(yaml_path), dry_run=True)
@@ -1301,7 +1301,7 @@ class TestApiHelperShapes:
 class TestPushDependencyPass:
     def test_existing_task_gets_dependency_added(self, tmp_path):
         data = _data_with(
-            {"Magnit Monitoring System": [
+            {"VendorX Monitoring System": [
                 _story_with("dev task", clickup_id="T1", depends_on=["GATE"])
             ]},
         )
@@ -1323,7 +1323,7 @@ class TestPushDependencyPass:
 
     def test_newly_created_task_gets_dependency_in_second_pass(self, tmp_path):
         data = _data_with(
-            {"Magnit Monitoring System": [
+            {"VendorX Monitoring System": [
                 _story_with("new dev task", depends_on=["GATE"])  # no clickup_id
             ]},
         )
@@ -1343,7 +1343,7 @@ class TestPushDependencyPass:
 
     def test_dry_run_makes_no_dependency_calls(self, tmp_path):
         data = _data_with(
-            {"Magnit Monitoring System": [
+            {"VendorX Monitoring System": [
                 _story_with("dev task", clickup_id="T1", depends_on=["GATE"])
             ]},
         )
@@ -1741,7 +1741,7 @@ class TestRelationApiHelperShapes:
 class TestPushRelationPass:
     def test_existing_task_gets_relation_added(self, tmp_path):
         data = _data_with(
-            {"Magnit Monitoring System": [
+            {"VendorX Monitoring System": [
                 _story_with("dev task", clickup_id="T1", related=["GATE"])
             ]},
         )
@@ -1763,7 +1763,7 @@ class TestPushRelationPass:
 
     def test_newly_created_task_gets_relation_in_second_pass(self, tmp_path):
         data = _data_with(
-            {"Magnit Monitoring System": [
+            {"VendorX Monitoring System": [
                 _story_with("new dev task", related=["GATE"])  # no clickup_id
             ]},
         )
@@ -1782,7 +1782,7 @@ class TestPushRelationPass:
 
     def test_dry_run_makes_no_relation_calls(self, tmp_path):
         data = _data_with(
-            {"Magnit Monitoring System": [
+            {"VendorX Monitoring System": [
                 _story_with("dev task", clickup_id="T1", related=["GATE"])
             ]},
         )
@@ -1836,7 +1836,7 @@ class TestSyncReconcilesEdges:
         return add_dep, add_link
 
     def test_sync_applies_dependency_and_relation(self, tmp_path):
-        data = _data_with({"Magnit Monitoring System": [
+        data = _data_with({"VendorX Monitoring System": [
             _story_with("dev task", clickup_id="T1",
                         depends_on=["GATE"], related=["REL"])
         ]})
@@ -1852,7 +1852,7 @@ class TestSyncReconcilesEdges:
         add_link.assert_called_once_with(clickup.get_clickup_token(), "T1", "REL")
 
     def test_sync_dry_run_makes_no_edge_calls(self, tmp_path):
-        data = _data_with({"Magnit Monitoring System": [
+        data = _data_with({"VendorX Monitoring System": [
             _story_with("dev task", clickup_id="T1",
                         depends_on=["GATE"], related=["REL"])
         ]})
@@ -1908,7 +1908,7 @@ class TestLinkUrlEncoding:
 
 class TestDiffSurfacesRelation:
     def test_related_divergence_counts_as_mismatch(self, tmp_path):
-        data = _data_with({"Magnit Monitoring System": [
+        data = _data_with({"VendorX Monitoring System": [
             _story_with("dev task", clickup_id="T1", related=["X"])
         ]})
         cu_tasks = [_cu_task_with_edges("T1", "dev task")]  # no linked_tasks

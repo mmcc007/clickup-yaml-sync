@@ -579,7 +579,7 @@ def normalize_description(desc: Optional[str]) -> str:
 _MD_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 # ClickUp also auto-linkifies bare URLs/emails/domains in markdown, e.g.
-# ``maurice@spark6.com`` -> ``[maurice@spark6.com](mailto:maurice@spark6.com)``.
+# ``alice@example.com`` -> ``[alice@example.com](mailto:alice@example.com)``.
 # We collapse such *self-referential* links (label == url, ignoring the
 # mailto:/http(s):// scheme) back to bare text. A genuine mention or labeled
 # link — where the label differs from the url — is left untouched.
