@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1658,7 +1659,9 @@ def _build_backup_snapshot(data: dict, cu_tasks: list[dict]) -> dict:
     """Convert a bulk-fetched ClickUp task list into a YAML-compatible snapshot.
 
     The snapshot mirrors the input YAML's ``project`` + ``status_map`` blocks
-    so it can be fed back to ``pull --conflict remote`` as a source of truth.
+    so a bad push can be undone by ``push``-ing this file back up (YAML→ClickUp
+    restores the snapshot). NOT via ``pull`` — pull's source is ClickUp's live
+    API, never a backup file.
     """
     status_map = data.get("status_map", {}) or {}
     epic_name_map = build_epic_name_map(data)
@@ -1750,6 +1753,68 @@ def _maybe_write_backup(
     return target
 
 
+def _backup_yaml_file(yaml_path: str, dest: Optional[str] = None) -> Optional[Path]:
+    """Copy the YAML file to a timestamped backup before pull overwrites it.
+
+    pull is the only mutating command that rewrites the *local* file (remote
+    wins), so its safety net is a copy of the YAML — not a snapshot of ClickUp
+    (which pull never touches). Returns the backup path, or None if the source
+    doesn't exist yet.
+
+    Default destination is the project-local ``.clickup-sync/`` sidecar (the same
+    gitignored dir that holds the base snapshot) — NOT ``~/tmp``: backups keyed
+    only by file *stem* collide when a corpus has several identically-named files
+    (e.g. multiple ``project-tasks.yaml``). Co-locating beside the source is
+    collision-free and travels with the project. ``dest`` (from ``--backup-to``)
+    overrides with an explicit path.
+    """
+    src = Path(yaml_path)
+    if not src.exists():
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if dest:
+        dst = Path(dest)
+    else:
+        dst = src.resolve().parent / ".clickup-sync" / f"yaml-backup-{src.stem}-{ts}.yaml"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    log.info(f"YAML backup written: {dst}")
+    return dst
+
+
+def _warn_one_directional(
+    command: str,
+    overwrites: str,
+    backup_desc: str,
+    *,
+    dry_run: bool,
+    will_backup: bool,
+) -> None:
+    """Loud startup banner: this command is a blunt one-way overwrite.
+
+    push/pull have NO conflict detection — unlike sync, which reads the base
+    snapshot, auto-resolves one-sided changes, and STOPS on a true conflict.
+    Non-blocking (so scripted use still works), just makes the bluntness visible.
+    The backup line is derived from the resolved run state (``dry_run`` /
+    ``will_backup``) so it never claims a backup that won't actually be written.
+    """
+    if dry_run:
+        note = "(dry run — no changes will be written.)"
+    elif will_backup:
+        note = f"A backup of {backup_desc} is written first (--no-backup to skip)."
+    else:
+        note = ("--no-backup: NO backup will be written — an unwanted overwrite "
+                "is unrecoverable.")
+    bar = "=" * 74
+    log.warning(bar)
+    log.warning(f"  `{command}` is a one-directional overwrite with NO conflict detection.")
+    log.warning(f"  It overwrites {overwrites}.")
+    log.warning(f"  {note}")
+    log.warning("  For conflict-aware reconciliation that auto-resolves one-sided")
+    log.warning("  changes and STOPS on a true conflict, use `sync` instead.")
+    log.warning(bar)
+
+
 # ---------------------------------------------------------------------------
 # Push command (flat stories with epic tag)
 # ---------------------------------------------------------------------------
@@ -1772,14 +1837,24 @@ def cmd_push(
     project_cfg = data.get("project", {})
     stats = {"created": 0, "updated": 0, "unchanged": 0, "errors": 0}
 
+    _warn_one_directional(
+        "push",
+        "ClickUp from YAML for every managed field — a change made in the "
+        "ClickUp UI since your last sync will be lost",
+        "current ClickUp state, restorable by running `push <backup-file>`",
+        dry_run=dry_run,
+        will_backup=backup_default,
+    )
+
     # Bulk fetch all ClickUp tasks once — avoids N individual GET calls
     log.info("Fetching all tasks from ClickUp...")
     cu_tasks = clickup_list_tasks(token, list_id)
     cu_by_id = {t["id"]: t for t in cu_tasks}
     log.info(f"Fetched {len(cu_tasks)} tasks")
 
-    # Backup-before-push: snapshot remote state so a bad push is recoverable
-    # via `pull --conflict remote` from the backup file.
+    # Backup-before-push: snapshot remote state so a bad push can be undone by
+    # `push`-ing the backup file back up (YAML→ClickUp restores the snapshot).
+    # NOT `pull` — pull reads ClickUp's live API, never a backup file.
     if not dry_run:
         _maybe_write_backup(
             data=data,
@@ -1922,13 +1997,43 @@ def cmd_push(
 # ---------------------------------------------------------------------------
 
 
-def cmd_pull(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
+def cmd_pull(
+    data: dict,
+    yaml_path: str,
+    dry_run: bool = False,
+    backup_default: bool = True,
+    backup_path: Optional[str] = None,
+) -> dict:
     """Pull ClickUp tasks into YAML. Tasks are matched by clickup_id.
-    New tasks are placed by their epic tag (E1, E9, etc.) or into _orphans."""
+    New tasks are placed by their epic tag (E1, E9, etc.) or into _orphans.
+    ``backup_path`` (from --backup-to) overrides the default backup location."""
     token = get_clickup_token()
     list_id = data["project"]["clickup_list_id"]
     status_map = data.get("status_map", {})
     stats = {"updated": 0, "new": 0, "archived": 0, "unchanged": 0}
+
+    _warn_one_directional(
+        "pull",
+        "your YAML file from ClickUp (remote wins) — uncommitted local YAML "
+        "edits will be lost",
+        "your YAML file (restore by copying the backup back over it)",
+        dry_run=dry_run,
+        will_backup=backup_default,
+    )
+
+    # Backup-before-pull: pull rewrites the local file, so copy it first. Fail
+    # CLOSED — if the safety copy can't be written, abort before any overwrite
+    # rather than proceed unprotected (rerun with --no-backup to opt out).
+    if not dry_run and backup_default:
+        explicit = backup_path if backup_path not in (None, BACKUP_DEFAULT_SENTINEL) else None
+        try:
+            _backup_yaml_file(yaml_path, dest=explicit)
+        except OSError as e:
+            log.error(
+                f"Pre-pull YAML backup failed ({e}); aborting to avoid an "
+                f"unrecoverable overwrite. Rerun with --no-backup to pull without one."
+            )
+            sys.exit(1)
 
     log.info("Fetching all tasks from ClickUp...")
     cu_tasks = clickup_list_tasks(token, list_id)
@@ -2994,17 +3099,19 @@ def main() -> None:
         const=BACKUP_DEFAULT_SENTINEL,
         default=None,
         help=(
-            "Snapshot current ClickUp state to a YAML file before any "
-            "modifying call. Pass a path, or omit value to use "
-            "~/tmp/clickup-backup-<list_id>-<iso>.yaml. Applies to push, "
-            "sync, merge. push auto-backs-up by default for non-empty lists; "
-            "use --no-backup to opt out."
+            "Override the backup location written before a modifying run. For "
+            "push/sync/merge this is the ClickUp-state snapshot "
+            "(~/tmp/clickup-backup-<list_id>-<iso>.yaml by default); for pull it "
+            "is the YAML-file copy (.clickup-sync/yaml-backup-<stem>-<iso>.yaml by "
+            "default). Pass a path, or omit the value for the default. "
+            "Auto-on for non-empty lists; --no-backup opts out."
         ),
     )
     parser.add_argument(
         "--no-backup",
         action="store_true",
-        help="Disable the automatic backup-before-push (push only).",
+        help="Disable the automatic backup-before-push (ClickUp snapshot) and "
+             "backup-before-pull (YAML-file copy).",
     )
     parser.add_argument(
         "--sandbox",
@@ -3036,7 +3143,13 @@ def main() -> None:
             backup_default=not args.no_backup,
         )
     elif args.command == "pull":
-        cmd_pull(data, args.yaml_file, dry_run=args.dry_run)
+        cmd_pull(
+            data,
+            args.yaml_file,
+            dry_run=args.dry_run,
+            backup_default=not args.no_backup,
+            backup_path=args.backup_to,
+        )
     elif args.command == "diff":
         cmd_diff(data)
     elif args.command == "sync":

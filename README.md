@@ -27,6 +27,20 @@ epics:                        Tasks (flat list):
 | `merge` | Like sync but uses GPT-4o-mini to propose merged values |
 | `status` | Offline summary table (no API calls) |
 
+### Which command should I use? → `sync` (default)
+
+**`sync` is the safe default and the recommended command for routine work.** It is the only command with **conflict detection**: it reads a base snapshot, auto-resolves changes that happened on only one side, and **stops on a true conflict** (both sides changed the same field) under the default `--on-conflict stop` — making zero changes until you resolve it. Inspect first with `sync --dry-run`.
+
+`push` and `pull` are **blunt, one-directional overwrites with no conflict detection** — keep them for deliberate "force one side to win" cases (or first-time bootstrap), not routine use:
+
+| | Direction | Conflict detection | Safety net | Equivalent via sync |
+|---|---|:--:|---|---|
+| **`sync`** | both | **yes** (3-way, stops on conflict) | base snapshot | — |
+| **`push`** | YAML → ClickUp | none — clobbers UI edits | auto ClickUp-state backup | `sync --on-conflict local` |
+| **`pull`** | ClickUp → YAML | none — clobbers local YAML edits | auto YAML-file backup | `sync --on-conflict remote` |
+
+Both `push` and `pull` print a one-time warning banner describing what they'll overwrite, and both auto-create a backup first (disable with `--no-backup`). Prefer the `sync` equivalents — they do the same thing but auto-resolve the non-conflicting changes and stop before clobbering a genuine collision.
+
 ## Multi-Tag, Milestones, and Custom Dropdowns
 
 The tool maintains an additive multi-tag set per story. Sources merge in
@@ -198,19 +212,25 @@ If either field is missing, the dropdown push is skipped silently — old
 YAML files keep working unchanged. Per-story override via
 `epic_dropdown_value: "<epic name>"` on a single story.
 
-## Backup-before-push
+## Backups (push and pull)
 
-Before any modifying call, `push` snapshots the current ClickUp state to a
-YAML file you can `pull --conflict remote` from if a push goes sideways.
+Each command backs up **the side it's about to overwrite**, and `--no-backup`
+disables whichever applies:
 
-- `push` runs the backup by **default** for any non-empty list. New empty
-  sandbox lists skip the backup.
-- `push --no-backup` disables it.
-- `push --backup-to /path/to/file.yaml` writes to a specific path.
-- `push --backup-to` (no value) uses
-  `~/tmp/clickup-backup-<list_id>-<iso>.yaml`.
-- `sync` and `merge` accept the same `--backup-to` flag but **don't**
-  auto-backup — pass the flag explicitly to opt in.
+- **`push`** snapshots the current **ClickUp state** to a YAML file. To recover
+  from a bad push, **`push` that backup file back up** (`push <backup-file>`) —
+  it restores ClickUp to the snapshot. (Not `pull` — pull reads ClickUp's live
+  API, never a backup file.) Runs by default for any non-empty list; new empty
+  sandbox lists skip it.
+- **`pull`** copies your **YAML file** (the thing pull overwrites) to
+  `.clickup-sync/yaml-backup-<stem>-<iso>.yaml` beside the project — the same
+  gitignored sidecar that holds the base snapshot. To recover from a bad pull,
+  copy that backup back over your YAML. If the backup can't be written, pull
+  **aborts** rather than overwrite unprotected (rerun with `--no-backup` to
+  proceed without one). Runs by default.
+- `--backup-to /path` overrides the location for either; `--backup-to` with no
+  value uses the default. `sync`/`merge` accept `--backup-to` but don't
+  auto-backup — pass it to opt in.
 
 ## 3-way merge (sync)
 
