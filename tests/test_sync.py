@@ -582,9 +582,9 @@ class TestPushIntegration:
 # ---------------------------------------------------------------------------
 
 MEMBERS = [
-    {"id": 100, "username": "Bob Jung", "email": "bob@example.com"},
-    {"id": 200, "username": "Alice Mock", "email": "alice@example.com"},
-    {"id": 300, "username": "Maurice McCabe", "email": "dave@example.com"},
+    {"id": 100, "username": "Bob Example", "email": "bob@example.com"},
+    {"id": 200, "username": "Alice Example", "email": "alice@example.com"},
+    {"id": 300, "username": "Dave Example", "email": "dave@example.com"},
 ]
 
 
@@ -610,7 +610,7 @@ class TestAssigneeResolver:
     def test_resolves_email_username_and_id(self):
         r = clickup._build_assignee_resolver(MEMBERS)
         ids, unresolved = clickup._resolve_assignee_ids(
-            ["bob@example.com", "Alice Mock", "300"], r
+            ["bob@example.com", "Alice Example", "300"], r
         )
         assert ids == [100, 200, 300]
         assert unresolved == []
