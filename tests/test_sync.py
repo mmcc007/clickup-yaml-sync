@@ -1968,3 +1968,156 @@ class TestEdgeRemovalWarning:
             clickup._sync_relations("tok", "T1", cu, story,
                                     dry_run=True, warn_on_remove=True)
         assert any("Would remove" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# push/pull safety: one-directional warning banner + pull YAML backup.
+# ---------------------------------------------------------------------------
+
+
+class TestOneDirectionalWarning:
+    def test_push_warns_about_clobbering_clickup(self, tmp_path, caplog):
+        data = _data_with({"Kickoff / Access": [
+            _story_with("t", clickup_id="T1")
+        ]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_with_edges("T1", "t")
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+             mock.patch.object(clickup, "_maybe_write_backup"), \
+             mock.patch.object(clickup, "save_yaml"), \
+             caplog.at_level("WARNING"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=True,
+                             backup_path=None, backup_default=False)
+        joined = " ".join(r.message for r in caplog.records)
+        assert "`push` is a one-directional overwrite" in joined
+        assert "use `sync`" in joined
+
+    def test_pull_warns_about_clobbering_yaml(self, tmp_path, caplog):
+        data = _data_with({"Kickoff / Access": [_story_with("t", clickup_id="T1")]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_with_edges("T1", "t")
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "save_yaml"), \
+             caplog.at_level("WARNING"):
+            clickup.cmd_pull(data, str(yaml_path), dry_run=True)
+        joined = " ".join(r.message for r in caplog.records)
+        assert "`pull` is a one-directional overwrite" in joined
+
+
+class TestPullBackup:
+    def test_pull_backs_up_yaml_by_default(self, tmp_path):
+        data = _data_with({"Kickoff / Access": [_story_with("t", clickup_id="T1")]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_with_edges("T1", "t")
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "save_yaml"), \
+             mock.patch.object(clickup, "_backup_yaml_file") as bk:
+            clickup.cmd_pull(data, str(yaml_path), dry_run=False, backup_default=True)
+        bk.assert_called_once_with(str(yaml_path), dest=None)
+
+    def test_pull_skips_backup_when_disabled(self, tmp_path):
+        data = _data_with({"Kickoff / Access": [_story_with("t", clickup_id="T1")]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_with_edges("T1", "t")
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "save_yaml"), \
+             mock.patch.object(clickup, "_backup_yaml_file") as bk:
+            clickup.cmd_pull(data, str(yaml_path), dry_run=False, backup_default=False)
+        bk.assert_not_called()
+
+    def test_pull_dry_run_does_not_back_up(self, tmp_path):
+        data = _data_with({"Kickoff / Access": [_story_with("t", clickup_id="T1")]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_with_edges("T1", "t")
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "save_yaml"), \
+             mock.patch.object(clickup, "_backup_yaml_file") as bk:
+            clickup.cmd_pull(data, str(yaml_path), dry_run=True, backup_default=True)
+        bk.assert_not_called()
+
+    def test_backup_yaml_file_writes_beside_source_in_sidecar(self, tmp_path):
+        # Co-located in the project-local .clickup-sync/ sidecar (NOT ~/tmp),
+        # so identically-named files in different dirs never collide.
+        src = tmp_path / "proj.yaml"
+        src.write_text("project: {}\n")
+        dst = clickup._backup_yaml_file(str(src))
+        assert dst is not None and dst.exists()
+        assert dst.read_text() == "project: {}\n"
+        assert dst.parent == src.resolve().parent / ".clickup-sync"
+        assert dst.name.startswith("yaml-backup-proj-")
+
+    def test_backup_yaml_file_honors_explicit_dest(self, tmp_path):
+        src = tmp_path / "proj.yaml"
+        src.write_text("x: 1\n")
+        dest = tmp_path / "custom" / "mybak.yaml"
+        dst = clickup._backup_yaml_file(str(src), dest=str(dest))
+        assert dst == dest and dest.read_text() == "x: 1\n"
+
+    def test_backup_yaml_file_none_when_missing(self, tmp_path):
+        assert clickup._backup_yaml_file(str(tmp_path / "nope.yaml")) is None
+
+
+class TestBannerHonesty:
+    def _pull(self, tmp_path, caplog, **kw):
+        data = _data_with({"Kickoff / Access": [_story_with("t", clickup_id="T1")]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_with_edges("T1", "t")
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "save_yaml"), \
+             mock.patch.object(clickup, "_backup_yaml_file"), \
+             caplog.at_level("WARNING"):
+            clickup.cmd_pull(data, str(yaml_path), **kw)
+        return " ".join(r.message for r in caplog.records)
+
+    def test_no_backup_banner_does_not_promise_a_backup(self, tmp_path, caplog):
+        msg = self._pull(tmp_path, caplog, dry_run=False, backup_default=False)
+        assert "NO backup will be written" in msg
+        assert "backup of your YAML file is written first" not in msg
+
+    def test_default_banner_promises_a_backup(self, tmp_path, caplog):
+        msg = self._pull(tmp_path, caplog, dry_run=False, backup_default=True)
+        assert "A backup of your YAML file" in msg
+        assert "NO backup will be written" not in msg
+
+
+class TestPullBackupFailClosed:
+    def test_backup_oserror_aborts_pull(self, tmp_path):
+        data = _data_with({"Kickoff / Access": [_story_with("t", clickup_id="T1")]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        # If the safety copy fails, pull must abort BEFORE fetching/overwriting.
+        with mock.patch.object(clickup, "_backup_yaml_file",
+                               side_effect=OSError("disk full")), \
+             mock.patch.object(clickup, "clickup_list_tasks") as lst, \
+             mock.patch.object(clickup, "save_yaml") as save, \
+             pytest.raises(SystemExit):
+            clickup.cmd_pull(data, str(yaml_path), dry_run=False, backup_default=True)
+        lst.assert_not_called()
+        save.assert_not_called()
+
+    def test_pull_passes_explicit_backup_path(self, tmp_path):
+        data = _data_with({"Kickoff / Access": [_story_with("t", clickup_id="T1")]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu = _cu_task_with_edges("T1", "t")
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[cu]), \
+             mock.patch.object(clickup, "save_yaml"), \
+             mock.patch.object(clickup, "_backup_yaml_file") as bk:
+            clickup.cmd_pull(data, str(yaml_path), dry_run=False,
+                             backup_default=True, backup_path="/tmp/x.yaml")
+        bk.assert_called_once_with(str(yaml_path), dest="/tmp/x.yaml")
