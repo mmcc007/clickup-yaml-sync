@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -72,43 +73,121 @@ log = setup_logging()
 # ---------------------------------------------------------------------------
 
 
-def load_env_file(path: str) -> None:
-    """Load key=value pairs from a file into os.environ (simple .env loader)."""
-    env_path = Path(path)
-    if not env_path.exists():
-        return
-    with open(env_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                # Handle export KEY=VALUE and KEY=VALUE
-                if line.startswith("export "):
-                    line = line[7:]
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip("\"'")
-                if key and key not in os.environ:
-                    os.environ[key] = value
+# Credentials resolve in a fixed precedence (env var > pass > legacy env file)
+# so the project can standardize on `pass` while existing ~/bin/*.env setups
+# keep working untouched. `pass` is the canonical store; the env-file branch is
+# a back-compat fallback only.
+
+
+def _pass_get(key: str) -> Optional[str]:
+    """Return the first line of ``pass show <key>``, or None if unavailable.
+
+    None covers every "no secret here" case — pass not installed, the entry
+    missing, or an empty body — so the caller falls through to the next source.
+    """
+    try:
+        result = subprocess.run(
+            ["pass", "show", key],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = result.stdout.splitlines()
+    if not lines:
+        return None
+    first = lines[0].strip()
+    return first or None
+
+
+def _read_env_file_value(path: Path, key: str) -> Optional[str]:
+    """Read a single ``KEY=value`` from a .env file without mutating os.environ.
+
+    Handles the ``export`` prefix and quote stripping, and is side-effect-free
+    so the file-fallback branch can't leak a value into the process environment
+    and bleed across callers (or tests).
+    """
+    if not path.exists():
+        return None
+    try:
+        contents = path.read_text()
+    except OSError:
+        return None  # unreadable (permissions, etc.) — fall through to caller
+    for line in contents.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:]
+        k, sep, value = line.partition("=")
+        if sep and k.strip() == key:
+            return value.strip().strip("\"'") or None
+    return None
+
+
+def _resolve_secret(
+    env_var: str, pass_key: str, env_path: Path, label: str
+) -> str:
+    """Resolve a secret: explicit env var > ``pass`` > legacy env file.
+
+    The env-file key is the same name as ``env_var``. Exits the process with a
+    pointer to all three sources if none yields a value.
+    """
+    val = os.environ.get(env_var, "").strip()
+    if val:
+        return val
+    val = _pass_get(pass_key)
+    if val:
+        return val
+    val = _read_env_file_value(env_path, env_var)
+    if val:
+        return val
+    log.error(
+        f"{label} not set. Add it to pass ({pass_key}), export {env_var}, "
+        f"or put it in {env_path}"
+    )
+    sys.exit(1)
+
+
+def _sandbox_mode() -> bool:
+    """True when CLI/env selects the sandbox ClickUp account (CLICKUP_SANDBOX)."""
+    return bool(os.environ.get("CLICKUP_SANDBOX"))
+
+
+def _prod_env_path() -> Path:
+    return Path.home() / "bin" / "clickup.env"
+
+
+def _sandbox_env_path() -> Path:
+    return Path.home() / "bin" / "clickup-sandbox.env"
 
 
 def get_clickup_token() -> str:
-    load_env_file(str(Path.home() / "bin" / "clickup.env"))
-    token = os.environ.get("CLICKUP_API_TOKEN", "")
-    if not token:
-        log.error("CLICKUP_API_TOKEN not set. Export it or add to ~/bin/clickup.env")
-        sys.exit(1)
-    return token
+    if _sandbox_mode():
+        return _resolve_secret(
+            "CLICKUP_API_TOKEN_SANDBOX",
+            "clickup/sandbox-api-token",
+            _sandbox_env_path(),
+            "ClickUp sandbox API token",
+        )
+    return _resolve_secret(
+        "CLICKUP_API_TOKEN",
+        "clickup/api-token",
+        _prod_env_path(),
+        "CLICKUP_API_TOKEN",
+    )
 
 
 def get_openai_key() -> str:
-    load_env_file(str(Path.home() / "bin" / "clickup.env"))
-    key = os.environ.get("OPENAI_API_KEY", "")
-    if not key:
-        log.error("OPENAI_API_KEY not set. Export it or add to ~/bin/clickup.env")
-        sys.exit(1)
-    return key
+    return _resolve_secret(
+        "OPENAI_API_KEY",
+        "clickup/openai-key",
+        _prod_env_path(),
+        "OPENAI_API_KEY",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +382,21 @@ def clickup_remove_dependency(token: str, task_id: str, depends_on: str) -> dict
         f"{CLICKUP_BASE}/task/{task_id}/dependency"
         f"?depends_on={urllib.parse.quote(depends_on)}"
     )
+    return _api_request("DELETE", url, token)
+
+
+def clickup_add_link(token: str, task_id: str, links_to: str) -> dict:
+    """Add a non-blocking link ("linked task") between two tasks.
+
+    The link is symmetric — ClickUp records it on both endpoints.
+    """
+    url = f"{CLICKUP_BASE}/task/{task_id}/link/{urllib.parse.quote(links_to)}"
+    return _api_request("POST", url, token)
+
+
+def clickup_remove_link(token: str, task_id: str, links_to: str) -> dict:
+    """Remove a non-blocking link between ``task_id`` and ``links_to``."""
+    url = f"{CLICKUP_BASE}/task/{task_id}/link/{urllib.parse.quote(links_to)}"
     return _api_request("DELETE", url, token)
 
 
@@ -1287,17 +1381,35 @@ def _resolve_dependency_ids(
     return desired, unresolved
 
 
+def _warn_edge_removal(kind: str, task_id: str, rem: list[str], dry_run: bool) -> None:
+    """Loudly flag a destructive edge removal (mirrors the assignee warning).
+
+    Edges are YAML-authoritative but NOT base-tracked, so a removal here deletes
+    a remote edge that may have been added in the ClickUp UI or declared by the
+    peer task — surface it instead of silently destroying it. push omits this
+    (its overwrite contract is documented); sync/merge pass warn_on_remove=True.
+    """
+    prefix = "[DRY RUN] Would remove" if dry_run else "Removing"
+    log.warning(
+        f"    {prefix} {len(rem)} {kind} edge(s) {rem} on {task_id} — YAML is "
+        f"authoritative and these aren't base-tracked; a UI-added or peer-declared "
+        f"edge will be deleted."
+    )
+
+
 def _sync_dependencies(
     token: str,
     task_id: str,
     cu_task: dict,
     story: dict,
     dry_run: bool = False,
+    warn_on_remove: bool = False,
 ) -> bool:
     """Reconcile a task's waiting_on edges to match the story's ``depends_on``.
 
     No-op (preserves UI edges) when the story has no ``depends_on`` key.
     Returns True if a change was made — or would be, under ``dry_run``.
+    ``warn_on_remove`` loudly flags edge deletions (set by sync/merge, not push).
     """
     if "depends_on" not in story:
         return False
@@ -1310,6 +1422,8 @@ def _sync_dependencies(
     rem = sorted(current - desired)
     if not add and not rem:
         return False
+    if rem and warn_on_remove:
+        _warn_edge_removal("dependency", task_id, rem, dry_run)
     if dry_run:
         log.info(f"    [DRY RUN] Would reconcile dependencies: +{add} -{rem}")
         return True
@@ -1356,6 +1470,170 @@ def _pull_dependencies(story: dict, cu_task: dict) -> bool:
         return False
     story["depends_on"] = target
     return True
+
+
+# ---------------------------------------------------------------------------
+# Relations (non-blocking "linked tasks") — relationship-reconcile
+# ---------------------------------------------------------------------------
+#
+# Semantics mirror ``depends_on`` (and assignees) exactly — YAML-authoritative
+# when the ``related`` key is present:
+#   - no ``related`` key   -> UNMANAGED: ClickUp links untouched (UI links survive)
+#   - ``related: []``      -> MANAGED, empty: clears the task's links
+#   - ``related: [id, …]`` -> MANAGED: reconciled to match exactly
+#
+# Unlike ``depends_on`` (a directional waiting_on edge), a link is NON-directional
+# — ClickUp records the same link on both endpoints. We therefore collapse each
+# linked_tasks entry to "the other end" (the id that isn't this task), so the
+# relation round-trips identically regardless of which task created it.
+
+
+def _cu_linked_ids(cu_task: dict) -> set[str]:
+    """The set of task ids THIS task is linked to, read from ``linked_tasks``.
+
+    Each entry carries two ids (``task_id`` and ``link_id``) for the two
+    endpoints; the relation is symmetric, so we keep whichever id is not this
+    task's own. Self-referential or malformed entries are ignored.
+    """
+    self_id = cu_task.get("id")
+    out: set[str] = set()
+    for link in cu_task.get("linked_tasks") or []:
+        a = link.get("task_id")
+        b = link.get("link_id")
+        other = None
+        if a and a != self_id:
+            other = a
+        elif b and b != self_id:
+            other = b
+        if other:
+            out.add(str(other))
+    return out
+
+
+def _sync_relations(
+    token: str,
+    task_id: str,
+    cu_task: dict,
+    story: dict,
+    dry_run: bool = False,
+    warn_on_remove: bool = False,
+) -> bool:
+    """Reconcile a task's links to match the story's ``related`` list.
+
+    No-op (preserves UI links) when the story has no ``related`` key.
+    Returns True if a change was made — or would be, under ``dry_run``.
+    ``warn_on_remove`` loudly flags link deletions (set by sync/merge, not push).
+    Because links are symmetric, a removal here is the H1 footgun — two managed
+    tasks that disagree about a mutual link — so the warning matters most here.
+    """
+    if "related" not in story:
+        return False
+    # Same normalizer as depends_on: drops blanks, dedups, refuses self-link.
+    desired_ids, unresolved = _resolve_dependency_ids(story.get("related"), task_id)
+    for u in unresolved:
+        log.warning(f"    Invalid related target, skipping: '{u}'")
+    desired = set(desired_ids)
+    current = _cu_linked_ids(cu_task)
+    add = sorted(desired - current)
+    rem = sorted(current - desired)
+    if not add and not rem:
+        return False
+    if rem and warn_on_remove:
+        _warn_edge_removal("relation", task_id, rem, dry_run)
+    if dry_run:
+        log.info(f"    [DRY RUN] Would reconcile relations: +{add} -{rem}")
+        return True
+    changed = False
+    for rid in add:
+        try:
+            clickup_add_link(token, task_id, rid)
+            log.info(f"    Added relation: linked to {rid}")
+            changed = True
+        except Exception as e:
+            log.warning(f"    Failed to add relation to {rid}: {e}")
+    for rid in rem:
+        try:
+            clickup_remove_link(token, task_id, rid)
+            log.info(f"    Removed relation: no longer linked to {rid}")
+            changed = True
+        except Exception as e:
+            log.warning(f"    Failed to remove relation to {rid}: {e}")
+    return changed
+
+
+def _relations_pull_target(story: dict, cu_task: dict) -> Optional[list[str]]:
+    """The ``related`` list a pull would write, or None if no change needed.
+
+    Pure (no mutation), so the dry-run preview and the real pull share one rule.
+    """
+    cu_ids = _cu_linked_ids(cu_task)
+    if not cu_ids and "related" not in story:
+        return None
+    current = {
+        str(x).strip() for x in (story.get("related") or []) if str(x).strip()
+    }
+    if current == cu_ids:
+        return None
+    return sorted(cu_ids)
+
+
+def _pull_relations(story: dict, cu_task: dict) -> bool:
+    """Read ClickUp links back into the YAML story. True if changed."""
+    target = _relations_pull_target(story, cu_task)
+    if target is None:
+        return False
+    story["related"] = target
+    return True
+
+
+def _reconcile_edges_pass(
+    token: str,
+    data: dict,
+    cu_by_id: dict,
+    stats: dict,
+    dry_run: bool,
+    warn_on_remove: bool = False,
+) -> None:
+    """Reconcile dependency + relation edges for every managed story.
+
+    The relationship-reconcile **second pass**, shared by ``cmd_push``,
+    ``cmd_sync``, and ``cmd_merge``. Runs after the create/update pass so a task
+    created this run already has its ``clickup_id`` written back (edge targets
+    reference tasks by id and must resolve). A task created this run isn't in
+    ``cu_by_id`` (fetched before creates), so it starts from a synthetic
+    edge-free task. Edges are YAML-authoritative when the key is present;
+    failures bump ``stats['errors']``. ``warn_on_remove`` loudly flags edge
+    deletions — push leaves it False (authoritative overwrite is its contract);
+    sync/merge pass True so a destructive removal is never silent.
+    """
+    for epic in data["epics"]:
+        for story in epic.get("stories", []):
+            cid = story.get("clickup_id")
+            if not cid or ("depends_on" not in story and "related" not in story):
+                continue
+            cu_task = cu_by_id.get(cid) or {
+                "id": cid, "dependencies": [], "linked_tasks": []
+            }
+            try:
+                _sync_dependencies(
+                    token, cid, cu_task, story,
+                    dry_run=dry_run, warn_on_remove=warn_on_remove,
+                )
+            except Exception as e:
+                log.error(
+                    f"  Failed to reconcile dependencies for {story['name']}: {e}"
+                )
+                stats["errors"] += 1
+            try:
+                _sync_relations(
+                    token, cid, cu_task, story,
+                    dry_run=dry_run, warn_on_remove=warn_on_remove,
+                )
+            except Exception as e:
+                log.error(
+                    f"  Failed to reconcile relations for {story['name']}: {e}"
+                )
+                stats["errors"] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -1628,23 +1906,8 @@ def cmd_push(
                     assignee_resolver, dry_run=dry_run,
                 )
 
-    # Second pass: reconcile dependencies. Runs after the create/update pass so
-    # every story created this run already has its clickup_id written back —
-    # dependency targets reference tasks by id and must resolve. A new task
-    # isn't in cu_by_id (fetched before creates), so it starts with no edges.
-    for epic in data["epics"]:
-        for story in epic.get("stories", []):
-            cid = story.get("clickup_id")
-            if not cid or "depends_on" not in story:
-                continue
-            cu_task = cu_by_id.get(cid) or {"id": cid, "dependencies": []}
-            try:
-                _sync_dependencies(token, cid, cu_task, story, dry_run=dry_run)
-            except Exception as e:
-                log.error(
-                    f"  Failed to reconcile dependencies for {story['name']}: {e}"
-                )
-                stats["errors"] += 1
+    # Second pass: reconcile relationship edges (dependencies + relations).
+    _reconcile_edges_pass(token, data, cu_by_id, stats, dry_run)
 
     if not dry_run:
         save_yaml(data, yaml_path)
@@ -1717,6 +1980,17 @@ def cmd_pull(data: dict, yaml_path: str, dry_run: bool = False) -> dict:
             elif _pull_dependencies(story, cu_task):
                 log.info(f"  Pulled dependencies for '{story['name']}': "
                          f"{story.get('depends_on')}")
+            # Relations (linked tasks) are also not a compare_task field —
+            # reconcile directly so a UI-set link round-trips into YAML.
+            if dry_run:
+                rtarget = _relations_pull_target(story, cu_task)
+                if rtarget is not None:
+                    log.info(f"  [DRY RUN] Would pull relations for "
+                             f"'{story['name']}': "
+                             f"{story.get('related', '(none)')} -> {rtarget}")
+            elif _pull_relations(story, cu_task):
+                log.info(f"  Pulled relations for '{story['name']}': "
+                         f"{story.get('related')}")
         else:
             # New task from ClickUp — place by epic tag
             new_story = _clickup_task_to_yaml_story(cu_task, status_map)
@@ -1795,6 +2069,9 @@ def _clickup_task_to_yaml_story(cu_task: dict, status_map: dict) -> dict:
     dep_ids = _cu_waiting_on_ids(cu_task)
     if dep_ids:
         story["depends_on"] = sorted(dep_ids)
+    rel_ids = _cu_linked_ids(cu_task)
+    if rel_ids:
+        story["related"] = sorted(rel_ids)
     return story
 
 
@@ -1869,7 +2146,9 @@ def cmd_diff(data: dict) -> dict:
                 a_diff = _assignees_differ(story, cu_task, assignee_resolver)
                 dep_target = _dependencies_pull_target(story, cu_task)
                 d_diff = dep_target is not None
-                if diffs or a_diff or d_diff:
+                rel_target = _relations_pull_target(story, cu_task)
+                r_diff = rel_target is not None
+                if diffs or a_diff or d_diff or r_diff:
                     if not has_stories:
                         log.info(f"[{tag}] {epic['name']}:")
                         has_stories = True
@@ -1887,6 +2166,10 @@ def cmd_diff(data: dict) -> dict:
                         y = story.get("depends_on", "(unmanaged)")
                         r = sorted(_cu_waiting_on_ids(cu_task))
                         log.info(f"    depends_on: YAML='{y}' vs ClickUp='{r}'")
+                    if r_diff:
+                        y = story.get("related", "(unmanaged)")
+                        r = sorted(_cu_linked_ids(cu_task))
+                        log.info(f"    related: YAML='{y}' vs ClickUp='{r}'")
                     stats["mismatches"] += 1
                 else:
                     stats["synced"] += 1
@@ -1995,6 +2278,11 @@ def cmd_merge(
             except Exception as e:
                 log.error(f"    Merge failed: {e}")
                 stats["errors"] += 1
+
+    # Relationship-reconcile second pass (dependencies + relations), same as
+    # push/sync — so merge also applies YAML-authoritative link edges. Interactive
+    # command, so warn before any destructive edge removal.
+    _reconcile_edges_pass(token, data, cu_by_id, stats, dry_run=False, warn_on_remove=True)
 
     save_yaml(data, yaml_path)
     log.info(f"\nMerge complete: {stats['merged']} merged, {stats['skipped']} skipped, "
@@ -2304,6 +2592,15 @@ def cmd_sync(
                         token, story, cu_task, assignee_resolver,
                         assignee_strategy, story_name, stats,
                     )
+
+    # Phase 2.5: relationship-reconcile second pass (dependencies + relations).
+    # Mirrors cmd_push — runs after the create/update pass so tasks created this
+    # run already have their clickup_id written back. Edges are YAML-authoritative
+    # when the key is present (same managed/clear/authoritative rule as push); they
+    # are NOT base-tracked 3-way fields, so adding `depends_on`/`related` in YAML
+    # is applied here rather than surfaced as a conflict — which is exactly what
+    # makes the `sync --dry-run -> sync` workflow cover link edges.
+    _reconcile_edges_pass(token, data, cu_by_id, stats, dry_run, warn_on_remove=True)
 
     # Phase 3: ClickUp tasks not in YAML -> create in YAML
     epic_name_map = build_epic_name_map(data)
@@ -2709,8 +3006,18 @@ def main() -> None:
         action="store_true",
         help="Disable the automatic backup-before-push (push only).",
     )
+    parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="Use the sandbox ClickUp account (token from pass "
+             "clickup/sandbox-api-token, env CLICKUP_API_TOKEN_SANDBOX, or "
+             "~/bin/clickup-sandbox.env) instead of production.",
+    )
 
     args = parser.parse_args()
+
+    if args.sandbox:
+        os.environ["CLICKUP_SANDBOX"] = "1"
 
     if not os.path.exists(args.yaml_file):
         log.error(f"YAML file not found: {args.yaml_file}")

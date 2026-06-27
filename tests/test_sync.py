@@ -1457,3 +1457,514 @@ def test_sync_created_task_not_flagged_archived(tmp_path):
     # ...and must NOT be false-flagged as archived.
     assert "archived_in_clickup" not in story
     assert stats["archived"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Credential resolution: env var > pass > legacy env file
+# ---------------------------------------------------------------------------
+
+
+class TestPassGet:
+    def _fake_run(self, returncode, stdout):
+        class _R:
+            pass
+        r = _R()
+        r.returncode = returncode
+        r.stdout = stdout
+        return r
+
+    def test_returns_first_line_stripped(self, monkeypatch):
+        monkeypatch.setattr(
+            clickup.subprocess, "run",
+            lambda *a, **k: self._fake_run(0, "pk_secret\nignored\n"),
+        )
+        assert clickup._pass_get("clickup/api-token") == "pk_secret"
+
+    def test_none_on_nonzero_returncode(self, monkeypatch):
+        monkeypatch.setattr(
+            clickup.subprocess, "run",
+            lambda *a, **k: self._fake_run(1, ""),
+        )
+        assert clickup._pass_get("clickup/missing") is None
+
+    def test_none_on_empty_body(self, monkeypatch):
+        monkeypatch.setattr(
+            clickup.subprocess, "run",
+            lambda *a, **k: self._fake_run(0, "\n"),
+        )
+        assert clickup._pass_get("clickup/blank") is None
+
+    def test_none_when_pass_not_installed(self, monkeypatch):
+        def boom(*a, **k):
+            raise FileNotFoundError("pass")
+        monkeypatch.setattr(clickup.subprocess, "run", boom)
+        assert clickup._pass_get("x") is None
+
+
+class TestReadEnvFileValue:
+    def test_reads_export_quoted(self, tmp_path):
+        f = tmp_path / "c.env"
+        f.write_text('export CLICKUP_API_TOKEN="pk_file"\n')
+        assert clickup._read_env_file_value(f, "CLICKUP_API_TOKEN") == "pk_file"
+
+    def test_missing_file_is_none(self, tmp_path):
+        assert clickup._read_env_file_value(tmp_path / "nope.env", "K") is None
+
+    def test_missing_key_is_none(self, tmp_path):
+        f = tmp_path / "c.env"
+        f.write_text("OTHER=1\n")
+        assert clickup._read_env_file_value(f, "CLICKUP_API_TOKEN") is None
+
+    def test_does_not_mutate_environ(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ZZZ_TOKEN", raising=False)
+        f = tmp_path / "c.env"
+        f.write_text("ZZZ_TOKEN=val\n")
+        clickup._read_env_file_value(f, "ZZZ_TOKEN")
+        assert "ZZZ_TOKEN" not in os.environ
+
+
+class TestGetClickupToken:
+    def test_env_var_wins_over_pass(self, monkeypatch):
+        monkeypatch.setenv("CLICKUP_API_TOKEN", "pk_env")
+        monkeypatch.delenv("CLICKUP_SANDBOX", raising=False)
+        monkeypatch.setattr(clickup, "_pass_get", lambda k: "pk_pass")
+        assert clickup.get_clickup_token() == "pk_env"
+
+    def test_pass_used_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+        monkeypatch.delenv("CLICKUP_SANDBOX", raising=False)
+        seen = {}
+        def fake(key):
+            seen["key"] = key
+            return "pk_from_pass"
+        monkeypatch.setattr(clickup, "_pass_get", fake)
+        assert clickup.get_clickup_token() == "pk_from_pass"
+        assert seen["key"] == "clickup/api-token"
+
+    def test_sandbox_mode_selects_sandbox_pass_key(self, monkeypatch):
+        monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+        monkeypatch.delenv("CLICKUP_API_TOKEN_SANDBOX", raising=False)
+        monkeypatch.setenv("CLICKUP_SANDBOX", "1")
+        seen = {}
+        def fake(key):
+            seen["key"] = key
+            return "pk_sbx"
+        monkeypatch.setattr(clickup, "_pass_get", fake)
+        assert clickup.get_clickup_token() == "pk_sbx"
+        assert seen["key"] == "clickup/sandbox-api-token"
+
+    def test_file_fallback_when_no_env_no_pass(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+        monkeypatch.delenv("CLICKUP_SANDBOX", raising=False)
+        monkeypatch.setattr(clickup, "_pass_get", lambda k: None)
+        envf = tmp_path / "clickup.env"
+        envf.write_text("export CLICKUP_API_TOKEN=pk_file\n")
+        monkeypatch.setattr(clickup, "_prod_env_path", lambda: envf)
+        assert clickup.get_clickup_token() == "pk_file"
+
+    def test_exits_when_nothing_resolves(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+        monkeypatch.delenv("CLICKUP_SANDBOX", raising=False)
+        monkeypatch.setattr(clickup, "_pass_get", lambda k: None)
+        monkeypatch.setattr(clickup, "_prod_env_path", lambda: tmp_path / "absent.env")
+        with pytest.raises(SystemExit):
+            clickup.get_clickup_token()
+
+
+class TestGetOpenAIKey:
+    def test_pass_key_is_clickup_openai_key(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        seen = {}
+        def fake(key):
+            seen["key"] = key
+            return "sk_from_pass"
+        monkeypatch.setattr(clickup, "_pass_get", fake)
+        assert clickup.get_openai_key() == "sk_from_pass"
+        assert seen["key"] == "clickup/openai-key"
+
+
+# ---------------------------------------------------------------------------
+# Relations (non-blocking "linked tasks") — mirror the dependency suite
+# ---------------------------------------------------------------------------
+
+
+def _cu_task_linked(task_id: str, linked: list[str], extra_links: list[dict] | None = None) -> dict:
+    """A ClickUp task carrying ``linked_tasks`` entries for ``task_id``.
+
+    Each entry models the symmetric link as ``{task_id: other, link_id: self}``.
+    ``extra_links`` injects raw entries (reversed orientation, self-only,
+    malformed) to prove the reader collapses to "the other end" robustly.
+    """
+    base = _cu_task(task_id, [])
+    links = [{"task_id": other, "link_id": task_id} for other in linked]
+    if extra_links:
+        links.extend(extra_links)
+    base["linked_tasks"] = links
+    return base
+
+
+class TestCuLinkedIds:
+    def test_extracts_other_end(self):
+        cu = _cu_task_linked("T1", ["A", "B"])
+        assert clickup._cu_linked_ids(cu) == {"A", "B"}
+
+    def test_handles_reversed_orientation(self):
+        # Entry where THIS task sits in link_id and the peer in task_id.
+        cu = _cu_task_linked("T1", [], extra_links=[{"task_id": "T1", "link_id": "C"}])
+        assert clickup._cu_linked_ids(cu) == {"C"}
+
+    def test_ignores_self_only_and_malformed(self):
+        cu = _cu_task_linked(
+            "T1", ["A"],
+            extra_links=[{"task_id": "T1", "link_id": "T1"}, {}],
+        )
+        assert clickup._cu_linked_ids(cu) == {"A"}
+
+    def test_empty_when_no_links(self):
+        assert clickup._cu_linked_ids(_cu_task("T1", [])) == set()
+
+
+class TestSyncRelations:
+    def test_no_key_is_noop(self):
+        story = _story_with("s", clickup_id="T1")  # no related key
+        cu = _cu_task_linked("T1", ["A"])
+        with mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link") as rm:
+            changed = clickup._sync_relations("tok", "T1", cu, story)
+        assert changed is False
+        add.assert_not_called()
+        rm.assert_not_called()
+
+    def test_adds_missing_links(self):
+        story = _story_with("s", clickup_id="T1", related=["A", "B"])
+        cu = _cu_task_linked("T1", ["A"])  # B missing
+        with mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link") as rm:
+            changed = clickup._sync_relations("tok", "T1", cu, story)
+        assert changed is True
+        add.assert_called_once_with("tok", "T1", "B")
+        rm.assert_not_called()
+
+    def test_empty_list_clears_all_links(self):
+        story = _story_with("s", clickup_id="T1", related=[])
+        cu = _cu_task_linked("T1", ["A", "B"])
+        with mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link") as rm:
+            changed = clickup._sync_relations("tok", "T1", cu, story)
+        assert changed is True
+        add.assert_not_called()
+        assert {c.args[2] for c in rm.call_args_list} == {"A", "B"}
+
+    def test_mixed_add_and_remove(self):
+        story = _story_with("s", clickup_id="T1", related=["A", "C"])
+        cu = _cu_task_linked("T1", ["A", "B"])  # add C, remove B
+        with mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link") as rm:
+            clickup._sync_relations("tok", "T1", cu, story)
+        add.assert_called_once_with("tok", "T1", "C")
+        rm.assert_called_once_with("tok", "T1", "B")
+
+    def test_already_in_sync_is_noop(self):
+        story = _story_with("s", clickup_id="T1", related=["A"])
+        cu = _cu_task_linked("T1", ["A"])
+        with mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link") as rm:
+            changed = clickup._sync_relations("tok", "T1", cu, story)
+        assert changed is False
+        add.assert_not_called()
+        rm.assert_not_called()
+
+    def test_dry_run_makes_no_calls(self):
+        story = _story_with("s", clickup_id="T1", related=["A", "B"])
+        cu = _cu_task_linked("T1", [])
+        with mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link") as rm:
+            changed = clickup._sync_relations("tok", "T1", cu, story, dry_run=True)
+        assert changed is True
+        add.assert_not_called()
+        rm.assert_not_called()
+
+    def test_self_link_skipped(self):
+        story = _story_with("s", clickup_id="T1", related=["T1", "A"])
+        cu = _cu_task_linked("T1", [])
+        with mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link"):
+            clickup._sync_relations("tok", "T1", cu, story)
+        add.assert_called_once_with("tok", "T1", "A")
+
+
+class TestPullRelations:
+    def test_pulls_links_into_unmanaged_story(self):
+        story = _story_with("s", clickup_id="T1")  # no related key
+        cu = _cu_task_linked("T1", ["B", "A"])
+        assert clickup._pull_relations(story, cu) is True
+        assert story["related"] == ["A", "B"]  # sorted
+
+    def test_no_change_when_equal(self):
+        story = _story_with("s", clickup_id="T1", related=["A", "B"])
+        cu = _cu_task_linked("T1", ["A", "B"])
+        assert clickup._pull_relations(story, cu) is False
+
+    def test_remote_removal_writes_empty_list(self):
+        story = _story_with("s", clickup_id="T1", related=["A"])
+        cu = _cu_task_linked("T1", [])  # link removed in UI
+        assert clickup._pull_relations(story, cu) is True
+        assert story["related"] == []
+
+    def test_both_empty_no_key_added(self):
+        story = _story_with("s", clickup_id="T1")  # no key
+        cu = _cu_task_linked("T1", [])
+        assert clickup._pull_relations(story, cu) is False
+        assert "related" not in story
+
+    def test_clickup_task_to_story_captures_links(self):
+        cu = _cu_task_linked("T1", ["B", "A"])
+        story = clickup._clickup_task_to_yaml_story(cu, SMAP)
+        assert story["related"] == ["A", "B"]
+
+
+class TestRelationApiHelperShapes:
+    def test_add_link_endpoint(self):
+        with mock.patch.object(clickup, "_api_request") as api:
+            clickup.clickup_add_link("tok", "T1", "A")
+        api.assert_called_once()
+        assert api.call_args.args[0] == "POST"
+        assert api.call_args.args[1].endswith("/task/T1/link/A")
+
+    def test_remove_link_endpoint(self):
+        with mock.patch.object(clickup, "_api_request") as api:
+            clickup.clickup_remove_link("tok", "T1", "A")
+        assert api.call_args.args[0] == "DELETE"
+        assert api.call_args.args[1].endswith("/task/T1/link/A")
+
+
+class TestPushRelationPass:
+    def test_existing_task_gets_relation_added(self, tmp_path):
+        data = _data_with(
+            {"Magnit Monitoring System": [
+                _story_with("dev task", clickup_id="T1", related=["GATE"])
+            ]},
+        )
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu_tasks = [_cu_task_linked("T1", []), _cu_task("GATE", [])]
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_update_task"), \
+             mock.patch.object(clickup, "clickup_add_tag"), \
+             mock.patch.object(clickup, "clickup_remove_tag"), \
+             mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link"), \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=False,
+                             backup_path=None, backup_default=False)
+        add.assert_called_once_with(clickup.get_clickup_token(), "T1", "GATE")
+
+    def test_newly_created_task_gets_relation_in_second_pass(self, tmp_path):
+        data = _data_with(
+            {"Magnit Monitoring System": [
+                _story_with("new dev task", related=["GATE"])  # no clickup_id
+            ]},
+        )
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[_cu_task("GATE", [])]), \
+             mock.patch.object(clickup, "clickup_create_task",
+                               return_value={"id": "NEW-1", "custom_id": None}), \
+             mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=False,
+                             backup_path=None, backup_default=False)
+        add.assert_called_once_with(clickup.get_clickup_token(), "NEW-1", "GATE")
+
+    def test_dry_run_makes_no_relation_calls(self, tmp_path):
+        data = _data_with(
+            {"Magnit Monitoring System": [
+                _story_with("dev task", clickup_id="T1", related=["GATE"])
+            ]},
+        )
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu_tasks = [_cu_task_linked("T1", []), _cu_task("GATE", [])]
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_add_link") as add, \
+             mock.patch.object(clickup, "clickup_remove_link") as rm, \
+             mock.patch.object(clickup, "clickup_set_custom_field"):
+            clickup.cmd_push(data, str(yaml_path), dry_run=True,
+                             backup_path=None, backup_default=False)
+        add.assert_not_called()
+        rm.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Sync applies link edges (roadmap #2): the relationship-reconcile second pass
+# now runs inside cmd_sync, so `sync` covers depends_on + related.
+# ---------------------------------------------------------------------------
+
+
+def _cu_task_with_edges(task_id: str, name: str) -> dict:
+    """A ClickUp task whose scalar fields match a _story_with(name) story, so
+    compare_task yields no diffs and the test isolates the edge second pass."""
+    cu = _cu_task(task_id, [])
+    cu["name"] = name
+    cu["dependencies"] = []
+    cu["linked_tasks"] = []
+    return cu
+
+
+class TestSyncReconcilesEdges:
+    def _run(self, data, yaml_path, cu_tasks, dry_run):
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+             mock.patch.object(clickup, "clickup_update_task"), \
+             mock.patch.object(clickup, "clickup_add_tag"), \
+             mock.patch.object(clickup, "clickup_remove_tag"), \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "clickup_add_dependency") as add_dep, \
+             mock.patch.object(clickup, "clickup_remove_dependency"), \
+             mock.patch.object(clickup, "clickup_add_link") as add_link, \
+             mock.patch.object(clickup, "clickup_remove_link"), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_sync(
+                data, str(yaml_path), conflict="local",
+                on_conflict="local", dry_run=dry_run,
+            )
+        return add_dep, add_link
+
+    def test_sync_applies_dependency_and_relation(self, tmp_path):
+        data = _data_with({"Magnit Monitoring System": [
+            _story_with("dev task", clickup_id="T1",
+                        depends_on=["GATE"], related=["REL"])
+        ]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu_tasks = [
+            _cu_task_with_edges("T1", "dev task"),
+            _cu_task("GATE", []), _cu_task("REL", []),
+        ]
+        add_dep, add_link = self._run(data, yaml_path, cu_tasks, dry_run=False)
+        add_dep.assert_called_once_with(clickup.get_clickup_token(), "T1", "GATE")
+        add_link.assert_called_once_with(clickup.get_clickup_token(), "T1", "REL")
+
+    def test_sync_dry_run_makes_no_edge_calls(self, tmp_path):
+        data = _data_with({"Magnit Monitoring System": [
+            _story_with("dev task", clickup_id="T1",
+                        depends_on=["GATE"], related=["REL"])
+        ]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        cu_tasks = [
+            _cu_task_with_edges("T1", "dev task"),
+            _cu_task("GATE", []), _cu_task("REL", []),
+        ]
+        add_dep, add_link = self._run(data, yaml_path, cu_tasks, dry_run=True)
+        add_dep.assert_not_called()
+        add_link.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Coverage gaps surfaced in review (M3): sandbox precedence, timeout, encoding,
+# diff related-mismatch display.
+# ---------------------------------------------------------------------------
+
+
+class TestCredentialGaps:
+    def test_sandbox_env_var_wins_over_pass(self, monkeypatch):
+        monkeypatch.setenv("CLICKUP_SANDBOX", "1")
+        monkeypatch.setenv("CLICKUP_API_TOKEN_SANDBOX", "pk_env_sbx")
+        monkeypatch.setattr(clickup, "_pass_get", lambda k: "pk_pass_sbx")
+        assert clickup.get_clickup_token() == "pk_env_sbx"
+
+    def test_sandbox_file_fallback(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLICKUP_SANDBOX", "1")
+        monkeypatch.delenv("CLICKUP_API_TOKEN_SANDBOX", raising=False)
+        monkeypatch.setattr(clickup, "_pass_get", lambda k: None)
+        f = tmp_path / "clickup-sandbox.env"
+        f.write_text("export CLICKUP_API_TOKEN_SANDBOX=pk_sbx_file\n")
+        monkeypatch.setattr(clickup, "_sandbox_env_path", lambda: f)
+        assert clickup.get_clickup_token() == "pk_sbx_file"
+
+    def test_pass_timeout_falls_through(self, monkeypatch):
+        def timeout(*a, **k):
+            raise clickup.subprocess.TimeoutExpired(cmd="pass", timeout=15)
+        monkeypatch.setattr(clickup.subprocess, "run", timeout)
+        assert clickup._pass_get("clickup/api-token") is None
+
+
+class TestLinkUrlEncoding:
+    def test_add_link_url_encodes_target(self):
+        with mock.patch.object(clickup, "_api_request") as api:
+            clickup.clickup_add_link("tok", "T1", "a b")
+        # Space -> %20 proves urllib.parse.quote runs (default safe='/', matching
+        # the existing dependency helpers). ClickUp ids never contain spaces.
+        assert api.call_args.args[1].endswith("/task/T1/link/a%20b")
+
+
+class TestDiffSurfacesRelation:
+    def test_related_divergence_counts_as_mismatch(self, tmp_path):
+        data = _data_with({"Magnit Monitoring System": [
+            _story_with("dev task", clickup_id="T1", related=["X"])
+        ]})
+        cu_tasks = [_cu_task_with_edges("T1", "dev task")]  # no linked_tasks
+        # Isolate the related path: no scalar diffs, no assignee/dep diffs.
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+             mock.patch.object(clickup, "compare_task", return_value=[]):
+            stats = clickup.cmd_diff(data)
+        assert stats["mismatches"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Edge-removal warning (H1/M1 mitigation): sync/merge warn before deleting a
+# remote edge; push stays silent (authoritative overwrite is its contract).
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeRemovalWarning:
+    def test_relation_removal_warns_when_flag_set(self, caplog):
+        story = _story_with("s", clickup_id="T1", related=[])  # clear -> remove A
+        cu = _cu_task_linked("T1", ["A"])
+        with mock.patch.object(clickup, "clickup_remove_link"), \
+             caplog.at_level("WARNING"):
+            clickup._sync_relations("tok", "T1", cu, story, warn_on_remove=True)
+        assert any("relation edge" in r.message and "will be deleted" in r.message
+                   for r in caplog.records)
+
+    def test_relation_removal_silent_when_flag_unset(self, caplog):
+        story = _story_with("s", clickup_id="T1", related=[])
+        cu = _cu_task_linked("T1", ["A"])
+        with mock.patch.object(clickup, "clickup_remove_link"), \
+             caplog.at_level("WARNING"):
+            clickup._sync_relations("tok", "T1", cu, story, warn_on_remove=False)
+        assert not any("will be deleted" in r.message for r in caplog.records)
+
+    def test_dependency_removal_warns_when_flag_set(self, caplog):
+        story = _story_with("s", clickup_id="T1", depends_on=[])
+        cu = _cu_task_deps("T1", ["A"])
+        with mock.patch.object(clickup, "clickup_remove_dependency"), \
+             caplog.at_level("WARNING"):
+            clickup._sync_dependencies("tok", "T1", cu, story, warn_on_remove=True)
+        assert any("dependency edge" in r.message and "will be deleted" in r.message
+                   for r in caplog.records)
+
+    def test_pure_add_does_not_warn(self, caplog):
+        story = _story_with("s", clickup_id="T1", related=["A"])  # add only
+        cu = _cu_task_linked("T1", [])
+        with mock.patch.object(clickup, "clickup_add_link"), \
+             caplog.at_level("WARNING"):
+            clickup._sync_relations("tok", "T1", cu, story, warn_on_remove=True)
+        assert not any("will be deleted" in r.message for r in caplog.records)
+
+    def test_dry_run_removal_warns_with_dry_run_prefix(self, caplog):
+        story = _story_with("s", clickup_id="T1", related=[])
+        cu = _cu_task_linked("T1", ["A"])
+        with caplog.at_level("WARNING"):
+            clickup._sync_relations("tok", "T1", cu, story,
+                                    dry_run=True, warn_on_remove=True)
+        assert any("Would remove" in r.message for r in caplog.records)

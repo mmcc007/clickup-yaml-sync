@@ -103,23 +103,55 @@ Only the **waiting_on** direction is modeled; ClickUp maintains the mirrored
 | `depends_on: []` | **Clear** — the task's waiting_on edges removed |
 | `depends_on: [id, …]` | **Authoritative** — ClickUp reconciled to exactly this set |
 
-`push` reconciles dependencies in a **second pass**, after the create/update
-pass, so a task created in the same run already has its `clickup_id` and can be
-referenced. A target that doesn't exist yet (no `clickup_id`) can't be
-referenced — declare the edge once both tasks exist and it resolves on the next
-push. `pull` reads remote waiting_on edges back into `depends_on`; `diff` shows
-mismatches. Requires the **Dependencies ClickApp** enabled on the Space.
+Edges are reconciled in a **second pass**, after the create/update pass, so a
+task created in the same run already has its `clickup_id` and can be referenced.
+A target that doesn't exist yet (no `clickup_id`) can't be referenced — declare
+the edge once both tasks exist and it resolves on the next run. `pull` reads
+remote waiting_on edges back into `depends_on`; `diff` shows mismatches. Requires
+the **Dependencies ClickApp** enabled on the Space.
 
-**Limitation:** dependencies are reconciled by `push`/`pull`/`diff` only —
-**not** by `sync`/`merge` (they're deliberately excluded from the 3-way /
-base-snapshot machinery). Use `pull` then `push` to round-trip them. (Both
-limitations — and non-blocking relations — are on the [Roadmap](#roadmap).)
+`push`, `sync`, and `merge` all run the same second pass, so adding a dependency
+needs nothing beyond your normal command — including `sync --dry-run → sync`.
+Edges are YAML-authoritative (the table above) and are **not** base-tracked 3-way
+fields: declaring `depends_on` in YAML is *applied*, never surfaced as a sync
+conflict. `pull`/`diff` round-trip them too.
 
-**Relations (non-blocking "linked tasks") are not modeled.** ClickUp's
-relate/link feature (`POST /task/{id}/link/{links_to}`) has no YAML field yet —
-only `depends_on` (a *blocking* dependency) exists. A non-blocking association
-currently has to be faked with a markdown link in the task description. See the
-[Roadmap](#roadmap).
+## Relations (non-blocking "linked tasks")
+
+Each story can also declare a `related` list — ClickUp's non-blocking
+"linked tasks" (the relate/link feature, `POST /task/{id}/link/{links_to}`).
+Unlike `depends_on`, a link implies **no ordering or blocking** — it's a plain
+association. Targets are referenced by `clickup_id`, exactly like `depends_on`:
+
+```yaml
+stories:
+  - name: Magnit ingestion adapter
+    clickup_id: 86ba84c7d
+    related:
+      - 86bade1f9   # see-also: the schema-mapping spike
+```
+
+A link is **non-directional** — ClickUp records it on both endpoints — so the
+reader collapses each link to "the other end," and the relation round-trips
+identically regardless of which task created it. Semantics mirror `depends_on`:
+
+| YAML on the story | Behaviour |
+|---|---|
+| no `related` key | **Unmanaged** — ClickUp links left untouched (UI-added links preserved) |
+| `related: []` | **Clear** — the task's links removed |
+| `related: [id, …]` | **Authoritative** — ClickUp reconciled to exactly this set |
+
+Reconciled by the same second pass as `depends_on` (`push`/`sync`/`merge`), read
+back by `pull`, and shown by `diff`.
+
+> **Symmetric-link footgun.** A link lives on *both* endpoints. If you manage
+> `related` on **both** tasks of a pair and only one lists the other, the
+> authoritative reconcile will **delete** the link (the side that doesn't list it
+> wins its own `related: []`/`[other]`). To avoid surprise: declare the link on
+> **both** ends, or run `pull` first (it symmetrizes — writing the reciprocal
+> `related` onto both stories), then edit. `sync`/`merge` print a **loud warning
+> before removing any edge** (dependency or relation) so a destructive deletion is
+> never silent; `push` removes silently by its authoritative-overwrite contract.
 
 ## Descriptions (markdown / task-mention safe)
 
@@ -245,7 +277,8 @@ nor pulled, and a value set in the ClickUp UI will be invisible to the YAML
 | milestone (`custom_item_id`) | ✅ | ✅ |
 | due_date / start_date (`YYYY-MM-DD`, date-only) | ✅ | ✅ |
 | assignees | ✅ | ✅ |
-| `depends_on` (waiting_on edges) | ✅ (push/diff; UI-added edges preserved) | ✅ (push/pull/diff only — **not** sync/merge) |
+| `depends_on` (waiting_on edges) | ✅ (push/sync/merge; UI-added edges preserved) | ✅ (pull/diff) |
+| `related` (non-blocking linked tasks) | ✅ (push/sync/merge; UI-added links preserved) | ✅ (pull/diff) |
 | tags | ✅ (additive; UI-added tags preserved) | ⚠️ epic placement only — UI tag *edits* are **not** pulled into YAML |
 | Epic dropdown (one configured custom field) | ✅ | ❌ |
 
@@ -355,19 +388,6 @@ python3 clickup.py push project.yaml --dry-run
 
 ## Roadmap
 
-- **Native relations (non-blocking "linked tasks").** Add a `related: [<clickup_id>, …]`
-  story field backed by ClickUp's link API (`POST /task/{id}/link/{links_to}`,
-  `DELETE …/link/…`), reconciled with the same managed/clear/authoritative
-  semantics as `depends_on`. Today only `depends_on` (a blocking dependency)
-  exists, so a non-blocking association has to be faked with a markdown link in
-  the description.
-- **Apply link edges during `sync` (so the sync-only workflow covers them).**
-  Today `depends_on` — and any future `related` edges — are reconciled by
-  `push`/`pull`/`diff` only, never by `sync`/`merge`. Goal: have `sync` run the
-  same relationship-reconcile second pass after its create/update pass, so
-  adding a relation, dependency, or blocker needs nothing beyond `sync`. (A
-  dependency *is* a blocker — ClickUp's `waiting_on` edge auto-creates the
-  mirrored `blocking` edge on the target.)
 - **Subtasks.** The ClickUp API supports them (create a task with a
   `parent: <task_id>` field; read via `?include_subtasks=true`). Model them
   either as a `parent:` reference on a story or as a nested `subtasks:` list,
@@ -376,15 +396,21 @@ python3 clickup.py push project.yaml --dry-run
 
 ## Credentials
 
-The script loads credentials from `~/bin/clickup.env` by default, then falls back to environment variables.
+Each secret resolves in a fixed precedence — **environment variable → [`pass`](https://www.passwordstore.org/) → legacy `~/bin/*.env` file** — so the canonical store is `pass`, while existing `.env` setups keep working untouched.
+
+| Secret | Env var | `pass` entry | `.env` fallback |
+|---|---|---|---|
+| ClickUp token (production) | `CLICKUP_API_TOKEN` | `clickup/api-token` | `~/bin/clickup.env` |
+| ClickUp token (sandbox, with `--sandbox`) | `CLICKUP_API_TOKEN_SANDBOX` | `clickup/sandbox-api-token` | `~/bin/clickup-sandbox.env` |
+| OpenAI key (optional, for `merge`) | `OPENAI_API_KEY` | `clickup/openai-key` | `~/bin/clickup.env` |
 
 ```bash
-# ~/bin/clickup.env
-CLICKUP_API_TOKEN=pk_your_token_here
-OPENAI_API_KEY=sk_your_key_here  # optional
+# Recommended: store in pass
+pass insert clickup/api-token
+pass insert clickup/sandbox-api-token   # only if you use --sandbox
 ```
 
-Get your ClickUp API token at: **Settings → Apps → API Token**
+Pass `--sandbox` on any command to target the sandbox ClickUp account instead of production (selects the sandbox token from whichever source above resolves first). Get a ClickUp API token at: **Settings → Apps → API Token**.
 
 ## Logging
 
