@@ -41,6 +41,12 @@ epics:                        Tasks (flat list):
 
 Both `push` and `pull` print a one-time warning banner describing what they'll overwrite, and both auto-create a backup first (disable with `--no-backup`). Prefer the `sync` equivalents — they do the same thing but auto-resolve the non-conflicting changes and stop before clobbering a genuine collision.
 
+> **⚠️ Runtime — don't let a 2-minute shell timeout kill a sync mid-run.** A full `sync`/`push` re-issues an Epic-dropdown update for **every** task in the list, so on a board of dozens of tasks a single run can take **several minutes** — longer than a default 120 s command timeout (e.g. an agent's Bash tool). If the run is killed during the **create** phase, tasks already created in ClickUp may not have had their `clickup_id` written back to the YAML yet → a naive retry **creates duplicates**.
+>
+> - **Run it detached / in the background** (an agent's `run_in_background`, or `nohup … &` / a tmux pane), or set the shell timeout to **≥ 10 minutes**. Never run it under the default 2-minute cap.
+> - **If a run *was* interrupted:** check `git status` on the YAML. If it's unmodified and the new tasks are still `clickup_id: null`, the run died *before* creating anything — safe to re-run. If the YAML gained ids (or `git status` is dirty), the create phase started — re-run carefully and verify no duplicates were created in ClickUp.
+> - Always preview with `sync --dry-run` first (read-only, fast enough).
+
 ## Multi-Tag, Milestones, and Custom Dropdowns
 
 The tool maintains an additive multi-tag set per story. Sources merge in
