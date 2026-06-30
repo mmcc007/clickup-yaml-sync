@@ -1095,10 +1095,44 @@ def _epic_dropdown_value_for(story: dict, epic: dict, project_cfg: dict) -> Opti
 
 
 def _current_custom_field_value(cu_task: dict, field_id: str) -> Optional[str]:
-    """Read the current value of a custom field off a ClickUp task payload."""
+    """Read the raw current value of a custom field off a ClickUp task payload."""
     for f in cu_task.get("custom_fields", []) or []:
         if f.get("id") == field_id:
             return f.get("value")
+    return None
+
+
+def _current_dropdown_option_id(cu_task: dict, field_id: str) -> Optional[str]:
+    """Resolve a drop_down field's current value to its option UUID.
+
+    ClickUp's *write* endpoint (``clickup_set_custom_field``) takes the option
+    UUID, but a *read* (GET task) returns the selected drop_down value as the
+    option's **orderindex integer**, not the UUID — with the id↔orderindex map
+    carried in ``type_config.options``. Comparing the raw read value against the
+    target UUID therefore never matches, so the dropdown was re-PATCHed on every
+    task of every sync (BUG #13). Normalize the read value to the option UUID so
+    an already-correct value is recognised and skipped.
+
+    Handles both shapes defensively: some payloads/fixtures already carry the
+    UUID directly, in which case it is returned unchanged.
+    """
+    for f in cu_task.get("custom_fields", []) or []:
+        if f.get("id") != field_id:
+            continue
+        raw = f.get("value")
+        if raw is None:
+            return None
+        options = (f.get("type_config") or {}).get("options") or []
+        # Direct UUID match (payload already gives the option id).
+        for opt in options:
+            if str(opt.get("id")) == str(raw):
+                return str(opt.get("id"))
+        # Orderindex match (ClickUp's real GET shape: value = orderindex int).
+        for opt in options:
+            if str(opt.get("orderindex")) == str(raw):
+                return str(opt.get("id"))
+        # No options metadata to resolve against — compare the raw value as-is.
+        return str(raw)
     return None
 
 
@@ -1118,7 +1152,7 @@ def _push_epic_dropdown_if_needed(
     if not resolved:
         return False
     field_id, option_id = resolved
-    current = _current_custom_field_value(cu_task, field_id)
+    current = _current_dropdown_option_id(cu_task, field_id)
     if current == option_id:
         return False
     if dry_run:
@@ -1144,6 +1178,64 @@ def _all_yaml_story_ids(data: dict) -> set[str]:
             if cid:
                 ids.add(cid)
     return ids
+
+
+def _create_dedupe_key(name: str, epic_tag: Optional[str]) -> tuple[str, str]:
+    """Stable (name, epic-tag) key for matching a YAML story against tasks that
+    already exist in ClickUp. Case/whitespace-insensitive."""
+    return ((name or "").strip().lower(), (epic_tag or "").strip().lower())
+
+
+def _build_create_dedupe_index(cu_tasks: list[dict]) -> dict[tuple[str, str], list[str]]:
+    """Index existing ClickUp tasks by (normalized name, normalized tag) so a
+    create can detect a task that already exists — e.g. an orphan left by a
+    prior run whose ``clickup_id`` writeback was lost to a mid-run kill (BUG
+    #14). Each task is indexed under every one of its tags, plus a name-only
+    bucket (tag="") used when epic tagging is disabled.
+    """
+    index: dict[tuple[str, str], list[str]] = {}
+    for t in cu_tasks:
+        name = (t.get("name") or "").strip().lower()
+        tags = [
+            (tag.get("name", "") if isinstance(tag, dict) else str(tag)).strip().lower()
+            for tag in (t.get("tags") or [])
+        ]
+        keys = {(name, tag) for tag in tags}
+        keys.add((name, ""))  # name-only fallback bucket
+        for k in keys:
+            index.setdefault(k, []).append(t["id"])
+    return index
+
+
+def _match_existing_cu_task(
+    dedupe_index: dict[tuple[str, str], list[str]],
+    story_name: str,
+    epic_tag: Optional[str],
+    push_epic_tag: bool,
+) -> Optional[str]:
+    """Return the id of an existing ClickUp task matching this story, or None.
+
+    Prefers a (name, epic-tag) match; falls back to a name-only match only when
+    epic tagging is off (no tag axis to disambiguate on). Returns the first id
+    when several match (duplicates already exist) — caller flags the surplus."""
+    ids = dedupe_index.get(_create_dedupe_key(story_name, epic_tag))
+    if not ids and not push_epic_tag:
+        ids = dedupe_index.get(_create_dedupe_key(story_name, ""))
+    return ids[0] if ids else None
+
+
+def _count_yaml_duplicate_ids(data: dict) -> int:
+    """Count surplus stories that share a clickup_id (a duplicate-row symptom).
+
+    Returns the number of stories beyond the first for each repeated id — 0 when
+    every clickup_id is unique."""
+    seen: dict[str, int] = {}
+    for epic in data.get("epics", []):
+        for story in epic.get("stories", []):
+            cid = story.get("clickup_id")
+            if cid:
+                seen[cid] = seen.get(cid, 0) + 1
+    return sum(n - 1 for n in seen.values() if n > 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1865,6 +1957,10 @@ def cmd_push(
         )
 
     managed_universe = _collect_managed_tag_universe(data)
+    # Dedupe index — adopt an existing ClickUp task rather than create a
+    # duplicate when a prior run was interrupted before id writeback (BUG #14).
+    dedupe_index = _build_create_dedupe_index(cu_tasks)
+    push_epic_tag = project_cfg.get("push_epic_tag", True)
     assignee_resolver = _build_assignee_resolver(
         clickup_get_list_members(token, list_id)
     )
@@ -1879,6 +1975,22 @@ def cmd_push(
                 story, epic, push_epic_tag=project_cfg.get("push_epic_tag", True)
             )
             if not story.get("clickup_id"):
+                # Dedupe-before-create: adopt a matching existing task instead of
+                # making a second copy (interrupted-retry safety, BUG #14).
+                existing_id = _match_existing_cu_task(
+                    dedupe_index, story_name, tag, push_epic_tag
+                )
+                if existing_id is not None and not dry_run:
+                    story["clickup_id"] = existing_id
+                    story["task_id"] = cu_by_id.get(existing_id, {}).get("custom_id")
+                    save_yaml(data, yaml_path)  # crash-safe per-task flush
+                    log.warning(
+                        f"  Adopted existing ClickUp task for '{story_name}' -> "
+                        f"{existing_id} (skipped duplicate create)"
+                    )
+                    stats.setdefault("adopted", 0)
+                    stats["adopted"] += 1
+                    continue
                 # CREATE story as top-level task with all desired tags
                 create_assignee_ids: list[int] = []
                 if "assignees" in story:
@@ -1903,6 +2015,11 @@ def cmd_push(
                         resp = clickup_create_task(token, list_id, body)
                         story["clickup_id"] = resp["id"]
                         story["task_id"] = resp.get("custom_id")
+                        # Register the new id so a later same-name story this run
+                        # adopts it instead of creating a second copy.
+                        dedupe_index.setdefault(
+                            _create_dedupe_key(story_name, tag), []
+                        ).append(resp["id"])
                         if "priority" not in story and epic_priority is not None:
                             story["priority"] = epic_priority
                         # Push Epic dropdown if YAML configures it.
@@ -2523,6 +2640,8 @@ def cmd_sync(
     stats = {
         "created_in_clickup": 0,
         "created_in_yaml": 0,
+        "adopted": 0,
+        "duplicates": 0,
         "resolved_local": 0,
         "resolved_remote": 0,
         "resolved_merge": 0,
@@ -2554,6 +2673,11 @@ def cmd_sync(
     all_yaml_ids: set[str] = _all_yaml_story_ids(data)
     project_cfg = data.get("project", {})
     managed_universe = _collect_managed_tag_universe(data)
+    # Dedupe index: lets a create detect a task that already exists in ClickUp
+    # (e.g. an orphan from a prior run killed before its id was written back),
+    # so a retry adopts it instead of creating a duplicate (BUG #14).
+    dedupe_index = _build_create_dedupe_index(cu_tasks)
+    push_epic_tag = project_cfg.get("push_epic_tag", True)
     assignee_resolver = _build_assignee_resolver(
         clickup_get_list_members(token, list_id)
     )
@@ -2608,6 +2732,27 @@ def cmd_sync(
             )
 
             if not story.get("clickup_id"):
+                # Dedupe-before-create: if a task with this (name, epic-tag)
+                # already exists in ClickUp, adopt it instead of creating a
+                # duplicate. Covers the interrupted-retry case (BUG #14) where a
+                # prior run created the task but died before the id was written
+                # back to YAML — and any pre-existing duplicate already present.
+                existing_id = _match_existing_cu_task(
+                    dedupe_index, story_name, tag, push_epic_tag
+                )
+                if existing_id is not None:
+                    if not dry_run:
+                        story["clickup_id"] = existing_id
+                        story["task_id"] = cu_by_id.get(existing_id, {}).get("custom_id")
+                        seen_cu_ids.add(existing_id)
+                        all_yaml_ids.add(existing_id)  # don't re-import in Phase 3
+                        save_yaml(data, yaml_path)  # crash-safe per-task flush
+                    log.warning(
+                        f"  Adopted existing ClickUp task for '{story_name}' -> "
+                        f"{existing_id} (skipped duplicate create)"
+                    )
+                    stats["adopted"] += 1
+                    continue
                 # Create in ClickUp
                 create_assignee_ids: list[int] = []
                 if "assignees" in story:
@@ -2633,8 +2778,19 @@ def cmd_sync(
                         # A task created during this run now exists in ClickUp;
                         # record its id so Phase 5 archive-detection doesn't
                         # false-flag it as archived (it was absent from the
-                        # pre-run fetch that seeded seen_cu_ids).
+                        # pre-run fetch that seeded seen_cu_ids), and so Phase 3
+                        # never re-imports it as "new from ClickUp".
                         seen_cu_ids.add(resp["id"])
+                        all_yaml_ids.add(resp["id"])
+                        # Register the new id so a later same-name story this run
+                        # adopts it rather than creating a second copy.
+                        dedupe_index.setdefault(
+                            _create_dedupe_key(story_name, tag), []
+                        ).append(resp["id"])
+                        # Flush the id to disk IMMEDIATELY — a run killed mid-loop
+                        # must leave a resumable YAML, never an orphan that a
+                        # retry re-creates (BUG #14).
+                        save_yaml(data, yaml_path)
                         _push_epic_dropdown_if_needed(
                             token, resp["id"], resp, story, epic, project_cfg, dry_run
                         )
@@ -2739,9 +2895,15 @@ def cmd_sync(
     if not dry_run:
         save_yaml(data, yaml_path)
 
+    # Duplicate-detection guard: surface any clickup_id that ended up on more
+    # than one story (the BUG #14 symptom) instead of printing a clean summary.
+    stats["duplicates"] = _count_yaml_duplicate_ids(data)
+
     log.info(f"\nSync complete:")
     log.info(f"  Created in ClickUp: {stats['created_in_clickup']}")
     log.info(f"  Created in YAML:    {stats['created_in_yaml']}")
+    if stats["adopted"]:
+        log.info(f"  Adopted existing:   {stats['adopted']}")
     log.info(f"  Resolved (local):   {stats['resolved_local']}")
     log.info(f"  Resolved (remote):  {stats['resolved_remote']}")
     log.info(f"  Resolved (merge):   {stats['resolved_merge']}")
@@ -2750,6 +2912,11 @@ def cmd_sync(
     log.info(f"  Unchanged:          {stats['unchanged']}")
     log.info(f"  Archived:           {stats['archived']}")
     log.info(f"  Errors:             {stats['errors']}")
+    if stats["duplicates"]:
+        log.warning(
+            f"  ⚠️  DUPLICATES:      {stats['duplicates']} story row(s) share a "
+            f"clickup_id — inspect the YAML and ClickUp for duplicate tasks."
+        )
     return stats
 
 

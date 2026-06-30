@@ -41,11 +41,15 @@ epics:                        Tasks (flat list):
 
 Both `push` and `pull` print a one-time warning banner describing what they'll overwrite, and both auto-create a backup first (disable with `--no-backup`). Prefer the `sync` equivalents — they do the same thing but auto-resolve the non-conflicting changes and stop before clobbering a genuine collision.
 
-> **⚠️ Runtime — don't let a 2-minute shell timeout kill a sync mid-run.** A full `sync`/`push` re-issues an Epic-dropdown update for **every** task in the list, so on a board of dozens of tasks a single run can take **several minutes** — longer than a default 120 s command timeout (e.g. an agent's Bash tool). If the run is killed during the **create** phase, tasks already created in ClickUp may not have had their `clickup_id` written back to the YAML yet → a naive retry **creates duplicates**.
+> **⚠️ Runtime — a full sync can still run for minutes; prefer running it detached.** On a board of dozens of tasks a single `sync`/`push` can take a while. Two fixes (2026-06-30) make an interrupted run **safe to retry** without creating duplicates:
 >
-> - **Run it detached / in the background** (an agent's `run_in_background`, or `nohup … &` / a tmux pane), or set the shell timeout to **≥ 10 minutes**. Never run it under the default 2-minute cap.
-> - **If a run *was* interrupted:** check `git status` on the YAML. If it's unmodified and the new tasks are still `clickup_id: null`, the run died *before* creating anything — safe to re-run. If the YAML gained ids (or `git status` is dirty), the create phase started — re-run carefully and verify no duplicates were created in ClickUp.
-> - Always preview with `sync --dry-run` first (read-only, fast enough).
+> - **Per-create writeback (BUG #14).** Each new task's `clickup_id` is now flushed to the YAML file **immediately** after it's created — so a run killed mid-create leaves a resumable YAML, never an orphan that a retry re-creates.
+> - **Dedupe-before-create (BUG #14).** Before creating, the tool matches each YAML story against existing ClickUp tasks by `(name, epic-tag)`. If a match exists (e.g. an orphan from a prior killed run), it **adopts** that task's id instead of creating a duplicate, and never re-imports it as a "new from ClickUp" YAML row. The summary now reports `Adopted existing: N` and flags any `⚠️ DUPLICATES` (stories sharing a `clickup_id`).
+> - **No-op Epic-dropdown skip (BUG #13).** The Epic dropdown is only PATCHed when the value actually changes — the current value is resolved from ClickUp's read shape (`value` = option *orderindex*, mapped back to the option id) so an already-correct dropdown is no longer re-written on every task. This is what made full syncs slow enough to hit the timeout in the first place.
+>
+> Still good practice: **run it detached / in the background** (an agent's `run_in_background`, or `nohup … &` / a tmux pane) for very large boards, and always preview with `sync --dry-run` first (read-only).
+>
+> - **If a run *was* interrupted (older versions, or to double-check):** check `git status` on the YAML and re-run — the dedupe pass adopts any orphan tasks. If you see `⚠️ DUPLICATES` in the summary, inspect the YAML and ClickUp for duplicate tasks.
 
 ## Multi-Tag, Milestones, and Custom Dropdowns
 
