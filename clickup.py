@@ -266,6 +266,23 @@ def load_base_snapshot(path: Path) -> dict:
     return tasks
 
 
+def load_base_managed_tags(path: Path) -> set[str]:
+    """Return the managed-tag universe recorded in the base snapshot (lowercased).
+
+    Empty set when the file is absent, unparseable, or predates the
+    ``managed_tags`` key — so a first run or an old base simply falls back to the
+    prior additive-only tag behavior instead of erroring.
+    """
+    if not path.exists():
+        return set()
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return set()
+    return {str(t).lower() for t in (doc.get("managed_tags") or [])}
+
+
 def build_base_from_yaml(data: dict, status_map: dict) -> dict:
     """Comparable scalar snapshot for every story that has a clickup_id."""
     tasks: dict = {}
@@ -283,6 +300,11 @@ def save_base_snapshot(path: Path, data: dict, status_map: dict) -> None:
     doc = {
         "version": 1,
         "saved_at": datetime.now(timezone.utc).isoformat(),
+        # Record the tag universe this tool managed as of this snapshot, so the
+        # next sync can remove an epic/tag that was dropped from the YAML since
+        # (otherwise dropped managed tags accumulate — they're not in the *current*
+        # universe, so they'd look like untouched UI tags and be preserved).
+        "managed_tags": sorted(_collect_managed_tag_universe(data)),
         "tasks": tasks,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2695,6 +2717,11 @@ def cmd_sync(
         )
         stats["errors"] += 1
         return stats
+    # Tags the tool managed as of the base snapshot are "known managed" too, so an
+    # epic/tag dropped from the YAML since then gets REMOVED instead of accumulating.
+    # (UI-added tags are never in our managed universe, so they stay preserved.)
+    managed_universe |= load_base_managed_tags(base_snapshot_path(yaml_path, list_id))
+
     base_exists = bool(base)
     if base_exists:
         log.info(f"3-way mode: base snapshot has {len(base)} task(s).")

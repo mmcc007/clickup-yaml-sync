@@ -881,6 +881,45 @@ def test_load_base_snapshot_absent_returns_empty(tmp_path):
     assert clickup.load_base_snapshot(tmp_path / "nope.json") == {}
 
 
+def test_save_base_snapshot_records_managed_tags(tmp_path):
+    # The base snapshot must persist the managed-tag universe so the next sync
+    # can remove an epic/tag that was later dropped from the YAML.
+    data = {
+        "project": {"clickup_list_id": "999", "name": "p"},
+        "epics": [_epic_with("Alpha", [
+            _story_with("S1", clickup_id="aaa", tags=["stage_one"]),
+        ])],
+    }
+    p = clickup.base_snapshot_path(str(tmp_path / "proj.yaml"), "999")
+    clickup.save_base_snapshot(p, data, SMAP)
+    doc = json.loads(p.read_text())
+    assert "alpha" in doc["managed_tags"]        # epic name, lowercased
+    assert "stage_one" in doc["managed_tags"]     # explicit tag
+
+
+def test_load_base_managed_tags_roundtrip(tmp_path):
+    data = {
+        "project": {"clickup_list_id": "999", "name": "p"},
+        "epics": [_epic_with("Beta", [
+            _story_with("S1", clickup_id="aaa", tags=["stage_two"]),
+        ])],
+    }
+    p = clickup.base_snapshot_path(str(tmp_path / "proj.yaml"), "999")
+    clickup.save_base_snapshot(p, data, SMAP)
+    assert clickup.load_base_managed_tags(p) >= {"beta", "stage_two"}
+
+
+def test_load_base_managed_tags_absent_returns_empty(tmp_path):
+    assert clickup.load_base_managed_tags(tmp_path / "nope.json") == set()
+
+
+def test_load_base_managed_tags_old_base_without_key(tmp_path):
+    # A pre-fix base snapshot (no managed_tags key) degrades to empty, not error.
+    p = tmp_path / "base.json"
+    p.write_text(json.dumps({"version": 1, "tasks": {}}))
+    assert clickup.load_base_managed_tags(p) == set()
+
+
 # ---------------------------------------------------------------------------
 # 3-way sync integration (mocked API) — feat/3way-merge
 # ---------------------------------------------------------------------------
