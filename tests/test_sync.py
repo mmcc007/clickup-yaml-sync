@@ -1971,6 +1971,73 @@ class TestEdgeRemovalWarning:
 
 
 # ---------------------------------------------------------------------------
+# Peer-declared symmetric links (H1-footgun fix): a link declared by EITHER
+# endpoint survives; removal fires only when NEITHER managed side declares it.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDeclaredRelations:
+    def test_maps_managed_stories_only(self):
+        data = _data_with({"Infrastructure + CRM": [
+            _story_with("a", clickup_id="T1", related=["T2", "T2", ""]),  # dedup + blank
+            _story_with("b", clickup_id="T2"),                            # no related key -> unmanaged
+            _story_with("c", related=["T9"]),                             # no clickup_id -> skipped
+            _story_with("d", clickup_id="T3", related=["T3", "T4"]),      # self-link dropped
+        ]})
+        assert clickup._build_declared_relations(data) == {"T1": {"T2"}, "T3": {"T4"}}
+
+
+class TestPeerDeclaredRelationPreserved:
+    def test_managed_peer_declaration_prevents_removal(self):
+        # T2 is managed (related=[]) and linked to T1 in ClickUp, but the peer T1
+        # declares the reciprocal. Union semantics keep the edge; nothing removed.
+        story = _story_with("b", clickup_id="T2", related=[])
+        cu = _cu_task_linked("T2", ["T1"])
+        peer = {"T1": {"T2"}, "T2": set()}
+        with mock.patch.object(clickup, "clickup_remove_link") as rm:
+            changed = clickup._sync_relations("tok", "T2", cu, story, peer_declared=peer)
+        rm.assert_not_called()
+        assert changed is False
+
+    def test_removal_still_happens_when_no_peer_declares(self):
+        # No managed peer declares the T2<->X edge, so it is genuinely removed.
+        story = _story_with("b", clickup_id="T2", related=[])
+        cu = _cu_task_linked("T2", ["X"])
+        peer = {"T2": set()}
+        with mock.patch.object(clickup, "clickup_remove_link") as rm:
+            changed = clickup._sync_relations("tok", "T2", cu, story, peer_declared=peer)
+        rm.assert_called_once_with("tok", "T2", "X")
+        assert changed is True
+
+    def test_none_peer_declared_preserves_legacy_clear(self):
+        # Back-compat: without the map (push / bare call), related=[] still clears.
+        story = _story_with("b", clickup_id="T2", related=[])
+        cu = _cu_task_linked("T2", ["T1"])
+        with mock.patch.object(clickup, "clickup_remove_link") as rm:
+            clickup._sync_relations("tok", "T2", cu, story)
+        rm.assert_called_once_with("tok", "T2", "T1")
+
+    def test_reconcile_pass_preserves_one_sided_link(self):
+        # End-to-end via _reconcile_edges_pass: A declares related=[T2]; B(T2) is
+        # managed but declares related=[] — the mutual link must NOT be removed.
+        data = _data_with({"Infrastructure + CRM": [
+            _story_with("a", clickup_id="T1", related=["T2"]),
+            _story_with("b", clickup_id="T2", related=[]),
+        ]})
+        cu_by_id = {
+            "T1": _cu_task_linked("T1", ["T2"]),
+            "T2": _cu_task_linked("T2", ["T1"]),
+        }
+        stats = {"errors": 0}
+        with mock.patch.object(clickup, "clickup_remove_link") as rm, \
+             mock.patch.object(clickup, "clickup_add_link") as add:
+            clickup._reconcile_edges_pass("tok", data, cu_by_id, stats, dry_run=False)
+        rm.assert_not_called()
+        add.assert_not_called()
+        assert stats["errors"] == 0
+
+
+# ---------------------------------------------------------------------------
 # push/pull safety: one-directional warning banner + pull YAML backup.
 # ---------------------------------------------------------------------------
 
