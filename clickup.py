@@ -1511,6 +1511,29 @@ def _cu_linked_ids(cu_task: dict) -> set[str]:
     return out
 
 
+def _build_declared_relations(data: dict) -> dict[str, set[str]]:
+    """Map each relation-managed story's ``clickup_id`` -> the ids it declares in
+    ``related``. A story is relation-managed only with BOTH a ``clickup_id`` and a
+    ``related`` key. Lets ``_sync_relations`` preserve a symmetric link declared by
+    EITHER endpoint (union semantics) instead of deleting the reciprocal that this
+    side happens not to list.
+    """
+    declared: dict[str, set[str]] = {}
+    for epic in data.get("epics", []):
+        for story in epic.get("stories", []):
+            cid = story.get("clickup_id")
+            if not cid or "related" not in story:
+                continue
+            ids = {
+                str(x).strip()
+                for x in (story.get("related") or [])
+                if str(x).strip()
+            }
+            ids.discard(str(cid))
+            declared[str(cid)] = ids
+    return declared
+
+
 def _sync_relations(
     token: str,
     task_id: str,
@@ -1518,14 +1541,21 @@ def _sync_relations(
     story: dict,
     dry_run: bool = False,
     warn_on_remove: bool = False,
+    peer_declared: Optional[dict[str, set[str]]] = None,
 ) -> bool:
     """Reconcile a task's links to match the story's ``related`` list.
 
     No-op (preserves UI links) when the story has no ``related`` key.
     Returns True if a change was made — or would be, under ``dry_run``.
     ``warn_on_remove`` loudly flags link deletions (set by sync/merge, not push).
-    Because links are symmetric, a removal here is the H1 footgun — two managed
-    tasks that disagree about a mutual link — so the warning matters most here.
+
+    Links are symmetric, so a link declared by EITHER endpoint is authoritative.
+    ``peer_declared`` (id -> that managed peer's declared ``related`` set, from
+    ``_build_declared_relations``) lets us keep an edge whose peer still declares
+    it rather than deleting it because *this* side didn't list the reciprocal —
+    the H1 footgun, where two managed tasks disagree about a mutual link and it
+    oscillates every sync. Absent (push, or a bare unit call) behaviour is
+    unchanged: ``related`` remains authoritative for this task alone.
     """
     if "related" not in story:
         return False
@@ -1537,6 +1567,12 @@ def _sync_relations(
     current = _cu_linked_ids(cu_task)
     add = sorted(desired - current)
     rem = sorted(current - desired)
+    # Union semantics: never delete a symmetric link a managed peer still
+    # declares — that edge is authoritative from the peer's end, so deleting it
+    # here only oscillates (the peer re-adds it next sync). Absent the map
+    # (push / bare unit call) this is a no-op and legacy behaviour stands.
+    if peer_declared:
+        rem = [r for r in rem if str(task_id) not in peer_declared.get(r, ())]
     if not add and not rem:
         return False
     if rem and warn_on_remove:
@@ -1607,6 +1643,7 @@ def _reconcile_edges_pass(
     deletions — push leaves it False (authoritative overwrite is its contract);
     sync/merge pass True so a destructive removal is never silent.
     """
+    declared_related = _build_declared_relations(data)
     for epic in data["epics"]:
         for story in epic.get("stories", []):
             cid = story.get("clickup_id")
@@ -1629,6 +1666,7 @@ def _reconcile_edges_pass(
                 _sync_relations(
                     token, cid, cu_task, story,
                     dry_run=dry_run, warn_on_remove=warn_on_remove,
+                    peer_declared=declared_related,
                 )
             except Exception as e:
                 log.error(
