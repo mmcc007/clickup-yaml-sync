@@ -881,6 +881,45 @@ def test_load_base_snapshot_absent_returns_empty(tmp_path):
     assert clickup.load_base_snapshot(tmp_path / "nope.json") == {}
 
 
+def test_save_base_snapshot_records_managed_tags(tmp_path):
+    # The base snapshot must persist the managed-tag universe so the next sync
+    # can remove an epic/tag that was later dropped from the YAML.
+    data = {
+        "project": {"clickup_list_id": "999", "name": "p"},
+        "epics": [_epic_with("Alpha", [
+            _story_with("S1", clickup_id="aaa", tags=["stage_one"]),
+        ])],
+    }
+    p = clickup.base_snapshot_path(str(tmp_path / "proj.yaml"), "999")
+    clickup.save_base_snapshot(p, data, SMAP)
+    doc = json.loads(p.read_text())
+    assert "alpha" in doc["managed_tags"]        # epic name, lowercased
+    assert "stage_one" in doc["managed_tags"]     # explicit tag
+
+
+def test_load_base_managed_tags_roundtrip(tmp_path):
+    data = {
+        "project": {"clickup_list_id": "999", "name": "p"},
+        "epics": [_epic_with("Beta", [
+            _story_with("S1", clickup_id="aaa", tags=["stage_two"]),
+        ])],
+    }
+    p = clickup.base_snapshot_path(str(tmp_path / "proj.yaml"), "999")
+    clickup.save_base_snapshot(p, data, SMAP)
+    assert clickup.load_base_managed_tags(p) >= {"beta", "stage_two"}
+
+
+def test_load_base_managed_tags_absent_returns_empty(tmp_path):
+    assert clickup.load_base_managed_tags(tmp_path / "nope.json") == set()
+
+
+def test_load_base_managed_tags_old_base_without_key(tmp_path):
+    # A pre-fix base snapshot (no managed_tags key) degrades to empty, not error.
+    p = tmp_path / "base.json"
+    p.write_text(json.dumps({"version": 1, "tasks": {}}))
+    assert clickup.load_base_managed_tags(p) == set()
+
+
 # ---------------------------------------------------------------------------
 # 3-way sync integration (mocked API) — feat/3way-merge
 # ---------------------------------------------------------------------------
@@ -2188,3 +2227,140 @@ class TestPullBackupFailClosed:
             clickup.cmd_pull(data, str(yaml_path), dry_run=False,
                              backup_default=True, backup_path="/tmp/x.yaml")
         bk.assert_called_once_with(str(yaml_path), dest="/tmp/x.yaml")
+
+
+# ---------------------------------------------------------------------------
+# BUG #14: interrupted + retried sync must not create duplicates
+# ---------------------------------------------------------------------------
+
+
+def _new_story_data(stories_per_epic, project_extra=None):
+    """Like _data_with but for create-path tests: no clickup_id on stories."""
+    return _data_with(stories_per_epic, project_extra=project_extra)
+
+
+class TestSyncCreateCrashSafety:
+    """Each new clickup_id must be flushed to the YAML file IMMEDIATELY after the
+    create, so a run killed mid-create is resumable without duplicating tasks."""
+
+    def test_id_flushed_per_create_before_interruption(self, tmp_path):
+        data = _new_story_data({
+            "Epic One": [_story_with("Task A"), _story_with("Task B")],
+        })
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+
+        calls = {"n": 0}
+
+        def _fake_create(token, list_id, body):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"id": "NEW-1", "custom_id": "T-1"}
+            # Simulate the shell-timeout SIGTERM landing mid-create-loop: a
+            # BaseException propagates past the `except Exception` handlers and
+            # skips the end-of-run save_yaml entirely.
+            raise KeyboardInterrupt("killed mid-run")
+
+        # NOTE: save_yaml is intentionally NOT mocked — we assert the real file
+        # on disk gained the first task's id even though the run was killed
+        # before it could reach the final save.
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[]), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+             mock.patch.object(clickup, "clickup_create_task", side_effect=_fake_create), \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             pytest.raises(KeyboardInterrupt):
+            clickup.cmd_sync(data, str(yaml_path), on_conflict="stop")
+
+        on_disk = yaml.safe_load(yaml_path.read_text())
+        first = on_disk["epics"][0]["stories"][0]
+        assert first["clickup_id"] == "NEW-1", (
+            "first task's clickup_id was not flushed to disk before the kill — "
+            "a retry would re-create it (BUG #14)"
+        )
+
+
+class TestSyncCreateDedupe:
+    """A retry after an interrupted create must adopt the orphan task already in
+    ClickUp instead of (a) creating a second one or (b) re-importing it as a new
+    YAML row."""
+
+    def test_retry_adopts_orphan_no_duplicate(self, tmp_path):
+        # YAML still thinks Task A was never created (writeback was lost), but
+        # the prior killed run already made it in ClickUp.
+        data = _new_story_data({"Epic One": [_story_with("Task A")]})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+
+        orphan = _cu_task("ORPH-1", ["Epic One"])
+        orphan["name"] = "Task A"
+
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[orphan]), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+             mock.patch.object(clickup, "clickup_create_task") as create, \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "clickup_add_tag"), \
+             mock.patch.object(clickup, "clickup_remove_tag"), \
+             mock.patch.object(clickup, "save_yaml"):
+            stats = clickup.cmd_sync(data, str(yaml_path), on_conflict="stop")
+
+        create.assert_not_called()  # must NOT create a duplicate
+        stories = data["epics"][0]["stories"]
+        assert len(stories) == 1, "orphan was re-imported as a duplicate YAML row (BUG #14)"
+        assert stories[0]["clickup_id"] == "ORPH-1", "did not adopt the existing ClickUp task"
+        assert stats["created_in_clickup"] == 0
+
+
+# ---------------------------------------------------------------------------
+# BUG #13: Epic dropdown must be a no-op when the current value already matches,
+# including ClickUp's real GET shape (value = orderindex int, not the option id)
+# ---------------------------------------------------------------------------
+
+
+class TestEpicDropdownOrderindexNoop:
+    PROJECT_CFG = {
+        "epic_dropdown_field_id": "FIELD-UUID",
+        "epic_dropdown_options": {
+            "Kickoff / Access": "OPT-KICKOFF",
+            "VendorX Monitoring System": "OPT-VENDORX",
+        },
+    }
+
+    @staticmethod
+    def _cu_task_dropdown_orderindex(value):
+        """ClickUp GET returns a drop_down value as the option's orderindex int,
+        with the id<->orderindex mapping carried in type_config.options."""
+        cu = _cu_task("T1", [])
+        cu["custom_fields"] = [{
+            "id": "FIELD-UUID",
+            "type": "drop_down",
+            "value": value,
+            "type_config": {"options": [
+                {"id": "OPT-KICKOFF", "name": "Kickoff / Access", "orderindex": 0},
+                {"id": "OPT-VENDORX", "name": "VendorX Monitoring System", "orderindex": 1},
+            ]},
+        }]
+        return cu
+
+    def test_noop_when_orderindex_already_matches(self):
+        epic = _epic_with("VendorX Monitoring System", [])
+        story = _story_with("s1")
+        cu_task = self._cu_task_dropdown_orderindex(1)  # orderindex 1 == OPT-VENDORX
+        with mock.patch.object(clickup, "clickup_set_custom_field") as set_cf:
+            attempted = clickup._push_epic_dropdown_if_needed(
+                "tok", "T1", cu_task, story, epic, project_cfg=self.PROJECT_CFG, dry_run=False
+            )
+        assert attempted is False, "re-PATCHed an Epic dropdown that already matched (BUG #13)"
+        set_cf.assert_not_called()
+
+    def test_writes_when_orderindex_differs(self):
+        epic = _epic_with("VendorX Monitoring System", [])
+        story = _story_with("s1")
+        cu_task = self._cu_task_dropdown_orderindex(0)  # orderindex 0 == OPT-KICKOFF
+        with mock.patch.object(clickup, "clickup_set_custom_field") as set_cf:
+            attempted = clickup._push_epic_dropdown_if_needed(
+                "tok", "T1", cu_task, story, epic, project_cfg=self.PROJECT_CFG, dry_run=False
+            )
+        assert attempted is True
+        set_cf.assert_called_once_with("tok", "T1", "FIELD-UUID", "OPT-VENDORX")
