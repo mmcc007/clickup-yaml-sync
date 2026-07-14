@@ -187,6 +187,30 @@ used.) ClickUp is **not** storing two separate fields: a description is stored
 once and rendered both ways, so existing tasks need no migration — every task
 already returns a valid `markdown_description`.
 
+### Authoring convention — task references are chips, never raw IDs
+
+**Hard rule (Maurice, 2026-07-14):** when a YAML `description` references another
+ClickUp task, embed it as a **markdown link labeled with the task title or ID** —
+never a bare task ID and never a raw URL as visible text:
+
+```yaml
+description: |
+  Blocked by [Acquire foundation corpus](https://app.clickup.com/t/86baxxxxx)
+  — see [`86baxxxxx`](https://app.clickup.com/t/86baxxxxx) for details.
+```
+
+This renders as a clickable chip in ClickUp and round-trips losslessly (see
+above). Two reasons the label matters: URL auto-chipping is a **UI-only**
+behavior (pasting a URL through the API does not chip), and self-referential
+links (label == url) are deliberately collapsed to bare text on read — so an
+unlabeled link will not survive. The same convention already applies to task
+comments and chat/board messages authored outside this tool; this section makes
+synced descriptions consistent with them.
+
+User mentions in descriptions use ClickUp's native markdown form
+`[@Name](#user_mention#<user_id>)` (observed in `markdown_description` reads;
+user ids come from the workspace-members API).
+
 The markdown rendering applies two transformations that the tool normalizes on
 read so they never show as spurious diffs:
 
