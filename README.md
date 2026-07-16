@@ -183,17 +183,39 @@ back by `pull`, and shown by `diff`.
 > before removing any edge** (dependency or relation) so a destructive deletion is
 > never silent; `push` removes silently by its authoritative-overwrite contract.
 
-## Descriptions (markdown / task-mention safe)
+## Descriptions (markdown / task-reference safe)
 
 Descriptions are read as `markdown_description` and written as `markdown_content`,
-so an **embedded task-mention tile survives the round-trip** as a `[label](url)`
-link. (ClickUp's plain `description`/`text_content` flattens a mention to
-whitespace — silently dropping the reference — which is why the markdown form is
-used.) ClickUp is **not** storing two separate fields: a description is stored
-once and rendered both ways, so existing tasks need no migration — every task
-already returns a valid `markdown_description`.
+so a task **reference** survives the round-trip as a `[label](url)` link. (ClickUp's
+plain `description`/`text_content` flattens a task mention to whitespace — silently
+dropping the reference — which is why the markdown form is used.) ClickUp is **not**
+storing two separate fields: a description is stored once and rendered both ways, so
+existing tasks need no migration — every task already returns a valid
+`markdown_description`.
 
-### Authoring convention — task references are chips, never raw IDs
+### Two kinds of "chip" — only one is API-reachable (verified 2026-07-15)
+
+ClickUp has two distinct task-reference visuals. Do not conflate them — an earlier
+version of this section wrongly claimed a description link "renders as a chip." It
+does not.
+
+- **Inline description chip** — the pill you get by typing `@` + a task title
+  *inside the description prose* in the UI. It is a rich-text embed token that lives
+  ONLY in ClickUp's internal editor format (the `frontdoor` API, cookie/session
+  auth). **The public `pk_` API cannot create it, and every readable field destroys
+  it:** `description`/`text_content` drop it entirely; `markdown_description`
+  degrades it to plain title text + a self-link. Consequence: **a hand-added inline
+  chip is flattened to a plain link the next time this tool pushes that task** — do
+  not rely on one surviving a sync. (Empirically confirmed: bare short URL, full
+  team-scoped URL, `<autolink>`, and labeled link were each written via
+  `markdown_content` on both a new and an existing task — none rendered as a chip.)
+- **Linked-task relationship chip** — the chip in the task's **Relationships /
+  "Linked"** panel. This is first-class structured data (`linked_tasks`), is
+  **fully API-writable**, and **this tool already creates it from the YAML
+  `related:` / `depends_on:` fields.** This is the durable, sync-safe way to "chip"
+  a task reference — prefer it whenever the goal is an actual relationship.
+
+### Authoring convention — description task references are labeled links
 
 **Hard rule (Maurice, 2026-07-14):** when a YAML `description` references another
 ClickUp task, embed it as a **markdown link labeled with the task title or ID** —
@@ -205,13 +227,15 @@ description: |
   — see [`86baxxxxx`](https://app.clickup.com/t/86baxxxxx) for details.
 ```
 
-This renders as a clickable chip in ClickUp and round-trips losslessly (see
-above). Two reasons the label matters: URL auto-chipping is a **UI-only**
-behavior (pasting a URL through the API does not chip), and self-referential
-links (label == url) are deliberately collapsed to bare text on read — so an
-unlabeled link will not survive. The same convention already applies to task
-comments and chat/board messages authored outside this tool; this section makes
-synced descriptions consistent with them.
+This renders as a **plain clickable link** in the description (NOT an inline chip —
+see above) and round-trips losslessly. The label matters for two reasons:
+self-referential links (label == url) are deliberately collapsed to bare text on
+read (so an unlabeled link will not survive), and a readable label beats a raw ID
+for anyone skimming the task. When the goal is a real chip for the relationship,
+declare it in `related:` / `depends_on:` — that produces a Relationships-panel chip
+via the API. The same labeled-link convention already applies to task comments and
+chat/board messages authored outside this tool; this section keeps synced
+descriptions consistent with them.
 
 User mentions in descriptions use ClickUp's native markdown form
 `[@Name](#user_mention#<user_id>)` (observed in `markdown_description` reads;
