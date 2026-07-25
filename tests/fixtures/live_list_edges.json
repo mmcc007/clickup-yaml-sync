@@ -1,0 +1,465 @@
+{
+  "_source": "Captured live from the ClickUp sandbox by tools/capture_edge_fixture.py. Two throwaway tasks with one waiting-on dependency (A waits on B) and one non-blocking link. list_* is the body of GET /list/{id}/task?subtasks=true&include_closed=true&include_markdown_description=true -- exactly what clickup_list_tasks() returns. get_* is the single-task GET /task/{id}, kept so the suite can assert the two endpoints agree.",
+  "a_id": "86bb3fu91",
+  "b_id": "86bb3fu9k",
+  "list_A": {
+    "id": "86bb3fu91",
+    "custom_id": null,
+    "custom_item_id": 0,
+    "name": "EDGE-A",
+    "text_content": "",
+    "description": "",
+    "markdown_description": "",
+    "status": {
+      "status": "backlog",
+      "id": "p90145881224_DCnaeiSB",
+      "color": "#87909e",
+      "type": "open",
+      "orderindex": 0
+    },
+    "orderindex": "39908506.00000000000000000000000000000000",
+    "date_created": "1785006751830",
+    "date_updated": "1785006751830",
+    "date_closed": null,
+    "date_done": null,
+    "archived": false,
+    "creator": {
+      "id": 216015734,
+      "username": "Mo",
+      "color": "#595d66",
+      "email": "mmccabe@orbsoft.com",
+      "profilePicture": null
+    },
+    "assignees": [],
+    "group_assignees": [],
+    "watchers": [
+      {
+        "id": 216015734,
+        "username": "Mo",
+        "color": "#595d66",
+        "initials": "M",
+        "email": "mmccabe@orbsoft.com",
+        "profilePicture": null
+      }
+    ],
+    "checklists": [],
+    "tags": [],
+    "parent": null,
+    "top_level_parent": null,
+    "priority": null,
+    "due_date": null,
+    "start_date": null,
+    "points": null,
+    "time_estimate": null,
+    "custom_fields": [],
+    "dependencies": [
+      {
+        "task_id": "86bb3fu91",
+        "depends_on": "86bb3fu9k",
+        "type": 1,
+        "date_created": "1785006753964",
+        "userid": "216015734",
+        "workspace_id": "90141305256",
+        "chain_id": "beb6e792-4d38-4ebf-91bb-e938590e85fc"
+      }
+    ],
+    "linked_tasks": [
+      {
+        "task_id": "86bb3fu91",
+        "link_id": "86bb3fu9k",
+        "date_created": "1785006754981",
+        "userid": "216015734",
+        "workspace_id": "90141305256"
+      }
+    ],
+    "locations": [],
+    "team_id": "90141305256",
+    "url": "https://app.clickup.com/t/86bb3fu91",
+    "sharing": {
+      "public": false,
+      "public_share_expires_on": null,
+      "public_fields": [
+        "assignees",
+        "priority",
+        "due_date",
+        "content",
+        "comments",
+        "attachments",
+        "customFields",
+        "subtasks",
+        "tags",
+        "checklists",
+        "coverimage"
+      ],
+      "token": null,
+      "seo_optimized": false
+    },
+    "permission_level": "create",
+    "list": {
+      "id": "901416927706",
+      "name": "Project 2",
+      "access": true
+    },
+    "project": {
+      "id": "90149787437",
+      "name": "hidden",
+      "hidden": true,
+      "access": true
+    },
+    "folder": {
+      "id": "90149787437",
+      "name": "hidden",
+      "hidden": true,
+      "access": true
+    },
+    "space": {
+      "id": "90145881224"
+    }
+  },
+  "list_B": {
+    "id": "86bb3fu9k",
+    "custom_id": null,
+    "custom_item_id": 0,
+    "name": "EDGE-B",
+    "text_content": "",
+    "description": "",
+    "markdown_description": "",
+    "status": {
+      "status": "backlog",
+      "id": "p90145881224_DCnaeiSB",
+      "color": "#87909e",
+      "type": "open",
+      "orderindex": 0
+    },
+    "orderindex": "39908507.00000000000000000000000000000000",
+    "date_created": "1785006752966",
+    "date_updated": "1785006752966",
+    "date_closed": null,
+    "date_done": null,
+    "archived": false,
+    "creator": {
+      "id": 216015734,
+      "username": "Mo",
+      "color": "#595d66",
+      "email": "mmccabe@orbsoft.com",
+      "profilePicture": null
+    },
+    "assignees": [],
+    "group_assignees": [],
+    "watchers": [
+      {
+        "id": 216015734,
+        "username": "Mo",
+        "color": "#595d66",
+        "initials": "M",
+        "email": "mmccabe@orbsoft.com",
+        "profilePicture": null
+      }
+    ],
+    "checklists": [],
+    "tags": [],
+    "parent": null,
+    "top_level_parent": null,
+    "priority": null,
+    "due_date": null,
+    "start_date": null,
+    "points": null,
+    "time_estimate": null,
+    "custom_fields": [],
+    "dependencies": [
+      {
+        "task_id": "86bb3fu91",
+        "depends_on": "86bb3fu9k",
+        "type": 1,
+        "date_created": "1785006753964",
+        "userid": "216015734",
+        "workspace_id": "90141305256",
+        "chain_id": "beb6e792-4d38-4ebf-91bb-e938590e85fc"
+      }
+    ],
+    "linked_tasks": [
+      {
+        "task_id": "86bb3fu91",
+        "link_id": "86bb3fu9k",
+        "date_created": "1785006754981",
+        "userid": "216015734",
+        "workspace_id": "90141305256"
+      }
+    ],
+    "locations": [],
+    "team_id": "90141305256",
+    "url": "https://app.clickup.com/t/86bb3fu9k",
+    "sharing": {
+      "public": false,
+      "public_share_expires_on": null,
+      "public_fields": [
+        "assignees",
+        "priority",
+        "due_date",
+        "content",
+        "comments",
+        "attachments",
+        "customFields",
+        "subtasks",
+        "tags",
+        "checklists",
+        "coverimage"
+      ],
+      "token": null,
+      "seo_optimized": false
+    },
+    "permission_level": "create",
+    "list": {
+      "id": "901416927706",
+      "name": "Project 2",
+      "access": true
+    },
+    "project": {
+      "id": "90149787437",
+      "name": "hidden",
+      "hidden": true,
+      "access": true
+    },
+    "folder": {
+      "id": "90149787437",
+      "name": "hidden",
+      "hidden": true,
+      "access": true
+    },
+    "space": {
+      "id": "90145881224"
+    }
+  },
+  "get_A": {
+    "id": "86bb3fu91",
+    "custom_id": null,
+    "custom_item_id": 0,
+    "name": "EDGE-A",
+    "text_content": "",
+    "description": "",
+    "markdown_description": "",
+    "status": {
+      "id": "p90145881224_DCnaeiSB",
+      "status": "backlog",
+      "color": "#87909e",
+      "orderindex": 0,
+      "type": "open"
+    },
+    "orderindex": "39908506.00000000000000000000000000000000",
+    "date_created": "1785006751830",
+    "date_updated": "1785006751830",
+    "date_closed": null,
+    "date_done": null,
+    "archived": false,
+    "creator": {
+      "id": 216015734,
+      "username": "Mo",
+      "color": "#595d66",
+      "email": "mmccabe@orbsoft.com",
+      "profilePicture": null
+    },
+    "assignees": [],
+    "group_assignees": [],
+    "watchers": [
+      {
+        "id": 216015734,
+        "username": "Mo",
+        "color": "#595d66",
+        "initials": "M",
+        "email": "mmccabe@orbsoft.com",
+        "profilePicture": null
+      }
+    ],
+    "checklists": [],
+    "tags": [],
+    "parent": null,
+    "top_level_parent": null,
+    "priority": null,
+    "due_date": null,
+    "start_date": null,
+    "points": null,
+    "time_estimate": null,
+    "time_spent": 0,
+    "custom_fields": [],
+    "dependencies": [
+      {
+        "task_id": "86bb3fu91",
+        "depends_on": "86bb3fu9k",
+        "type": 1,
+        "date_created": "1785006753964",
+        "userid": "216015734",
+        "workspace_id": "90141305256",
+        "chain_id": "beb6e792-4d38-4ebf-91bb-e938590e85fc"
+      }
+    ],
+    "linked_tasks": [
+      {
+        "task_id": "86bb3fu91",
+        "link_id": "86bb3fu9k",
+        "date_created": "1785006754981",
+        "userid": "216015734",
+        "workspace_id": "90141305256"
+      }
+    ],
+    "locations": [],
+    "team_id": "90141305256",
+    "url": "https://app.clickup.com/t/86bb3fu91",
+    "sharing": {
+      "public": false,
+      "public_share_expires_on": null,
+      "public_fields": [
+        "assignees",
+        "priority",
+        "due_date",
+        "content",
+        "comments",
+        "attachments",
+        "customFields",
+        "subtasks",
+        "tags",
+        "checklists",
+        "coverimage"
+      ],
+      "token": null,
+      "seo_optimized": false
+    },
+    "permission_level": "create",
+    "list": {
+      "id": "901416927706",
+      "name": "Project 2",
+      "access": true
+    },
+    "project": {
+      "id": "90149787437",
+      "name": "hidden",
+      "hidden": true,
+      "access": true
+    },
+    "folder": {
+      "id": "90149787437",
+      "name": "hidden",
+      "hidden": true,
+      "access": true
+    },
+    "space": {
+      "id": "90145881224"
+    },
+    "attachments": []
+  },
+  "get_B": {
+    "id": "86bb3fu9k",
+    "custom_id": null,
+    "custom_item_id": 0,
+    "name": "EDGE-B",
+    "text_content": "",
+    "description": "",
+    "markdown_description": "",
+    "status": {
+      "id": "p90145881224_DCnaeiSB",
+      "status": "backlog",
+      "color": "#87909e",
+      "orderindex": 0,
+      "type": "open"
+    },
+    "orderindex": "39908507.00000000000000000000000000000000",
+    "date_created": "1785006752966",
+    "date_updated": "1785006752966",
+    "date_closed": null,
+    "date_done": null,
+    "archived": false,
+    "creator": {
+      "id": 216015734,
+      "username": "Mo",
+      "color": "#595d66",
+      "email": "mmccabe@orbsoft.com",
+      "profilePicture": null
+    },
+    "assignees": [],
+    "group_assignees": [],
+    "watchers": [
+      {
+        "id": 216015734,
+        "username": "Mo",
+        "color": "#595d66",
+        "initials": "M",
+        "email": "mmccabe@orbsoft.com",
+        "profilePicture": null
+      }
+    ],
+    "checklists": [],
+    "tags": [],
+    "parent": null,
+    "top_level_parent": null,
+    "priority": null,
+    "due_date": null,
+    "start_date": null,
+    "points": null,
+    "time_estimate": null,
+    "time_spent": 0,
+    "custom_fields": [],
+    "dependencies": [
+      {
+        "task_id": "86bb3fu91",
+        "depends_on": "86bb3fu9k",
+        "type": 1,
+        "date_created": "1785006753964",
+        "userid": "216015734",
+        "workspace_id": "90141305256",
+        "chain_id": "beb6e792-4d38-4ebf-91bb-e938590e85fc"
+      }
+    ],
+    "linked_tasks": [
+      {
+        "task_id": "86bb3fu91",
+        "link_id": "86bb3fu9k",
+        "date_created": "1785006754981",
+        "userid": "216015734",
+        "workspace_id": "90141305256"
+      }
+    ],
+    "locations": [],
+    "team_id": "90141305256",
+    "url": "https://app.clickup.com/t/86bb3fu9k",
+    "sharing": {
+      "public": false,
+      "public_share_expires_on": null,
+      "public_fields": [
+        "assignees",
+        "priority",
+        "due_date",
+        "content",
+        "comments",
+        "attachments",
+        "customFields",
+        "subtasks",
+        "tags",
+        "checklists",
+        "coverimage"
+      ],
+      "token": null,
+      "seo_optimized": false
+    },
+    "permission_level": "create",
+    "list": {
+      "id": "901416927706",
+      "name": "Project 2",
+      "access": true
+    },
+    "project": {
+      "id": "90149787437",
+      "name": "hidden",
+      "hidden": true,
+      "access": true
+    },
+    "folder": {
+      "id": "90149787437",
+      "name": "hidden",
+      "hidden": true,
+      "access": true
+    },
+    "space": {
+      "id": "90145881224"
+    },
+    "attachments": []
+  }
+}

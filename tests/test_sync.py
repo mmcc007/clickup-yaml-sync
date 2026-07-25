@@ -2516,3 +2516,68 @@ class TestDependencyVisibility:
               _cu_task("GATE", []), _cu_task("REL", [])]
         _, _, msgs = self._sync(data, yp, cu, caplog, dry_run=True, level="WARNING")
         assert "both a dependency" not in msgs
+
+
+# ---------------------------------------------------------------------------
+# Live-captured shape regression
+#
+# Every other edge test in this file feeds the parsers a hand-written dict.
+# That pins our ASSUMPTION about ClickUp's JSON, not ClickUp's JSON. These
+# tests replay a response captured verbatim from the live sandbox
+# (tools/capture_edge_fixture.py) so a shape change on ClickUp's side, or a
+# parser change here, is caught by the suite.
+#
+# The question this answers: GET /list/{id}/task is the ONLY read behind
+# push/sync/merge/pull/diff. If it omitted `dependencies`/`linked_tasks` the
+# way some endpoints do, `current` would always be empty and edge REMOVAL
+# would silently never happen. Confirmed 2026-07-25: it does not omit them.
+# ---------------------------------------------------------------------------
+
+LIVE_EDGES = json.loads(
+    (HERE / "fixtures" / "live_list_edges.json").read_text()
+)
+
+
+class TestLiveListEndpointEdgeShape:
+    """Pins the real GET /list/{id}/task payload for dependency + link edges."""
+
+    def test_list_response_populates_both_edge_arrays(self):
+        # The core claim. Not empty, not absent.
+        for key in ("list_A", "list_B"):
+            task = LIVE_EDGES[key]
+            assert task["dependencies"], f"{key} lost its dependencies array"
+            assert task["linked_tasks"], f"{key} lost its linked_tasks array"
+
+    def test_dependency_edge_field_names_and_values(self):
+        (edge,) = LIVE_EDGES["list_A"]["dependencies"]
+        assert edge["task_id"] == LIVE_EDGES["a_id"]
+        assert edge["depends_on"] == LIVE_EDGES["b_id"]
+        assert edge["type"] == clickup.DEP_TYPE_WAITING_ON == 1
+
+    def test_link_edge_field_names_and_values(self):
+        (link,) = LIVE_EDGES["list_A"]["linked_tasks"]
+        assert link["task_id"] == LIVE_EDGES["a_id"]
+        assert link["link_id"] == LIVE_EDGES["b_id"]
+
+    def test_parsers_read_the_live_shape(self):
+        a, b = LIVE_EDGES["list_A"], LIVE_EDGES["list_B"]
+        aid, bid = LIVE_EDGES["a_id"], LIVE_EDGES["b_id"]
+        # A waits on B; B waits on nothing.
+        assert clickup._cu_waiting_on_ids(a) == {bid}
+        assert clickup._cu_waiting_on_ids(b) == set()
+        # The link is symmetric: each side sees the other.
+        assert clickup._cu_linked_ids(a) == {bid}
+        assert clickup._cu_linked_ids(b) == {aid}
+
+    def test_dependency_edge_is_shared_not_mirrored(self):
+        # ClickUp does NOT emit a second, reversed edge on the blocked task --
+        # it repeats the SAME object on both. _cu_waiting_on_ids therefore
+        # cannot rely on a mirror existing; its task_id == self filter is what
+        # keeps B from claiming it waits on A.
+        assert LIVE_EDGES["list_A"]["dependencies"] == LIVE_EDGES["list_B"]["dependencies"]
+
+    def test_list_endpoint_matches_single_task_endpoint(self):
+        # If these ever diverge, the per-task GET hydration question reopens.
+        for lst, get in (("list_A", "get_A"), ("list_B", "get_B")):
+            assert LIVE_EDGES[lst]["dependencies"] == LIVE_EDGES[get]["dependencies"]
+            assert LIVE_EDGES[lst]["linked_tasks"] == LIVE_EDGES[get]["linked_tasks"]
