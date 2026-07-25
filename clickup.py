@@ -1445,11 +1445,21 @@ def _assignees_differ(story: dict, cu_task: dict, resolver: dict[str, int]) -> b
 # on the next push. Only the waiting_on direction (ClickUp type 1) is modeled;
 # ClickUp maintains the mirrored "blocking" edge automatically.
 #
-# Scope (v1): reconciled by ``cmd_push`` (second pass), ``cmd_pull``, and shown
-# in ``cmd_diff``. NOT yet handled by ``cmd_sync`` / ``cmd_merge`` — dependencies
-# are deliberately excluded from the 3-way/base-snapshot machinery.
+# Scope: reconciled by ``cmd_push``, ``cmd_sync`` and ``cmd_merge`` — all three
+# run the same relationship-reconcile second pass (``_reconcile_edges_pass``) —
+# read back by ``cmd_pull``, and shown in ``cmd_diff``.
+#
+# Dependencies remain deliberately excluded from the 3-way/base-snapshot
+# machinery: they are NOT base-tracked, so sync APPLIES a declared ``depends_on``
+# rather than surfacing it as a conflict. That exclusion is also why sync/merge
+# warn before every edge removal (``_warn_edge_removal``) — with no base there is
+# nothing to distinguish a deliberate clear from an accidental one.
 
 DEP_TYPE_WAITING_ON = 1  # ClickUp dependency ``type``: task_id waits on depends_on
+
+# Stand-in id for a story the run would create: under ``--dry-run`` no task is
+# created, so there is no ClickUp id to name in the edge preview.
+PENDING_CREATE_ID = "pending create"
 
 
 def _cu_waiting_on_ids(cu_task: dict) -> set[str]:
@@ -1496,6 +1506,16 @@ def _resolve_dependency_ids(
     return desired, unresolved
 
 
+def _edge_label(story: dict, task_id: str) -> str:
+    """``'story name' (task id)`` — so an edge log line says which task it means.
+
+    Edge lines are emitted from a second pass that runs after the per-story
+    output, so without this they read as bare id lists with no way to tell which
+    task a preview belongs to.
+    """
+    return f"'{story.get('name', '?')}' ({task_id})"
+
+
 def _warn_edge_removal(kind: str, task_id: str, rem: list[str], dry_run: bool) -> None:
     """Loudly flag a destructive edge removal (mirrors the assignee warning).
 
@@ -1537,23 +1557,26 @@ def _sync_dependencies(
     rem = sorted(current - desired)
     if not add and not rem:
         return False
+    label = _edge_label(story, task_id)
     if rem and warn_on_remove:
         _warn_edge_removal("dependency", task_id, rem, dry_run)
     if dry_run:
-        log.info(f"    [DRY RUN] Would reconcile dependencies: +{add} -{rem}")
+        log.info(
+            f"    [DRY RUN] Would reconcile dependencies on {label}: +{add} -{rem}"
+        )
         return True
     changed = False
     for dep_id in add:
         try:
             clickup_add_dependency(token, task_id, dep_id)
-            log.info(f"    Added dependency: waits on {dep_id}")
+            log.info(f"    Added dependency: {label} waits on {dep_id}")
             changed = True
         except Exception as e:
             log.warning(f"    Failed to add dependency on {dep_id}: {e}")
     for dep_id in rem:
         try:
             clickup_remove_dependency(token, task_id, dep_id)
-            log.info(f"    Removed dependency: no longer waits on {dep_id}")
+            log.info(f"    Removed dependency: {label} no longer waits on {dep_id}")
             changed = True
         except Exception as e:
             log.warning(f"    Failed to remove dependency on {dep_id}: {e}")
@@ -1689,23 +1712,24 @@ def _sync_relations(
         rem = [r for r in rem if str(task_id) not in peer_declared.get(r, ())]
     if not add and not rem:
         return False
+    label = _edge_label(story, task_id)
     if rem and warn_on_remove:
         _warn_edge_removal("relation", task_id, rem, dry_run)
     if dry_run:
-        log.info(f"    [DRY RUN] Would reconcile relations: +{add} -{rem}")
+        log.info(f"    [DRY RUN] Would reconcile relations on {label}: +{add} -{rem}")
         return True
     changed = False
     for rid in add:
         try:
             clickup_add_link(token, task_id, rid)
-            log.info(f"    Added relation: linked to {rid}")
+            log.info(f"    Added relation: {label} linked to {rid}")
             changed = True
         except Exception as e:
             log.warning(f"    Failed to add relation to {rid}: {e}")
     for rid in rem:
         try:
             clickup_remove_link(token, task_id, rid)
-            log.info(f"    Removed relation: no longer linked to {rid}")
+            log.info(f"    Removed relation: {label} no longer linked to {rid}")
             changed = True
         except Exception as e:
             log.warning(f"    Failed to remove relation to {rid}: {e}")
@@ -1737,6 +1761,46 @@ def _pull_relations(story: dict, cu_task: dict) -> bool:
     return True
 
 
+def _declared_edge_ids(story: dict, key: str) -> set[str]:
+    """The non-blank ids a story declares under ``key`` (``depends_on``/``related``)."""
+    return {str(x).strip() for x in (story.get(key) or []) if str(x).strip()}
+
+
+def _warn_edge_target_overlap(story: dict, task_id: str) -> None:
+    """Flag a target declared as BOTH a dependency and a relation.
+
+    ClickUp permits both edges on one pair and we apply exactly what the YAML
+    says, so this is a warning and not an error. But it is nearly always one
+    intent written twice — typically a ``related`` entry added because the
+    ``depends_on`` was believed not to have taken effect — and the two edges then
+    have to be found and cleaned up separately.
+    """
+    both = sorted(
+        _declared_edge_ids(story, "depends_on") & _declared_edge_ids(story, "related")
+    )
+    if not both:
+        return
+    log.warning(
+        f"    {_edge_label(story, task_id)} declares {both} as both a dependency "
+        f"and a relation — ClickUp will hold two separate edges on the same pair. "
+        f"Drop the `related` entry unless the extra link is deliberate."
+    )
+
+
+def _preview_pending_create_edges(token: str, story: dict) -> None:
+    """Preview the edges a story that would be CREATED this run declares.
+
+    Under ``--dry-run`` no task is created, so the story still has no
+    ``clickup_id`` and the reconcile below skips it — the edges would then first
+    appear in the real run, having never been previewed. Reconcile against a
+    synthetic edge-free task so additions still surface; a task that does not
+    exist yet has no edges to remove, so nothing destructive is hidden here.
+    """
+    cu_task = {"id": PENDING_CREATE_ID, "dependencies": [], "linked_tasks": []}
+    _sync_dependencies(token, PENDING_CREATE_ID, cu_task, story, dry_run=True)
+    _sync_relations(token, PENDING_CREATE_ID, cu_task, story, dry_run=True)
+
+
 def _reconcile_edges_pass(
     token: str,
     data: dict,
@@ -1752,7 +1816,10 @@ def _reconcile_edges_pass(
     created this run already has its ``clickup_id`` written back (edge targets
     reference tasks by id and must resolve). A task created this run isn't in
     ``cu_by_id`` (fetched before creates), so it starts from a synthetic
-    edge-free task. Edges are YAML-authoritative when the key is present;
+    edge-free task. Under ``dry_run`` no create happened, so a pending-create
+    story has no id at all — its edges are previewed against a synthetic task
+    rather than skipped, since the real run WILL apply them. Edges are
+    YAML-authoritative when the key is present;
     failures bump ``stats['errors']``. ``warn_on_remove`` loudly flags edge
     deletions — push leaves it False (authoritative overwrite is its contract);
     sync/merge pass True so a destructive removal is never silent.
@@ -1761,7 +1828,15 @@ def _reconcile_edges_pass(
     for epic in data["epics"]:
         for story in epic.get("stories", []):
             cid = story.get("clickup_id")
-            if not cid or ("depends_on" not in story and "related" not in story):
+            if "depends_on" not in story and "related" not in story:
+                continue
+            _warn_edge_target_overlap(story, cid or PENDING_CREATE_ID)
+            if not cid:
+                # No id yet. In a real run the create pass has already written
+                # one back, so this is the dry-run case: preview the edges
+                # instead of going silent about them (they WOULD be applied).
+                if dry_run:
+                    _preview_pending_create_edges(token, story)
                 continue
             cu_task = cu_by_id.get(cid) or {
                 "id": cid, "dependencies": [], "linked_tasks": []

@@ -6,3 +6,6 @@ __pycache__/
 *.pyo
 .pytest_cache/
 ~/tmp/clickup_sync.log
+
+# Local git worktrees (see git-workflow: one worktree per branch)
+.worktrees/
