@@ -4,6 +4,29 @@
 
 ### Fixed
 
+- **Dependency/relation edges are now fully visible in `--dry-run`.**
+  - A story the run would **create** no longer has its declared `depends_on` /
+    `related` silently skipped in the preview. It has no `clickup_id` under
+    `--dry-run` (creates don't happen), so the second pass used to skip it
+    entirely and the edges first appeared in the real run — unpreviewed.
+  - Edge log lines (preview and apply) now name the task they change —
+    `'story name' (task id)` — instead of emitting bare id lists from a second
+    pass that runs after the per-story output.
+  - The inline scope comment above `DEP_TYPE_WAITING_ON` claimed dependencies
+    were "NOT yet handled by `cmd_sync` / `cmd_merge`". They have been handled by
+    both since sync/merge gained the second pass; the accurate half — that
+    dependencies are excluded from the 3-way/base-snapshot machinery and are
+    therefore *applied* rather than surfaced as conflicts — is kept. A test now
+    pins `sync` (not just `push`) applying a declared `depends_on`, so the claim
+    can't drift silently again.
+
+### Added
+
+- **Warning when the same target is declared as both `depends_on` and `related`.**
+  ClickUp permits both edges on one pair and both are still applied as declared,
+  but it is nearly always one intent written twice — and the two edges then have
+  to be cleaned up separately.
+
 - **#14 (critical) — interrupted + retried sync no longer creates duplicate tasks.**
   - `sync` now flushes each new `clickup_id` back to the YAML file immediately
     after each create (matching `push`), so a run killed mid-create is resumable.

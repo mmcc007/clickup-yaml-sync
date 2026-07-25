@@ -140,6 +140,12 @@ Edges are YAML-authoritative (the table above) and are **not** base-tracked 3-wa
 fields: declaring `depends_on` in YAML is *applied*, never surfaced as a sync
 conflict. `pull`/`diff` round-trip them too.
 
+A `--dry-run` previews every edge change it would make — additions and removals,
+named by story and id — including for a task the run would *create*, whose edges
+land in the second pass after the create. Because `depends_on: []` **deletes real
+blockers**, `sync`/`merge` also print a loud warning before any edge removal (see
+the footgun note under Relations).
+
 ## Relations (non-blocking "linked tasks")
 
 Each story can also declare a `related` list — ClickUp's non-blocking

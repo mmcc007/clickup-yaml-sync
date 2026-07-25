@@ -2364,3 +2364,155 @@ class TestEpicDropdownOrderindexNoop:
             )
         assert attempted is True
         set_cf.assert_called_once_with("tok", "T1", "FIELD-UUID", "OPT-VENDORX")
+
+
+# ---------------------------------------------------------------------------
+# Dependency visibility: a dry-run must preview dependency edges with the same
+# fidelity relations already get (add/remove preview + pre-removal warning),
+# INCLUDING for a task that would be created this run, and must name the task
+# it is talking about. Pins the sync path specifically — the inline scope
+# comment once claimed sync did not handle dependencies, and nothing failed
+# when that became untrue.
+# ---------------------------------------------------------------------------
+
+
+class TestDependencyVisibility:
+    """Every case drives the real command (not the helper) so the whole
+    second-pass wiring is under test, and asserts on emitted log lines."""
+
+    def _sync(self, data, yaml_path, cu_tasks, caplog, dry_run, level="INFO"):
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+             mock.patch.object(clickup, "clickup_update_task"), \
+             mock.patch.object(clickup, "clickup_add_tag"), \
+             mock.patch.object(clickup, "clickup_remove_tag"), \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "clickup_create_task",
+                               return_value={"id": "NEW-1", "custom_id": None}), \
+             mock.patch.object(clickup, "clickup_add_dependency") as add_dep, \
+             mock.patch.object(clickup, "clickup_remove_dependency") as rm_dep, \
+             mock.patch.object(clickup, "clickup_add_link"), \
+             mock.patch.object(clickup, "clickup_remove_link"), \
+             mock.patch.object(clickup, "save_yaml"), \
+             caplog.at_level(level):
+            clickup.cmd_sync(
+                data, str(yaml_path), conflict="local",
+                on_conflict="local", dry_run=dry_run,
+            )
+        return add_dep, rm_dep, " | ".join(r.message for r in caplog.records)
+
+    def _yaml(self, tmp_path, stories):
+        data = _data_with({"VendorX Monitoring System": stories})
+        yaml_path = tmp_path / "p.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(data, f)
+        return data, yaml_path
+
+    # -- sync APPLIES a declared dependency (pins the scope claim) -----------
+
+    def test_sync_applies_declared_dependency(self, tmp_path, caplog):
+        """sync — not just push — runs the dependency second pass."""
+        data, yp = self._yaml(tmp_path, [
+            _story_with("dev task", clickup_id="T1", depends_on=["GATE"])
+        ])
+        cu = [_cu_task_with_edges("T1", "dev task"), _cu_task("GATE", [])]
+        add_dep, _, _ = self._sync(data, yp, cu, caplog, dry_run=False)
+        add_dep.assert_called_once_with(clickup.get_clickup_token(), "T1", "GATE")
+
+    def test_sync_clears_dependencies_on_empty_list(self, tmp_path, caplog):
+        data, yp = self._yaml(tmp_path, [
+            _story_with("dev task", clickup_id="T1", depends_on=[])
+        ])
+        cu = [_cu_task_with_edges("T1", "dev task")]
+        cu[0]["dependencies"] = [
+            {"task_id": "T1", "depends_on": "GATE", "type": clickup.DEP_TYPE_WAITING_ON}
+        ]
+        _, rm_dep, _ = self._sync(data, yp, cu, caplog, dry_run=False)
+        rm_dep.assert_called_once_with(clickup.get_clickup_token(), "T1", "GATE")
+
+    def test_apply_logs_the_added_dependency_at_info(self, tmp_path, caplog):
+        data, yp = self._yaml(tmp_path, [
+            _story_with("dev task", clickup_id="T1", depends_on=["GATE"])
+        ])
+        cu = [_cu_task_with_edges("T1", "dev task"), _cu_task("GATE", [])]
+        _, _, msgs = self._sync(data, yp, cu, caplog, dry_run=False)
+        assert "Added dependency" in msgs and "GATE" in msgs
+        assert "dev task" in msgs, "apply line does not name the task it changed"
+
+    # -- dry-run PREVIEWS additions and removals ----------------------------
+
+    def test_dry_run_previews_dependency_addition(self, tmp_path, caplog):
+        data, yp = self._yaml(tmp_path, [
+            _story_with("dev task", clickup_id="T1", depends_on=["GATE"])
+        ])
+        cu = [_cu_task_with_edges("T1", "dev task"), _cu_task("GATE", [])]
+        add_dep, _, msgs = self._sync(data, yp, cu, caplog, dry_run=True)
+        add_dep.assert_not_called()
+        assert "dependencies" in msgs and "GATE" in msgs
+        assert "dev task" in msgs, "preview does not name the task it would change"
+
+    def test_dry_run_previews_dependency_removal(self, tmp_path, caplog):
+        data, yp = self._yaml(tmp_path, [
+            _story_with("dev task", clickup_id="T1", depends_on=[])
+        ])
+        cu = [_cu_task_with_edges("T1", "dev task")]
+        cu[0]["dependencies"] = [
+            {"task_id": "T1", "depends_on": "GATE", "type": clickup.DEP_TYPE_WAITING_ON}
+        ]
+        _, rm_dep, msgs = self._sync(data, yp, cu, caplog, dry_run=True)
+        rm_dep.assert_not_called()
+        assert "dependencies" in msgs and "GATE" in msgs
+
+    def test_dry_run_warns_before_a_dependency_removal(self, tmp_path, caplog):
+        """The destructive case: `depends_on: []` deletes real blockers, so the
+        preview must carry the same loud warning relations already get."""
+        data, yp = self._yaml(tmp_path, [
+            _story_with("dev task", clickup_id="T1", depends_on=[])
+        ])
+        cu = [_cu_task_with_edges("T1", "dev task")]
+        cu[0]["dependencies"] = [
+            {"task_id": "T1", "depends_on": "GATE", "type": clickup.DEP_TYPE_WAITING_ON}
+        ]
+        _, _, msgs = self._sync(data, yp, cu, caplog, dry_run=True, level="WARNING")
+        assert "dependency edge" in msgs and "will be deleted" in msgs
+        assert "Would remove" in msgs
+
+    # -- dry-run preview for a task that does not exist yet -----------------
+
+    def test_dry_run_previews_edges_for_a_task_it_would_create(self, tmp_path, caplog):
+        """A story with no clickup_id is created by the real run and gets its
+        declared edges in the second pass. Under --dry-run no id exists, so the
+        edge preview must still surface them rather than going silent."""
+        data, yp = self._yaml(tmp_path, [
+            _story_with("brand new", depends_on=["GATE"], related=["REL"])
+        ])
+        cu = [_cu_task("GATE", []), _cu_task("REL", [])]
+        _, _, msgs = self._sync(data, yp, cu, caplog, dry_run=True)
+        assert "GATE" in msgs, "dependency on a to-be-created task was not previewed"
+        assert "REL" in msgs, "relation on a to-be-created task was not previewed"
+        assert "brand new" in msgs
+
+    # -- same target declared as both a dependency and a relation -----------
+
+    def test_warns_when_same_target_is_both_dependency_and_relation(
+        self, tmp_path, caplog
+    ):
+        """ClickUp permits both edges on one pair, but it is nearly always the
+        same intent declared twice — say so rather than silently creating two."""
+        data, yp = self._yaml(tmp_path, [
+            _story_with("dev task", clickup_id="T1",
+                        depends_on=["GATE"], related=["GATE"])
+        ])
+        cu = [_cu_task_with_edges("T1", "dev task"), _cu_task("GATE", [])]
+        _, _, msgs = self._sync(data, yp, cu, caplog, dry_run=True, level="WARNING")
+        assert "GATE" in msgs and "both" in msgs.lower()
+
+    def test_no_overlap_warning_when_targets_differ(self, tmp_path, caplog):
+        data, yp = self._yaml(tmp_path, [
+            _story_with("dev task", clickup_id="T1",
+                        depends_on=["GATE"], related=["REL"])
+        ])
+        cu = [_cu_task_with_edges("T1", "dev task"),
+              _cu_task("GATE", []), _cu_task("REL", [])]
+        _, _, msgs = self._sync(data, yp, cu, caplog, dry_run=True, level="WARNING")
+        assert "both a dependency" not in msgs
