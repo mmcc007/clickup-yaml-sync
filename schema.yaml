@@ -284,7 +284,10 @@ properties:
                   a clickup_id by the relationship second pass, which runs after
                   creates, so a brand-new parent and child link on the FIRST
                   sync. A raw ClickUp id is also accepted, which is how a parent
-                  that lives outside this file is referenced. Two stories sharing
+                  that lives outside this file is referenced — but it must be in
+                  the SAME list: a cross-list parent is refused, because ClickUp's
+                  PUT would silently move this task into the parent's list (and
+                  the next sync would then report it archived). Two stories sharing
                   the referenced name is an error, not a guess. Semantics mirror
                   depends_on: OMIT this key to leave ClickUp's hierarchy
                   untouched (a subtask nested in the UI survives); set it to

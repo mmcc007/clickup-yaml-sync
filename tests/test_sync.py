@@ -2961,3 +2961,73 @@ class TestParentRoundTripSafety:
         ctx = clickup._build_parent_context(_parent_data(stories))
         clickup._pull_parent(stories[1], _cu_task_parent("T1", "HUB"), ctx)
         assert clickup._resolve_parent_id(stories[1]["parent"], ctx, "T1") == "HUB"
+
+
+class TestParentSameListGuard:
+    """A cross-list parent is refused: ClickUp's PUT would MOVE the task.
+
+    Verified live — `PUT /task/{id} {"parent": <task in another list>}` returns
+    200 and relocates the task into the parent's list, where the next sync sees
+    it as archived. (The create endpoint refuses the same thing outright with
+    ITEM_137 "Parent not child of list".) So the tool checks membership first.
+    """
+
+    def _ctx(self, stories, cu_by_id=None):
+        return clickup._build_parent_context(
+            _parent_data(stories), cu_by_id=cu_by_id or {}
+        )
+
+    def test_refuses_a_parent_id_in_another_list(self):
+        story = _story_with("child", clickup_id="T1", parent="OUTSIDE")
+        ctx = self._ctx([story])
+        elsewhere = _cu_task_parent("OUTSIDE", None)
+        elsewhere["list"] = {"id": "111111"}  # not the project's list (999999)
+        with mock.patch.object(clickup, "clickup_get_task", return_value=elsewhere), \
+             mock.patch.object(clickup, "clickup_update_task") as put:
+            with pytest.raises(ValueError, match="different list"):
+                clickup._sync_parent("tok", "T1", _cu_task_parent("T1", None), story, ctx)
+        put.assert_not_called()
+
+    def test_allows_a_parent_id_in_the_same_list(self):
+        story = _story_with("child", clickup_id="T1", parent="OUTSIDE")
+        ctx = self._ctx([story])
+        same = _cu_task_parent("OUTSIDE", None)
+        same["list"] = {"id": "999999"}  # the project's list
+        with mock.patch.object(clickup, "clickup_get_task", return_value=same), \
+             mock.patch.object(clickup, "clickup_update_task") as put:
+            assert clickup._sync_parent(
+                "tok", "T1", _cu_task_parent("T1", None), story, ctx
+            ) is True
+        put.assert_called_once_with("tok", "T1", {"parent": "OUTSIDE"})
+
+    def test_in_file_parent_costs_no_extra_fetch(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1", parent="Export hub"),
+        ]
+        ctx = self._ctx(stories, cu_by_id={"HUB": _cu_task_parent("HUB", None)})
+        with mock.patch.object(clickup, "clickup_get_task") as get, \
+             mock.patch.object(clickup, "clickup_update_task"):
+            clickup._sync_parent("tok", "T1", _cu_task_parent("T1", None), stories[1], ctx)
+        get.assert_not_called()
+
+    def test_missing_parent_task_is_reported_not_pushed(self):
+        story = _story_with("child", clickup_id="T1", parent="NOSUCHID")
+        ctx = self._ctx([story])
+        with mock.patch.object(clickup, "clickup_get_task",
+                               side_effect=Exception("HTTP Error 404: Not Found")), \
+             mock.patch.object(clickup, "clickup_update_task") as put:
+            with pytest.raises(ValueError, match="could not be read"):
+                clickup._sync_parent("tok", "T1", _cu_task_parent("T1", None), story, ctx)
+        put.assert_not_called()
+
+    def test_dry_run_still_checks_membership(self):
+        story = _story_with("child", clickup_id="T1", parent="OUTSIDE")
+        ctx = self._ctx([story])
+        elsewhere = _cu_task_parent("OUTSIDE", None)
+        elsewhere["list"] = {"id": "111111"}
+        with mock.patch.object(clickup, "clickup_get_task", return_value=elsewhere):
+            with pytest.raises(ValueError, match="different list"):
+                clickup._sync_parent(
+                    "tok", "T1", _cu_task_parent("T1", None), story, ctx, dry_run=True
+                )

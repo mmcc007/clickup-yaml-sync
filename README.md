@@ -214,7 +214,8 @@ Resolution rules:
 
 - Matched **case-insensitively and trimmed** against story names in the same file.
 - A raw `clickup_id` is also accepted — that's how you reference a parent that
-  isn't a story in this file.
+  isn't a story in this file. It must still be **in the same list**: a parent in
+  another list is refused (see the warning below).
 - **Two stories sharing the referenced name is an error, not a guess.** Reference
   that parent by `clickup_id` instead.
 
@@ -242,8 +243,25 @@ base-tracked**, so a declared parent is applied rather than raised as a conflict
 > **Separate**) and save it, or a board that used to show flat rows will look like
 > it lost them. Status-group counts stay at top-level tasks either way.
 
+> **⚠️ A parent must be in the same list, and the tool enforces it.** ClickUp is
+> asymmetric here: *creating* a task under a parent in another list is refused
+> (`400 ITEM_137 "Parent not child of list"`), but a `PUT` **succeeds and silently
+> moves the task into the parent's list** — verified live. Since this tool sets
+> `parent` via `PUT`, an unchecked cross-list reference would relocate the story out
+> of the synced list, and the next sync would report it as `archived_in_clickup`. So
+> a parent outside the synced list is refused before the write (under `--dry-run`
+> too); a mistyped id fails with a readable error rather than a bare 400.
+
+> **⚠️ Deleting a parent deletes its children.** Verified live: deleting a hub took
+> its subtask with it (`GET` on the child → 404, gone from the list). If you're
+> moving off the hub-card-plus-`related` pattern, note the difference — deleting a
+> hub card used to leave its siblings alone. The tool never deletes tasks, but a
+> delete in the **UI** now destroys the children underneath.
+
 Also verified against the live API: nesting works at least 3 deep, a subtask stays
-in its parent's list, tags apply to subtasks normally, and there is **no status
+in its parent's list, tags **and the Epic dropdown** apply to subtasks normally
+(the dropdown reads back through the same `orderindex` shape the no-op-skip already
+handles, so an already-correct value isn't re-written), and there is **no status
 rollup** — completing every child leaves the parent's status alone (the rollup is a
 UI progress badge, not a field). Full evidence:
 [`docs/subtask-parent-findings.md`](docs/subtask-parent-findings.md).
@@ -428,7 +446,7 @@ nor pulled, and a value set in the ClickUp UI will be invisible to the YAML
 | assignees | ✅ | ✅ |
 | `depends_on` (waiting_on edges) | ✅ (push/sync/merge; UI-added edges preserved) | ✅ (pull/diff) |
 | `related` (non-blocking linked tasks) | ✅ (push/sync/merge; UI-added links preserved) | ✅ (pull/diff) |
-| `parent` (subtask hierarchy, by story name) | ✅ (push/sync/merge; set + re-parent in place, **cannot un-parent**) | ✅ (pull/diff) |
+| `parent` (subtask hierarchy, by story name) | ✅ (push/sync/merge; set + re-parent in place, same list only, **cannot un-parent**) | ✅ (pull/diff) |
 | tags | ✅ (additive; UI-added tags preserved) | ⚠️ epic placement only — UI tag *edits* are **not** pulled into YAML |
 | Epic dropdown (one configured custom field) | ✅ | ❌ |
 
