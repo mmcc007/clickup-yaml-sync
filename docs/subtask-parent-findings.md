@@ -66,11 +66,9 @@ honoured — that has to be an explicit, loud error, not a silent divergence.
   for the same list-scoped custom fields and the same sync run.
 - **Tags work on a subtask**: `POST /task/{child}/tag/probe-epic` → 200, and the tag
   comes back on read. The epic *tag* half of the epic grouping is therefore fine.
-- **Epic *dropdown* on a subtask: UNVERIFIED.** The sandbox list has no custom
-  fields (`GET /list/{id}/field` → `[]`) and the API cannot create one. Inference
-  only: custom fields are list-scoped and the subtask is in the same list, so the
-  same field set should apply. Verify on a list that has the dropdown before relying
-  on it.
+- **Epic *dropdown* on a subtask: VERIFIED** — see §8. (It was inference-only at
+  first pass, because the free sandbox list has no custom fields and the API cannot
+  create one.)
 - **No status rollup.** Setting a child to `complete` left the parent's status
   untouched. Rollup is a UI progress badge, not a field — consistent with rollup
   being a non-goal.
@@ -94,13 +92,9 @@ So nothing vanishes permanently, but **a board left on the default view mode wou
 show a hub row with a badge instead of the child rows it shows today.** That is a
 one-time per-view setting change, and it should be part of any rollout.
 
-## 6. Not tested
+## 6. Not tested at first pass
 
-- Cross-list parenting (child in list A, parent in list B). The tool syncs one list,
-  so a parent is always same-list; probe skipped it.
-- Cascade behaviour when a **parent is deleted** (children were deleted first). The
-  tool never deletes tasks, but a UI delete of a hub could take children with it.
-- The epic dropdown on a subtask (see §4).
+All three were closed later against a paid test workspace — see §8.
 
 ## 7. What this costs in the reconciler
 
@@ -136,3 +130,50 @@ creates so the id is always available by then.
 Rough size: ~150–200 lines in `clickup.py` closely modelled on the existing
 dependency/relation functions, plus schema docs and tests in the
 `tests/fixtures/live_list_edges.json` replay style.
+
+## 8. Follow-up verification (test workspace, 2026-07-29)
+
+The three open items needed a workspace with custom fields, which the free sandbox
+does not have. Re-probed against a dedicated **test** workspace (team
+`90141334779`, lists `test list 1` / `Test List 2`) via
+`tools/probe_subtask_custom_field.py`. That probe uses the production token, so in
+place of the `CLICKUP_SANDBOX` gate it holds a hard **allowlist of two list ids and
+re-checks each list's name before writing**. The live board is in a different
+workspace and is unreachable by it.
+
+### Epic dropdown on a subtask — works
+
+`POST /task/{child}/field/{field_id}` with an option id → 200. Read back on **both**
+the single-task and list endpoints as `"value": 0` — the option's *orderindex*, the
+same read shape the no-op-skip fix (BUG #13) already handles — and
+`_current_dropdown_option_id()` maps it back to the correct option UUID
+(`62f80e74-…`). So a subtask takes the Epic dropdown exactly like a top-level task,
+and an already-correct dropdown on a subtask is still skipped rather than re-PATCHed.
+
+### Cross-list parenting — asymmetric, and dangerous on the update path
+
+| Call | Result |
+|---|---|
+| `POST /list/A/task` with `parent` in list B | **400** `ITEM_137 "Parent not child of list"` |
+| `PUT /task/{in A}` with `parent` in list B | **200 — and the task is MOVED into list B** |
+
+Observed on the move: the child's `list.id` changed from A to B, it stopped being
+returned by a fetch of list A, and started being returned by list B. Since this tool
+always sets `parent` via `PUT` (never on create), that is the path it would take —
+and a task relocated out of the synced list is reported by the next sync as
+`archived_in_clickup`, i.e. the story silently leaves the board.
+
+**Guarded in code:** `_assert_parent_in_same_list()` refuses a parent whose list is
+not the one being synced, before the PUT, under `--dry-run` too. The check is free
+for a parent that is a story in the same YAML (synced to this list by construction)
+or already in the fetched task map; otherwise it costs one `GET`, which also turns a
+mistyped id into a clear error instead of an opaque 400.
+
+### Deleting a parent — CASCADES to its children
+
+Deleting a hub deleted its subtask with it: `GET` on the child returned **404** and
+it was gone from the list fetch. This is a behaviour change for boards moving off
+the hub-card pattern — with sibling tasks plus `related` chips, deleting the hub left
+the others alone. The tool never deletes tasks, so it cannot cause this; a **UI**
+delete of a hub can, and the children's stories would then be flagged
+`archived_in_clickup`.

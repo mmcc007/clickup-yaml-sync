@@ -1819,7 +1819,9 @@ class ParentPendingCreate(ValueError):
     """
 
 
-def _build_parent_context(data: dict) -> dict:
+def _build_parent_context(
+    data: dict, cu_by_id: Optional[dict] = None
+) -> dict:
     """Indexes ``parent`` resolution needs, built once per run.
 
     ``names``    -- ``name_lower -> [story, …]`` (a list, so a duplicated story
@@ -1828,6 +1830,10 @@ def _build_parent_context(data: dict) -> dict:
                     a readable name instead of an opaque id.
     ``ids``      -- every ``clickup_id`` in the file, so an explicit id reference
                     is recognised as such before the name lookup runs.
+    ``list_id``  -- the list being synced, so a parent in a DIFFERENT list can be
+                    refused before ClickUp silently relocates the child.
+    ``cu_by_id`` -- tasks already fetched from that list, so the membership check
+                    usually costs no extra API call.
     """
     names: dict[str, list[dict]] = {}
     name_by_id: dict[str, str] = {}
@@ -1842,7 +1848,13 @@ def _build_parent_context(data: dict) -> dict:
                 ids.add(str(cid))
                 if name:
                     name_by_id[str(cid)] = name
-    return {"names": names, "name_by_id": name_by_id, "ids": ids}
+    return {
+        "names": names,
+        "name_by_id": name_by_id,
+        "ids": ids,
+        "list_id": str((data.get("project") or {}).get("clickup_list_id") or ""),
+        "cu_by_id": cu_by_id or {},
+    }
 
 
 def _parent_display_ref(cu_parent_id: str, parent_ctx: dict) -> str:
@@ -1914,6 +1926,47 @@ def _resolve_parent_id(ref: str, parent_ctx: dict, self_id: Optional[str]) -> st
     return _check_self(ref)
 
 
+def _assert_parent_in_same_list(
+    token: str, parent_id: str, parent_ctx: dict, label: str
+) -> None:
+    """Refuse a parent that lives in a different ClickUp list.
+
+    Verified live: ``PUT /task/{id} {"parent": <task in another list>}`` returns
+    200 and **relocates the child into the parent's list**, where the next sync
+    sees it as ``archived_in_clickup`` — i.e. the story silently leaves the board.
+    (ClickUp's create endpoint refuses the same pairing outright: 400 ITEM_137
+    "Parent not child of list".) So membership is checked before the PUT.
+
+    Free when the parent is one of the tasks already fetched from this list;
+    otherwise one GET, which also turns a bad id into a clear error instead of an
+    opaque 400.
+    """
+    target_list = parent_ctx.get("list_id")
+    if not target_list:
+        return  # no list in context (bare unit call) — nothing to compare against
+    if parent_id in parent_ctx.get("ids", ()):
+        return  # a story in THIS yaml: synced to this list by construction. If it
+        # were moved out in the UI, sync reports it as archived, not as a parent bug.
+    if parent_id in (parent_ctx.get("cu_by_id") or {}):
+        return  # fetched from this list, so it is in it (a subtask shares its
+        # parent's list, so this holds for nested tasks too)
+    try:
+        parent_task = clickup_get_task(token, parent_id)
+    except Exception as e:
+        raise ValueError(
+            f"{label}: parent task {parent_id} could not be read ({e}) — check "
+            f"the id"
+        ) from e
+    parent_list = str((parent_task.get("list") or {}).get("id") or "")
+    if parent_list and parent_list != str(target_list):
+        raise ValueError(
+            f"{label}: parent task {parent_id} is in a different list "
+            f"({parent_list}, not {target_list}). ClickUp would MOVE this task "
+            f"into that list rather than reject it, and the next sync would see "
+            f"it as archived. Pick a parent in the list being synced."
+        )
+
+
 def _sync_parent(
     token: str,
     task_id: str,
@@ -1951,6 +2004,9 @@ def _sync_parent(
     desired = _resolve_parent_id(ref, parent_ctx, task_id)
     if desired == current:
         return False
+    # Checked under dry-run too: the whole point of the preview is to surface
+    # what the real run would do, and this one would relocate the task.
+    _assert_parent_in_same_list(token, desired, parent_ctx, label)
     if current and warn_on_remove:
         log.warning(
             f"    {'[DRY RUN] Would move' if dry_run else 'Moving'} {label} from "
@@ -2093,8 +2149,9 @@ def _reconcile_edges_pass(
     """
     declared_related = _build_declared_relations(data)
     # Built once: `parent` references stories by NAME, so resolution needs the
-    # whole-file view (and the ids the create pass just wrote back).
-    parent_ctx = _build_parent_context(data)
+    # whole-file view (and the ids the create pass just wrote back). cu_by_id
+    # makes the same-list check free for any parent already fetched.
+    parent_ctx = _build_parent_context(data, cu_by_id)
     for epic in data["epics"]:
         for story in epic.get("stories", []):
             cid = story.get("clickup_id")
