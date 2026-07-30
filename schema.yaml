@@ -275,6 +275,30 @@ properties:
                   type: string
                 example: ["86bade1f9"]
 
+              parent:
+                type: [string, "null"]
+                description: >
+                  Makes this story a SUBTASK of another task in ClickUp. The
+                  value is normally the parent story's `name` as written in this
+                  file (matched case-insensitively, trimmed) — it is resolved to
+                  a clickup_id by the relationship second pass, which runs after
+                  creates, so a brand-new parent and child link on the FIRST
+                  sync. A raw ClickUp id is also accepted, which is how a parent
+                  that lives outside this file is referenced. Two stories sharing
+                  the referenced name is an error, not a guess. Semantics mirror
+                  depends_on: OMIT this key to leave ClickUp's hierarchy
+                  untouched (a subtask nested in the UI survives); set it to
+                  make YAML authoritative (the task is moved under that parent
+                  in place — never delete+recreate). NOTE an empty value is only
+                  valid for a task that is already top-level: ClickUp's API
+                  cannot un-parent (PUT parent:null returns 200 and does
+                  nothing), so declaring no parent for an existing subtask is a
+                  loud error — promote it in the ClickUp UI instead. Reconciled
+                  by push/sync/merge; read back by pull and shown by diff. Not
+                  base-tracked (like the other edges), so a declared parent is
+                  applied rather than raised as a 3-way conflict.
+                example: "Export contacts hub"
+
               epic_dropdown_value:
                 type: [string, "null"]
                 description: >

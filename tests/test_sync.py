@@ -2581,3 +2581,383 @@ class TestLiveListEndpointEdgeShape:
         for lst, get in (("list_A", "get_A"), ("list_B", "get_B")):
             assert LIVE_EDGES[lst]["dependencies"] == LIVE_EDGES[get]["dependencies"]
             assert LIVE_EDGES[lst]["linked_tasks"] == LIVE_EDGES[get]["linked_tasks"]
+
+
+# ---------------------------------------------------------------------------
+# 13. Parent (subtask hierarchy): reference by story name, reconciled as an edge
+# ---------------------------------------------------------------------------
+
+
+def _cu_task_parent(task_id: str, parent: str | None = None) -> dict:
+    """A ClickUp task carrying a ``parent`` edge (the subtask shape)."""
+    base = _cu_task(task_id, [])
+    base["parent"] = parent
+    base["top_level_parent"] = parent
+    return base
+
+
+def _parent_data(stories: list[dict]) -> dict:
+    return _data_with({"Contact export": stories})
+
+
+class TestResolveParentId:
+    def test_resolves_by_story_name(self):
+        data = _parent_data([
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("Assign owners", clickup_id="T1", parent="Export hub"),
+        ])
+        ctx = clickup._build_parent_context(data)
+        assert clickup._resolve_parent_id("Export hub", ctx, "T1") == "HUB"
+
+    def test_name_match_is_case_insensitive_and_trimmed(self):
+        data = _parent_data([
+            _story_with("Export Hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1", parent="  export hub  "),
+        ])
+        ctx = clickup._build_parent_context(data)
+        assert clickup._resolve_parent_id("  export hub  ", ctx, "T1") == "HUB"
+
+    def test_accepts_a_raw_clickup_id_of_a_story_in_the_file(self):
+        data = _parent_data([
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1", parent="HUB"),
+        ])
+        ctx = clickup._build_parent_context(data)
+        assert clickup._resolve_parent_id("HUB", ctx, "T1") == "HUB"
+
+    def test_accepts_an_id_for_a_parent_outside_this_yaml(self):
+        # No story by that name and no whitespace -> treated as a literal id, so
+        # a hub that lives outside this file (or another list) still works.
+        data = _parent_data([_story_with("child", clickup_id="T1", parent="86bb5nbqg")])
+        ctx = clickup._build_parent_context(data)
+        assert clickup._resolve_parent_id("86bb5nbqg", ctx, "T1") == "86bb5nbqg"
+
+    def test_ambiguous_name_raises(self):
+        data = _parent_data([
+            _story_with("Export hub", clickup_id="HUB1"),
+            _story_with("Export hub", clickup_id="HUB2"),
+            _story_with("child", clickup_id="T1", parent="Export hub"),
+        ])
+        ctx = clickup._build_parent_context(data)
+        with pytest.raises(ValueError, match="ambiguous"):
+            clickup._resolve_parent_id("Export hub", ctx, "T1")
+
+    def test_unknown_name_raises(self):
+        data = _parent_data([_story_with("child", clickup_id="T1", parent="No such hub")])
+        ctx = clickup._build_parent_context(data)
+        with pytest.raises(ValueError, match="no story named"):
+            clickup._resolve_parent_id("No such hub", ctx, "T1")
+
+    def test_self_parent_by_name_raises(self):
+        data = _parent_data([_story_with("child", clickup_id="T1", parent="child")])
+        ctx = clickup._build_parent_context(data)
+        with pytest.raises(ValueError, match="its own parent"):
+            clickup._resolve_parent_id("child", ctx, "T1")
+
+    def test_self_parent_by_id_raises(self):
+        data = _parent_data([_story_with("child", clickup_id="T1", parent="T1")])
+        ctx = clickup._build_parent_context(data)
+        with pytest.raises(ValueError, match="its own parent"):
+            clickup._resolve_parent_id("T1", ctx, "T1")
+
+    def test_parent_without_clickup_id_raises_pending(self):
+        # The reconcile pass runs after creates, so this only happens when the
+        # parent's own create failed — say so rather than silently skipping.
+        data = _parent_data([
+            _story_with("Export hub"),  # never created
+            _story_with("child", clickup_id="T1", parent="Export hub"),
+        ])
+        ctx = clickup._build_parent_context(data)
+        with pytest.raises(ValueError, match="has no clickup_id"):
+            clickup._resolve_parent_id("Export hub", ctx, "T1")
+
+
+class TestSyncParent:
+    def _ctx(self, stories):
+        return clickup._build_parent_context(_parent_data(stories))
+
+    def test_no_key_is_noop(self):
+        story = _story_with("child", clickup_id="T1")  # no parent key
+        cu = _cu_task_parent("T1", "OLD")
+        ctx = self._ctx([story])
+        with mock.patch.object(clickup, "clickup_update_task") as put:
+            changed = clickup._sync_parent("tok", "T1", cu, story, ctx)
+        assert changed is False
+        put.assert_not_called()
+
+    def test_sets_parent_when_absent_remotely(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1", parent="Export hub"),
+        ]
+        cu = _cu_task_parent("T1", None)
+        with mock.patch.object(clickup, "clickup_update_task") as put:
+            changed = clickup._sync_parent("tok", "T1", cu, stories[1], self._ctx(stories))
+        assert changed is True
+        put.assert_called_once_with("tok", "T1", {"parent": "HUB"})
+
+    def test_already_correct_is_noop(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1", parent="Export hub"),
+        ]
+        cu = _cu_task_parent("T1", "HUB")
+        with mock.patch.object(clickup, "clickup_update_task") as put:
+            changed = clickup._sync_parent("tok", "T1", cu, stories[1], self._ctx(stories))
+        assert changed is False
+        put.assert_not_called()
+
+    def test_reparents_when_remote_differs(self):
+        stories = [
+            _story_with("New hub", clickup_id="HUB2"),
+            _story_with("child", clickup_id="T1", parent="New hub"),
+        ]
+        cu = _cu_task_parent("T1", "HUB1")
+        with mock.patch.object(clickup, "clickup_update_task") as put:
+            changed = clickup._sync_parent(
+                "tok", "T1", cu, stories[1], self._ctx(stories), warn_on_remove=True
+            )
+        assert changed is True
+        put.assert_called_once_with("tok", "T1", {"parent": "HUB2"})
+
+    def test_dry_run_makes_no_calls(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1", parent="Export hub"),
+        ]
+        cu = _cu_task_parent("T1", None)
+        with mock.patch.object(clickup, "clickup_update_task") as put:
+            changed = clickup._sync_parent(
+                "tok", "T1", cu, stories[1], self._ctx(stories), dry_run=True
+            )
+        assert changed is True
+        put.assert_not_called()
+
+    def test_declared_empty_with_no_remote_parent_is_noop(self):
+        # `parent:` present but empty means "top level" — already true remotely.
+        story = _story_with("child", clickup_id="T1", parent=None)
+        cu = _cu_task_parent("T1", None)
+        with mock.patch.object(clickup, "clickup_update_task") as put:
+            changed = clickup._sync_parent("tok", "T1", cu, story, self._ctx([story]))
+        assert changed is False
+        put.assert_not_called()
+
+    def test_declared_empty_with_remote_parent_raises(self):
+        # The API cannot un-parent (PUT parent:null is a silent 200 no-op), so
+        # this must fail loudly instead of diverging in silence.
+        story = _story_with("child", clickup_id="T1", parent=None)
+        cu = _cu_task_parent("T1", "HUB")
+        with mock.patch.object(clickup, "clickup_update_task") as put:
+            with pytest.raises(ValueError, match="cannot un-parent"):
+                clickup._sync_parent("tok", "T1", cu, story, self._ctx([story]))
+        put.assert_not_called()
+
+    def test_unresolvable_parent_raises(self):
+        story = _story_with("child", clickup_id="T1", parent="No such hub")
+        cu = _cu_task_parent("T1", None)
+        with pytest.raises(ValueError):
+            clickup._sync_parent("tok", "T1", cu, story, self._ctx([story]))
+
+
+class TestPullParent:
+    def test_pulls_remote_parent_as_story_name(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1"),  # no parent key
+        ]
+        ctx = clickup._build_parent_context(_parent_data(stories))
+        cu = _cu_task_parent("T1", "HUB")
+        assert clickup._pull_parent(stories[1], cu, ctx) is True
+        assert stories[1]["parent"] == "Export hub"
+
+    def test_pulls_raw_id_when_parent_not_in_yaml(self):
+        story = _story_with("child", clickup_id="T1")
+        ctx = clickup._build_parent_context(_parent_data([story]))
+        cu = _cu_task_parent("T1", "OUTSIDE")
+        assert clickup._pull_parent(story, cu, ctx) is True
+        assert story["parent"] == "OUTSIDE"
+
+    def test_no_change_when_name_already_resolves_to_remote_parent(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1", parent="Export hub"),
+        ]
+        ctx = clickup._build_parent_context(_parent_data(stories))
+        cu = _cu_task_parent("T1", "HUB")
+        assert clickup._pull_parent(stories[1], cu, ctx) is False
+        assert stories[1]["parent"] == "Export hub"  # not rewritten to the id
+
+    def test_remote_unparented_writes_empty_parent(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1", parent="Export hub"),
+        ]
+        ctx = clickup._build_parent_context(_parent_data(stories))
+        cu = _cu_task_parent("T1", None)  # promoted to top level in the UI
+        assert clickup._pull_parent(stories[1], cu, ctx) is True
+        assert stories[1]["parent"] is None
+
+    def test_both_empty_adds_no_key(self):
+        story = _story_with("child", clickup_id="T1")
+        ctx = clickup._build_parent_context(_parent_data([story]))
+        cu = _cu_task_parent("T1", None)
+        assert clickup._pull_parent(story, cu, ctx) is False
+        assert "parent" not in story
+
+    def test_new_story_from_clickup_records_parent_name(self):
+        stories = [_story_with("Export hub", clickup_id="HUB")]
+        ctx = clickup._build_parent_context(_parent_data(stories))
+        cu = _cu_task_parent("NEW", "HUB")
+        story = clickup._clickup_task_to_yaml_story(cu, SMAP, ctx)
+        assert story["parent"] == "Export hub"
+
+    def test_new_story_from_clickup_without_context_records_id(self):
+        cu = _cu_task_parent("NEW", "HUB")
+        story = clickup._clickup_task_to_yaml_story(cu, SMAP)
+        assert story["parent"] == "HUB"
+
+    def test_top_level_story_gets_no_parent_key(self):
+        story = clickup._clickup_task_to_yaml_story(_cu_task_parent("NEW", None), SMAP)
+        assert "parent" not in story
+
+
+class TestPushParentPass:
+    def _write(self, tmp_path, data):
+        p = tmp_path / "p.yaml"
+        with open(p, "w") as f:
+            yaml.safe_dump(data, f)
+        return str(p)
+
+    def test_existing_child_gets_parent_set(self, tmp_path):
+        data = _parent_data([
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("Assign owners", clickup_id="T1", parent="Export hub"),
+        ])
+        yaml_path = self._write(tmp_path, data)
+        cu_tasks = [_cu_task_parent("HUB", None), _cu_task_parent("T1", None)]
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_update_task") as put, \
+             mock.patch.object(clickup, "clickup_add_tag"), \
+             mock.patch.object(clickup, "clickup_remove_tag"), \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_push(data, yaml_path, dry_run=False,
+                             backup_path=None, backup_default=False)
+        parent_calls = [c for c in put.call_args_list if c.args[2] == {"parent": "HUB"}]
+        assert parent_calls and parent_calls[0].args[1] == "T1"
+
+    def test_new_parent_and_child_link_in_one_run(self, tmp_path):
+        # The headline case for name references: neither task has an id yet, so
+        # an id-only `parent:` would need two syncs.
+        data = _parent_data([
+            _story_with("Export hub"),
+            _story_with("Assign owners", parent="Export hub"),
+        ])
+        yaml_path = self._write(tmp_path, data)
+        created = iter([{"id": "HUB-NEW", "custom_id": None},
+                        {"id": "CHILD-NEW", "custom_id": None}])
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=[]), \
+             mock.patch.object(clickup, "clickup_create_task",
+                               side_effect=lambda *a, **k: next(created)), \
+             mock.patch.object(clickup, "clickup_update_task") as put, \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "save_yaml"):
+            clickup.cmd_push(data, yaml_path, dry_run=False,
+                             backup_path=None, backup_default=False)
+        assert [(c.args[1], c.args[2]) for c in put.call_args_list
+                if "parent" in c.args[2]] == [("CHILD-NEW", {"parent": "HUB-NEW"})]
+
+    def test_dry_run_makes_no_parent_call(self, tmp_path):
+        data = _parent_data([
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("Assign owners", clickup_id="T1", parent="Export hub"),
+        ])
+        yaml_path = self._write(tmp_path, data)
+        cu_tasks = [_cu_task_parent("HUB", None), _cu_task_parent("T1", None)]
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_update_task") as put, \
+             mock.patch.object(clickup, "clickup_set_custom_field"):
+            clickup.cmd_push(data, yaml_path, dry_run=True,
+                             backup_path=None, backup_default=False)
+        assert not [c for c in put.call_args_list if "parent" in c.args[2]]
+
+    def test_unresolvable_parent_counts_an_error_without_crashing(self, tmp_path):
+        data = _parent_data([
+            _story_with("Assign owners", clickup_id="T1", parent="No such hub"),
+        ])
+        yaml_path = self._write(tmp_path, data)
+        with mock.patch.object(clickup, "clickup_list_tasks",
+                               return_value=[_cu_task_parent("T1", None)]), \
+             mock.patch.object(clickup, "clickup_update_task"), \
+             mock.patch.object(clickup, "clickup_add_tag"), \
+             mock.patch.object(clickup, "clickup_remove_tag"), \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             mock.patch.object(clickup, "save_yaml"):
+            stats = clickup.cmd_push(data, yaml_path, dry_run=False,
+                                     backup_path=None, backup_default=False)
+        assert stats["errors"] >= 1
+
+    def test_dry_run_previews_parent_for_a_pending_create(self, tmp_path, caplog):
+        data = _parent_data([
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("Assign owners", parent="Export hub"),  # would be created
+        ])
+        yaml_path = self._write(tmp_path, data)
+        with mock.patch.object(clickup, "clickup_list_tasks",
+                               return_value=[_cu_task_parent("HUB", None)]), \
+             mock.patch.object(clickup, "clickup_set_custom_field"), \
+             caplog.at_level("INFO"):
+            clickup.cmd_push(data, yaml_path, dry_run=True,
+                             backup_path=None, backup_default=False)
+        assert "parent" in caplog.text.lower()
+
+
+class TestDiffParent:
+    def test_diff_reports_a_parent_mismatch(self, tmp_path, caplog):
+        data = _parent_data([
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("Assign owners", clickup_id="T1", parent="Export hub"),
+        ])
+        cu_tasks = [_cu_task_parent("HUB", None), _cu_task_parent("T1", None)]
+        with mock.patch.object(clickup, "clickup_list_tasks", return_value=cu_tasks), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=[]), \
+             caplog.at_level("INFO"):
+            clickup.cmd_diff(data)
+        assert "parent" in caplog.text.lower()
+
+
+class TestParentRoundTripSafety:
+    """A pulled `parent` must be a value push can resolve again."""
+
+    def test_pull_writes_id_not_an_ambiguous_name(self):
+        # Two stories share the parent's name, so the NAME form would be refused
+        # by _resolve_parent_id on the next push — write the id instead.
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("Export hub", clickup_id="HUB2"),
+            _story_with("child", clickup_id="T1"),
+        ]
+        ctx = clickup._build_parent_context(_parent_data(stories))
+        cu = _cu_task_parent("T1", "HUB")
+        assert clickup._pull_parent(stories[2], cu, ctx) is True
+        assert stories[2]["parent"] == "HUB"
+        # And the value written round-trips.
+        assert clickup._resolve_parent_id(stories[2]["parent"], ctx, "T1") == "HUB"
+
+    def test_import_writes_id_not_an_ambiguous_name(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("Export hub", clickup_id="HUB2"),
+        ]
+        ctx = clickup._build_parent_context(_parent_data(stories))
+        story = clickup._clickup_task_to_yaml_story(_cu_task_parent("NEW", "HUB"), SMAP, ctx)
+        assert story["parent"] == "HUB"
+
+    def test_pulled_name_survives_a_push_resolution(self):
+        stories = [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("child", clickup_id="T1"),
+        ]
+        ctx = clickup._build_parent_context(_parent_data(stories))
+        clickup._pull_parent(stories[1], _cu_task_parent("T1", "HUB"), ctx)
+        assert clickup._resolve_parent_id(stories[1]["parent"], ctx, "T1") == "HUB"
