@@ -1761,6 +1761,247 @@ def _pull_relations(story: dict, cu_task: dict) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Parent (subtask hierarchy) — reconciled as an edge, referenced by story NAME
+# ---------------------------------------------------------------------------
+#
+# Semantics mirror ``depends_on``/``related`` — YAML-authoritative when the key
+# is present:
+#   - no ``parent`` key      -> UNMANAGED: ClickUp hierarchy untouched (a
+#                               subtask nested in the UI survives).
+#   - ``parent: <ref>``      -> MANAGED: the task is moved under that parent.
+#   - ``parent:`` (empty)    -> MANAGED, top-level. Satisfiable only when the
+#                               task already HAS no remote parent — see below.
+#
+# ``<ref>`` is normally the parent story's ``name`` as written in this YAML,
+# resolved to a ``clickup_id`` at reconcile time (``_resolve_parent_id``). Names
+# are matched case-insensitively and trimmed. A raw ``clickup_id`` is also
+# accepted, which is what makes a parent living outside this file (or pulled
+# back from ClickUp) expressible.
+#
+# Why names and not ids (as ``depends_on`` uses): the reconcile pass runs AFTER
+# the create pass, so a parent created in the same run already has its id
+# written back — a name reference therefore links a brand-new parent and child
+# on the FIRST sync, where an id reference could not (the id does not exist
+# until that run creates it). It also reads as hierarchy in the file, which is
+# the point of the feature (#20).
+#
+# Sandbox-verified constraints (docs/subtask-parent-findings.md):
+#   - ``parent`` is settable AND changeable via ``PUT /task/{id}`` — a re-parent
+#     is an in-place update, never delete+recreate, so the
+#     in-place-by-``clickup_id`` invariant holds.
+#   - There is NO un-parent: ``PUT {"parent": null}`` and ``{"parent": ""}``
+#     both return 200 and change nothing. So a declared-empty ``parent`` on a
+#     task that IS a subtask cannot be honoured — that raises rather than
+#     silently diverging. Promoting a child back to top level is a UI action.
+#
+# Like the other edges, ``parent`` is deliberately NOT base-tracked: sync
+# APPLIES a declared parent rather than surfacing it as a 3-way conflict.
+#
+# A newly created child therefore costs one extra ``PUT`` (create, then parent in
+# the second pass) instead of passing ``parent`` on create. That is deliberate:
+# one code path handles create and re-parent alike, and it is what lets a
+# name reference point at a parent created later in the same run.
+
+# Sentinel for "no pull needed" — the pull target itself can legitimately be
+# ``None`` (remote task was promoted to top level), so ``None`` cannot mean
+# "nothing to do" the way it does for the list-valued edges.
+_NO_PARENT_CHANGE = object()
+
+
+class ParentPendingCreate(ValueError):
+    """The named parent story exists in YAML but has no ``clickup_id`` yet.
+
+    Distinguished from other resolution failures because it means opposite
+    things per caller: under ``--dry-run`` it is the *expected* state for a
+    parent the real run will create (preview it), whereas in a real run — where
+    the create pass has already written ids back — it means that create failed.
+    """
+
+
+def _build_parent_context(data: dict) -> dict:
+    """Indexes ``parent`` resolution needs, built once per run.
+
+    ``names``    -- ``name_lower -> [story, …]`` (a list, so a duplicated story
+                    name is detectable and can be refused instead of guessed at).
+    ``name_by_id`` -- ``clickup_id -> name``, for writing a pulled parent back as
+                    a readable name instead of an opaque id.
+    ``ids``      -- every ``clickup_id`` in the file, so an explicit id reference
+                    is recognised as such before the name lookup runs.
+    """
+    names: dict[str, list[dict]] = {}
+    name_by_id: dict[str, str] = {}
+    ids: set[str] = set()
+    for epic in data.get("epics", []):
+        for story in epic.get("stories", []):
+            name = str(story.get("name", "")).strip()
+            if name:
+                names.setdefault(name.lower(), []).append(story)
+            cid = story.get("clickup_id")
+            if cid:
+                ids.add(str(cid))
+                if name:
+                    name_by_id[str(cid)] = name
+    return {"names": names, "name_by_id": name_by_id, "ids": ids}
+
+
+def _parent_display_ref(cu_parent_id: str, parent_ctx: dict) -> str:
+    """How to WRITE a remote parent id into YAML: its story name, or the id.
+
+    The name is only used when it is unambiguous in this file — a name shared by
+    two stories is exactly what ``_resolve_parent_id`` refuses, so writing it
+    would produce YAML that the next push rejects. Falls back to the id, which
+    always resolves.
+    """
+    cu_parent_id = str(cu_parent_id)
+    name = parent_ctx.get("name_by_id", {}).get(cu_parent_id)
+    if not name:
+        return cu_parent_id
+    if len(parent_ctx.get("names", {}).get(name.lower(), [])) > 1:
+        return cu_parent_id
+    return name
+
+
+def _parent_ref(story: dict) -> Optional[str]:
+    """The story's declared ``parent`` reference, trimmed; ``None`` when empty."""
+    raw = story.get("parent")
+    if raw is None:
+        return None
+    ref = str(raw).strip()
+    return ref or None
+
+
+def _resolve_parent_id(ref: str, parent_ctx: dict, self_id: Optional[str]) -> str:
+    """Resolve a ``parent`` reference to a ClickUp task id.
+
+    Precedence: an explicit ``clickup_id`` of a story in this file, then a story
+    NAME, then a bare token treated as a literal id (a parent outside this YAML).
+
+    Raises ``ValueError`` — never guesses — when the reference is ambiguous,
+    unknown, self-referential, or names a story that has no id yet. The caller
+    turns that into a counted error: a parent that silently failed to apply is
+    exactly the drift this feature exists to remove.
+    """
+    ref = str(ref).strip()
+    self_id = str(self_id) if self_id else None
+
+    def _check_self(target: str) -> str:
+        if self_id and target == self_id:
+            raise ValueError(f"a task cannot be its own parent (parent: '{ref}')")
+        return target
+
+    if ref in parent_ctx.get("ids", ()):
+        return _check_self(ref)
+
+    candidates = parent_ctx.get("names", {}).get(ref.lower(), [])
+    if len(candidates) > 1:
+        raise ValueError(
+            f"parent: '{ref}' is ambiguous — {len(candidates)} stories share that "
+            f"name; reference the parent by its clickup_id instead"
+        )
+    if candidates:
+        cid = candidates[0].get("clickup_id")
+        if not cid:
+            raise ParentPendingCreate(
+                f"parent story '{ref}' has no clickup_id yet"
+            )
+        return _check_self(str(cid))
+
+    if not ref or any(c.isspace() for c in ref):
+        raise ValueError(f"parent: '{ref}' — no story named that in this YAML")
+    # No name match and no whitespace: a literal id for a parent outside this
+    # file. Push it as given; ClickUp rejects a bad id loudly.
+    return _check_self(ref)
+
+
+def _sync_parent(
+    token: str,
+    task_id: str,
+    cu_task: dict,
+    story: dict,
+    parent_ctx: dict,
+    dry_run: bool = False,
+    warn_on_remove: bool = False,
+) -> bool:
+    """Reconcile a task's ``parent`` edge to match the story's ``parent``.
+
+    No-op (preserves a UI-built hierarchy) when the story has no ``parent`` key.
+    Returns True if a change was made — or would be, under ``dry_run``.
+    Raises ``ValueError`` when the declared parent cannot be applied.
+    """
+    if "parent" not in story:
+        return False
+    current = cu_task.get("parent")
+    current = str(current) if current else None
+    ref = _parent_ref(story)
+    label = _edge_label(story, task_id)
+
+    if ref is None:
+        # Declared top-level. Already true -> nothing to do. Otherwise refuse:
+        # the API has no un-parent (verified — PUT parent:null is a silent 200).
+        if current is None:
+            return False
+        raise ValueError(
+            f"{label} declares no parent but ClickUp has it nested under "
+            f"{current}; the API cannot un-parent a task (PUT parent:null is a "
+            f"silent no-op). Promote it in the ClickUp UI, or restore the "
+            f"`parent:` value in YAML."
+        )
+
+    desired = _resolve_parent_id(ref, parent_ctx, task_id)
+    if desired == current:
+        return False
+    if current and warn_on_remove:
+        log.warning(
+            f"    {'[DRY RUN] Would move' if dry_run else 'Moving'} {label} from "
+            f"parent {current} to {desired} — parent is YAML-authoritative and "
+            f"not base-tracked, so a hierarchy change made in the UI is lost."
+        )
+    if dry_run:
+        log.info(
+            f"    [DRY RUN] Would set parent on {label}: "
+            f"{current or '(top level)'} -> {desired} ('{ref}')"
+        )
+        return True
+    clickup_update_task(token, task_id, {"parent": desired})
+    log.info(f"    Set parent: {label} -> {desired} ('{ref}')")
+    return True
+
+
+def _parent_pull_target(story: dict, cu_task: dict, parent_ctx: dict) -> Any:
+    """The ``parent`` value a pull would write, or ``_NO_PARENT_CHANGE``.
+
+    Pure (no mutation) so the dry-run preview and the real pull share one rule.
+    Prefers the parent story's NAME (the authoring form) and falls back to the
+    raw id when the parent isn't a story in this YAML.
+    """
+    cu_parent = cu_task.get("parent")
+    cu_parent = str(cu_parent) if cu_parent else None
+    if cu_parent is None:
+        # Remote is top-level: only a story that CLAIMS a parent needs writing.
+        if _parent_ref(story) is None:
+            return _NO_PARENT_CHANGE
+        return None
+    # Already pointing at this parent (by name or id)? Leave the wording alone.
+    ref = _parent_ref(story)
+    if ref is not None:
+        try:
+            if _resolve_parent_id(ref, parent_ctx, story.get("clickup_id")) == cu_parent:
+                return _NO_PARENT_CHANGE
+        except ValueError:
+            pass  # unresolvable locally — the remote value is the truth, write it
+    return _parent_display_ref(cu_parent, parent_ctx)
+
+
+def _pull_parent(story: dict, cu_task: dict, parent_ctx: dict) -> bool:
+    """Read ClickUp's ``parent`` edge back into the YAML story. True if changed."""
+    target = _parent_pull_target(story, cu_task, parent_ctx)
+    if target is _NO_PARENT_CHANGE:
+        return False
+    story["parent"] = target
+    return True
+
+
 def _declared_edge_ids(story: dict, key: str) -> set[str]:
     """The non-blank ids a story declares under ``key`` (``depends_on``/``related``)."""
     return {str(x).strip() for x in (story.get(key) or []) if str(x).strip()}
@@ -1787,7 +2028,9 @@ def _warn_edge_target_overlap(story: dict, task_id: str) -> None:
     )
 
 
-def _preview_pending_create_edges(token: str, story: dict) -> None:
+def _preview_pending_create_edges(
+    token: str, story: dict, parent_ctx: Optional[dict] = None
+) -> None:
     """Preview the edges a story that would be CREATED this run declares.
 
     Under ``--dry-run`` no task is created, so the story still has no
@@ -1795,10 +2038,34 @@ def _preview_pending_create_edges(token: str, story: dict) -> None:
     appear in the real run, having never been previewed. Reconcile against a
     synthetic edge-free task so additions still surface; a task that does not
     exist yet has no edges to remove, so nothing destructive is hidden here.
+
+    A declared ``parent`` may itself point at a story pending create (no id yet),
+    which ``_resolve_parent_id`` refuses — under dry-run that is expected, not an
+    error, so it is reported as pending rather than raised.
     """
-    cu_task = {"id": PENDING_CREATE_ID, "dependencies": [], "linked_tasks": []}
+    cu_task = {
+        "id": PENDING_CREATE_ID, "dependencies": [], "linked_tasks": [], "parent": None,
+    }
     _sync_dependencies(token, PENDING_CREATE_ID, cu_task, story, dry_run=True)
     _sync_relations(token, PENDING_CREATE_ID, cu_task, story, dry_run=True)
+    if "parent" in story:
+        try:
+            _sync_parent(
+                token, PENDING_CREATE_ID, cu_task, story, parent_ctx or {}, dry_run=True
+            )
+        except ParentPendingCreate:
+            # The parent is being created by this same run, so it has no id to
+            # name yet. Expected under dry-run — preview it rather than error.
+            log.info(
+                f"    [DRY RUN] Would set parent on "
+                f"{_edge_label(story, PENDING_CREATE_ID)} -> "
+                f"'{_parent_ref(story)}' (id assigned when it is created)"
+            )
+        except ValueError as e:
+            log.error(
+                f"    [DRY RUN] Parent on "
+                f"{_edge_label(story, PENDING_CREATE_ID)} cannot be applied: {e}"
+            )
 
 
 def _reconcile_edges_pass(
@@ -1809,7 +2076,7 @@ def _reconcile_edges_pass(
     dry_run: bool,
     warn_on_remove: bool = False,
 ) -> None:
-    """Reconcile dependency + relation edges for every managed story.
+    """Reconcile dependency, relation and parent edges for every managed story.
 
     The relationship-reconcile **second pass**, shared by ``cmd_push``,
     ``cmd_sync``, and ``cmd_merge``. Runs after the create/update pass so a task
@@ -1825,10 +2092,17 @@ def _reconcile_edges_pass(
     sync/merge pass True so a destructive removal is never silent.
     """
     declared_related = _build_declared_relations(data)
+    # Built once: `parent` references stories by NAME, so resolution needs the
+    # whole-file view (and the ids the create pass just wrote back).
+    parent_ctx = _build_parent_context(data)
     for epic in data["epics"]:
         for story in epic.get("stories", []):
             cid = story.get("clickup_id")
-            if "depends_on" not in story and "related" not in story:
+            if (
+                "depends_on" not in story
+                and "related" not in story
+                and "parent" not in story
+            ):
                 continue
             _warn_edge_target_overlap(story, cid or PENDING_CREATE_ID)
             if not cid:
@@ -1836,10 +2110,10 @@ def _reconcile_edges_pass(
                 # one back, so this is the dry-run case: preview the edges
                 # instead of going silent about them (they WOULD be applied).
                 if dry_run:
-                    _preview_pending_create_edges(token, story)
+                    _preview_pending_create_edges(token, story, parent_ctx)
                 continue
             cu_task = cu_by_id.get(cid) or {
-                "id": cid, "dependencies": [], "linked_tasks": []
+                "id": cid, "dependencies": [], "linked_tasks": [], "parent": None
             }
             try:
                 _sync_dependencies(
@@ -1861,6 +2135,14 @@ def _reconcile_edges_pass(
                 log.error(
                     f"  Failed to reconcile relations for {story['name']}: {e}"
                 )
+                stats["errors"] += 1
+            try:
+                _sync_parent(
+                    token, cid, cu_task, story, parent_ctx,
+                    dry_run=dry_run, warn_on_remove=warn_on_remove,
+                )
+            except Exception as e:
+                log.error(f"  Failed to reconcile parent for {story['name']}: {e}")
                 stats["errors"] += 1
 
 
@@ -2293,6 +2575,7 @@ def cmd_pull(
 
     story_index = build_story_id_index(data)
     epic_name_map = build_epic_name_map(data)
+    parent_ctx = _build_parent_context(data)
     seen_cu_ids: set[str] = set()
 
     for cu_task in cu_tasks:
@@ -2348,9 +2631,21 @@ def cmd_pull(
             elif _pull_relations(story, cu_task):
                 log.info(f"  Pulled relations for '{story['name']}': "
                          f"{story.get('related')}")
+            # Parent (subtask hierarchy) — likewise not a compare_task field, so
+            # a nesting change made in the UI round-trips into YAML here.
+            if dry_run:
+                ptarget = _parent_pull_target(story, cu_task, parent_ctx)
+                if ptarget is not _NO_PARENT_CHANGE:
+                    log.info(f"  [DRY RUN] Would pull parent for "
+                             f"'{story['name']}': "
+                             f"{story.get('parent', '(unmanaged)')} -> "
+                             f"{ptarget or '(top level)'}")
+            elif _pull_parent(story, cu_task, parent_ctx):
+                log.info(f"  Pulled parent for '{story['name']}': "
+                         f"{story.get('parent') or '(top level)'}")
         else:
             # New task from ClickUp — place by epic tag
-            new_story = _clickup_task_to_yaml_story(cu_task, status_map)
+            new_story = _clickup_task_to_yaml_story(cu_task, status_map, parent_ctx)
             epic_key = _extract_epic_name_from_tags(cu_task, epic_name_map)
             if epic_key is not None:
                 target_ei = epic_name_map[epic_key]
@@ -2407,8 +2702,16 @@ def _sync_metadata(yaml_task: dict, cu_task: dict) -> None:
         yaml_task["task_id"] = cu_custom_id
 
 
-def _clickup_task_to_yaml_story(cu_task: dict, status_map: dict) -> dict:
-    """Convert a ClickUp task to a YAML story dict."""
+def _clickup_task_to_yaml_story(
+    cu_task: dict, status_map: dict, parent_ctx: Optional[dict] = None
+) -> dict:
+    """Convert a ClickUp task to a YAML story dict.
+
+    ``parent_ctx`` (from ``_build_parent_context``) lets a subtask's ``parent``
+    be written as the parent story's readable NAME; without it the raw id is
+    used, which pushes back identically. Before this, a subtask imported from
+    ClickUp lost its hierarchy and landed as a flat top-level story.
+    """
     story = {
         "name": cu_task.get("name", ""),
         "clickup_id": cu_task["id"],
@@ -2429,6 +2732,9 @@ def _clickup_task_to_yaml_story(cu_task: dict, status_map: dict) -> dict:
     rel_ids = _cu_linked_ids(cu_task)
     if rel_ids:
         story["related"] = sorted(rel_ids)
+    cu_parent = cu_task.get("parent")
+    if cu_parent:
+        story["parent"] = _parent_display_ref(str(cu_parent), parent_ctx or {})
     return story
 
 
@@ -2469,6 +2775,7 @@ def cmd_diff(data: dict) -> dict:
     assignee_resolver = _build_assignee_resolver(
         clickup_get_list_members(token, list_id)
     )
+    parent_ctx = _build_parent_context(data)
 
     log.info(f"\n{'='*80}")
     log.info("DIFF REPORT")
@@ -2505,7 +2812,9 @@ def cmd_diff(data: dict) -> dict:
                 d_diff = dep_target is not None
                 rel_target = _relations_pull_target(story, cu_task)
                 r_diff = rel_target is not None
-                if diffs or a_diff or d_diff or r_diff:
+                p_target = _parent_pull_target(story, cu_task, parent_ctx)
+                p_diff = p_target is not _NO_PARENT_CHANGE
+                if diffs or a_diff or d_diff or r_diff or p_diff:
                     if not has_stories:
                         log.info(f"[{tag}] {epic['name']}:")
                         has_stories = True
@@ -2527,6 +2836,16 @@ def cmd_diff(data: dict) -> dict:
                         y = story.get("related", "(unmanaged)")
                         r = sorted(_cu_linked_ids(cu_task))
                         log.info(f"    related: YAML='{y}' vs ClickUp='{r}'")
+                    if p_diff:
+                        y = story.get("parent", "(unmanaged)")
+                        cu_p = cu_task.get("parent")
+                        # YAML names its parent, ClickUp only knows the id —
+                        # show both sides in the same terms where we can.
+                        r = (
+                            f"{parent_ctx['name_by_id'].get(str(cu_p), str(cu_p))} "
+                            f"({cu_p})" if cu_p else "(top level)"
+                        )
+                        log.info(f"    parent: YAML='{y}' vs ClickUp='{r}'")
                     stats["mismatches"] += 1
                 else:
                     stats["synced"] += 1
@@ -3005,10 +3324,13 @@ def cmd_sync(
 
     # Phase 3: ClickUp tasks not in YAML -> create in YAML
     epic_name_map = build_epic_name_map(data)
+    # Rebuilt here, after phase 2 wrote back the ids of tasks created this run,
+    # so an imported subtask can name its parent instead of citing its id.
+    import_parent_ctx = _build_parent_context(data)
     for cu_task in cu_tasks:
         if cu_task["id"] in all_yaml_ids:
             continue
-        new_story = _clickup_task_to_yaml_story(cu_task, status_map)
+        new_story = _clickup_task_to_yaml_story(cu_task, status_map, import_parent_ctx)
         epic_key = _extract_epic_name_from_tags(cu_task, epic_name_map)
         if epic_key is not None:
             target_ei = epic_name_map[epic_key]

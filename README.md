@@ -183,6 +183,71 @@ back by `pull`, and shown by `diff`.
 > before removing any edge** (dependency or relation) so a destructive deletion is
 > never silent; `push` removes silently by its authoritative-overwrite contract.
 
+## Parent / child (subtasks)
+
+A story can declare a `parent` — that makes it a real ClickUp **subtask**, so the
+`epics → stories` hierarchy in the YAML survives the round-trip instead of being
+flattened into a hub card plus prose. **The reference is the parent story's `name`**,
+resolved to its `clickup_id` at push time:
+
+```yaml
+epics:
+  - name: Contact export
+    stories:
+      - name: Export contacts hub          # the parent
+        clickup_id: 860000010
+      - name: Assign owners
+        clickup_id: 860000011
+        parent: Export contacts hub        # by name, not by id
+      - name: API write-back
+        clickup_id: 860000012
+        parent: Export contacts hub
+```
+
+Why names rather than ids (as `depends_on` uses): the reconcile pass runs **after**
+creates, so a parent created in the same run already has its id written back — a
+name reference therefore links a brand-new parent *and* child on the **first** sync,
+where an id reference could not (the id doesn't exist until that run creates it). It
+also reads as hierarchy in the file, which is the point.
+
+Resolution rules:
+
+- Matched **case-insensitively and trimmed** against story names in the same file.
+- A raw `clickup_id` is also accepted — that's how you reference a parent that
+  isn't a story in this file.
+- **Two stories sharing the referenced name is an error, not a guess.** Reference
+  that parent by `clickup_id` instead.
+
+| YAML on the story | Behaviour |
+|---|---|
+| no `parent` key | **Unmanaged** — ClickUp hierarchy untouched (a subtask nested in the UI survives) |
+| `parent: <name or id>` | **Authoritative** — the task is moved under that parent, **in place** |
+| `parent:` (empty) | **Top-level** — valid only if the task already *is* top-level (see below) |
+
+Reconciled by the same second pass as `depends_on`/`related` (`push`/`sync`/`merge`),
+read back by `pull`, shown by `diff`, and — like the other edges — **not
+base-tracked**, so a declared parent is applied rather than raised as a conflict.
+
+> **⚠️ There is no un-parent.** Sandbox-verified: `PUT /task/{id}` with
+> `{"parent": null}` **or** `{"parent": ""}` returns **HTTP 200 and changes
+> nothing**. So clearing a `parent:` on a story that *is* a subtask cannot be
+> honoured — the tool **fails loudly** (counted as an error) rather than silently
+> diverging. Promote the task to top level in the ClickUp UI, then pull. Setting
+> and *changing* a parent both work fine, in place — never delete+recreate.
+
+> **⚠️ Subtasks are hidden in the default List view.** ClickUp's List view has a
+> `Subtasks` control with **Collapsed (default) / Expanded / Separate**. Under the
+> default the child rows are **not rendered** — the parent row shows a disclosure
+> triangle and a `⑂ N` badge instead. Switch the view to **Expanded** (or
+> **Separate**) and save it, or a board that used to show flat rows will look like
+> it lost them. Status-group counts stay at top-level tasks either way.
+
+Also verified against the live API: nesting works at least 3 deep, a subtask stays
+in its parent's list, tags apply to subtasks normally, and there is **no status
+rollup** — completing every child leaves the parent's status alone (the rollup is a
+UI progress badge, not a field). Full evidence:
+[`docs/subtask-parent-findings.md`](docs/subtask-parent-findings.md).
+
 ## Descriptions (markdown / task-reference safe)
 
 Descriptions are read as `markdown_description` and written as `markdown_content`,
@@ -363,6 +428,7 @@ nor pulled, and a value set in the ClickUp UI will be invisible to the YAML
 | assignees | ✅ | ✅ |
 | `depends_on` (waiting_on edges) | ✅ (push/sync/merge; UI-added edges preserved) | ✅ (pull/diff) |
 | `related` (non-blocking linked tasks) | ✅ (push/sync/merge; UI-added links preserved) | ✅ (pull/diff) |
+| `parent` (subtask hierarchy, by story name) | ✅ (push/sync/merge; set + re-parent in place, **cannot un-parent**) | ✅ (pull/diff) |
 | tags | ✅ (additive; UI-added tags preserved) | ⚠️ epic placement only — UI tag *edits* are **not** pulled into YAML |
 | Epic dropdown (one configured custom field) | ✅ | ❌ |
 
