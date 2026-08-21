@@ -3960,3 +3960,75 @@ class TestHeadMovedDuringRun:
     def test_a_pinned_copy_has_no_head_to_compare(self, capsys):
         clickup.warn_if_head_moved(None, "sync")
         assert capsys.readouterr().err == ""
+
+
+# ---------------------------------------------------------------------------
+# push now strips a tag dropped from the YAML (it never used to)
+# ---------------------------------------------------------------------------
+#
+# `cmd_sync` unioned the base snapshot's managed_tags; `cmd_push` did not. So a
+# tag removed from `tags:` was stripped by sync and silently left behind by
+# push — for the whole life of the feature, on every board.
+#
+# Both halves were already unit-tested: _collect_managed_tag_universe has tests,
+# load_base_managed_tags has tests. What had no test was the WIRING between
+# them, which is exactly how the two call sites diverged. These tests cover the
+# join, and the two commands now share one function so a future fix cannot land
+# in only one of them.
+
+
+class TestManagedTagUniverseForRun:
+    def _data(self, tags: list[str]) -> dict:
+        return {
+            "project": {"name": "p", "clickup_list_id": "L1"},
+            "status_map": {},
+            "epics": [_epic_with("Delivery", [_story_with("card", tags=tags, clickup_id="T1")])],
+        }
+
+    def test_includes_what_the_yaml_declares_now(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        universe = clickup.managed_tag_universe_for(self._data(["alpha"]), str(f), "L1")
+        assert "alpha" in universe
+
+    def test_includes_what_was_managed_at_the_last_snapshot(self, tmp_path):
+        """The half that was missing from push. A tag dropped from the YAML is
+        no longer in the current universe, so without this it looks like an
+        untouched UI tag and is preserved forever — the reconcile can only
+        remove what it knows it owns."""
+        f = tmp_path / "project-tasks.yaml"
+        clickup.save_base_snapshot(
+            clickup.base_snapshot_path(str(f), "L1"), self._data(["dropped-later"]), {}
+        )
+        universe = clickup.managed_tag_universe_for(self._data(["kept"]), str(f), "L1")
+        assert "kept" in universe
+        assert "dropped-later" in universe, \
+            "a tag dropped since the last run must stay managed so it can be removed"
+
+    def test_a_ui_added_tag_is_never_in_the_universe(self, tmp_path):
+        """The guarantee this must not break: tags a human added in the ClickUp
+        UI are preserved, because they were never ours."""
+        f = tmp_path / "project-tasks.yaml"
+        universe = clickup.managed_tag_universe_for(self._data(["alpha"]), str(f), "L1")
+        assert "someones-ui-tag" not in universe
+
+    def test_no_snapshot_yet_is_not_an_error(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        assert "alpha" in clickup.managed_tag_universe_for(self._data(["alpha"]), str(f), "L1")
+
+
+class TestPushAndSyncShareOneUniverse:
+    def test_both_commands_call_the_same_function(self):
+        """The bug was two call sites where only one had the union. Pinning that
+        they now share one function is the thing that stops it recurring —
+        checking the outputs match would pass again the moment someone
+        reintroduces a second, subtly different call site."""
+        import inspect
+        push_src = inspect.getsource(clickup.cmd_push)
+        sync_src = inspect.getsource(clickup.cmd_sync)
+        assert "managed_tag_universe_for(" in push_src
+        assert "managed_tag_universe_for(" in sync_src
+        assert "_collect_managed_tag_universe(" not in push_src, \
+            "push must not compute the universe itself — that is how it drifted"
+        assert "_collect_managed_tag_universe(" not in sync_src
+        assert "load_base_managed_tags(" not in sync_src, \
+            "sync must not union the base itself either — one function, one place"

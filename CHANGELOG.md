@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`push` now strips a tag dropped from the YAML. It never used to.**
+  `cmd_sync` unioned the base snapshot's `managed_tags` into its managed-tag
+  universe; `cmd_push` did not. A tag removed from `tags:` (or a removed
+  `milestone_label`) was therefore stripped by `sync` and **silently left behind
+  by `push`** — for the whole life of the feature, on every board. The reconcile
+  can only remove what it knows it owns, and a tag no longer in the YAML looked
+  to `push` like an untouched UI tag.
+
+  Both halves were already unit-tested — `_collect_managed_tag_universe` and
+  `load_base_managed_tags` each had coverage. What had no test was the **wiring**
+  between them, which is exactly how two call sites diverged with a fix in only
+  one. They now share a single `managed_tag_universe_for()`, and a test asserts
+  neither command computes the universe itself, so the next fix cannot land in
+  only one of them.
+
+  Unchanged: a tag a human added in the ClickUp UI is still never in the managed
+  universe and is still preserved.
+
 ### Added
 
 - **Run provenance: every run states which code produced it.** The line
