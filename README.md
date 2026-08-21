@@ -120,6 +120,51 @@ has to remember.
 > have. In practice the snapshot is written by every push/pull/sync, so this only
 > bites on a first run against a board with no `.clickup-sync/` yet.
 
+<details>
+<summary><strong>Design note — why the enum's removal is a small regression, and the shape of the fix</strong> (investigated 2026-08-21, not built)</summary>
+
+The `M0`–`M3` enum's real purpose was never readability — it was a **closed
+vocabulary**, and a closed vocabulary is what buys reliable stale-tag removal. The
+tool could say "these four slugs are always mine to strip" precisely because it knew
+all of them in advance. Widening the field to `M<n>-<slug>` gains the readability and
+loses that property, so this is a genuine (small) regression rather than a rough edge.
+
+**The wrong way to get it back** is to declare the whole `m<n>[-slug]` namespace
+permanently managed. That claims every `m`-prefixed tag on a live board — including
+ones a person added in the ClickUp UI for their own reasons — and silently strips
+them. The blast radius is worse than the bug.
+
+**The better shape: derive the vocabulary from the milestone cards themselves.** The
+gates are already identifiable — stories with `milestone: true` carrying an
+`m<n>[-slug]` tag. That set *is* a closed vocabulary; it is computed from the file
+rather than hardcoded; it grows and shrinks as milestones are added or removed; and
+it never claims a tag no gate references. It recovers the enum's correctness property
+without the enum's four-milestone cap.
+
+Two things were checked before recommending it:
+
+1. **Is the universe computed early enough to see the milestone cards?** Yes.
+   `_collect_managed_tag_universe(data)` runs at the top of both `cmd_push` and
+   `cmd_sync`, before any per-story reconcile, and walks every epic and story. Gates
+   are ordinary stories, so there is no ordering problem.
+2. **What happens on the run that deletes a gate?** Its slug leaves the derived
+   vocabulary in the same run that removes it, so on its own the derived set cannot
+   strip the now-orphaned tag. In `sync` this is already covered: `managed_universe`
+   is unioned with the *previous* run's `managed_tags` from the base snapshot, which
+   still names the deleted slug. So the derived set is **strictly additive over the
+   base snapshot and never worse** — including the case where a project uses
+   `milestone_label` but has no gate card at all, where it is simply empty.
+
+**But that check surfaced a separate, pre-existing defect worth fixing first.**
+`cmd_sync` unions the base snapshot's `managed_tags`; **`cmd_push` does not.** So a
+tag removed from `tags:` (or a `milestone_label` removed) is stripped by `sync` and
+**silently left behind by `push`** — nothing to do with milestones, and true today for
+every board. Fixing that is one line and worth more than the milestone-vocabulary
+work; it also changes tag-removal behaviour on live boards, so it wants a decision
+rather than a quiet patch.
+
+</details>
+
 ### How a card is tied to a gate
 
 The gate is a story with `milestone: true` carrying an `m<n>` tag; a card points at it
