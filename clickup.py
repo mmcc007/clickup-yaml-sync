@@ -824,14 +824,55 @@ def load_base_managed_tags(path: Path) -> set[str]:
     return {str(t).lower() for t in (doc.get("managed_tags") or [])}
 
 
+# Key under which the base records the assignee set. Deliberately NOT in
+# SYNCED_FIELDS: assignees are a SET, and letting three_way_plan() compare them
+# as a scalar string would be its own bug (["a","b"] != ["b","a"]). They get
+# their own 3-way classifier, _assignees_3way().
+BASE_ASSIGNEES_KEY = "assignees"
+
+
+def _normalised_assignees(story: dict) -> Optional[list[str]]:
+    """The story's assignee list in a canonical, order-independent form, or
+    None when the story does not manage assignees at all.
+
+    None and [] are different and both meaningful: no key means UNMANAGED
+    (ClickUp is left alone), an empty list means MANAGED-AND-EMPTY (clear them).
+    """
+    if BASE_ASSIGNEES_KEY not in story:
+        return None
+    return sorted({str(a).strip().lower() for a in (story.get("assignees") or []) if str(a).strip()})
+
+
 def build_base_from_yaml(data: dict, status_map: dict) -> dict:
-    """Comparable scalar snapshot for every story that has a clickup_id."""
+    """Comparable snapshot for every story that has a clickup_id.
+
+    Scalars come from comparable_local(). Assignees are recorded separately, as
+    the YAML STRINGS rather than resolved ClickUp ids — deliberately:
+
+      * Resolution happens at COMPARE time, where the workspace roster is in
+        hand, and base/local/remote are then all compared in id space. That is
+        what stops a YAML email being matched against a ClickUp key as raw
+        strings, which would trade a loud false conflict for a SILENT false
+        agreement.
+      * Storing resolved ids instead would freeze a stale id into the snapshot,
+        so a roster change (someone's email updated) would make base and local
+        disagree spuriously. Storing strings and resolving both sides through
+        the SAME current roster cannot produce that skew.
+
+    A story that does not manage assignees records no key, so it stays
+    unmanaged and an old snapshot is indistinguishable from it — see
+    _assignees_3way(), which treats both as UNKNOWN and fails loud.
+    """
     tasks: dict = {}
     for epic in data.get("epics", []):
         for story in epic.get("stories", []):
             cid = story.get("clickup_id")
             if cid:
-                tasks[cid] = comparable_local(story, status_map)
+                record = comparable_local(story, status_map)
+                declared = _normalised_assignees(story)
+                if declared is not None:
+                    record[BASE_ASSIGNEES_KEY] = declared
+                tasks[cid] = record
     return tasks
 
 
@@ -2020,6 +2061,66 @@ def _pull_assignees(story: dict, cu_task: dict) -> bool:
         return False
     story["assignees"] = target
     return True
+
+
+# Outcomes of the assignee 3-way. "unknown" is its own answer and never
+# collapses into "none": that distinction is the whole safety property here.
+ASSIGNEES_AGREE = "none"
+ASSIGNEES_LOCAL_ONLY = "push"
+ASSIGNEES_REMOTE_ONLY = "pull"
+ASSIGNEES_CONFLICT = "conflict"
+ASSIGNEES_UNKNOWN = "unknown"
+
+
+def _assignees_3way(
+    base_task: dict, story: dict, cu_task: dict, resolver: dict[str, int]
+) -> str:
+    """Classify one task's assignee set as a 3-way merge, in ID SPACE.
+
+    All three sides are reduced to sets of ClickUp user ids before comparison —
+    base and local by resolving their YAML strings through the CURRENT roster,
+    remote from the task itself. Comparing YAML strings against ClickUp keys
+    directly would be a false-agreement generator, and a false agreement is a
+    silent overwrite of somebody's edit.
+
+    Returns UNKNOWN, never AGREE, whenever the baseline cannot be trusted:
+
+      * the story does not manage assignees (no key) — nothing to reason about;
+      * the snapshot predates assignee tracking, so it has no record;
+      * a name in the baseline no longer resolves (someone left the workspace),
+        which would silently shrink the base set and make a local-only change
+        look like a collision, or worse.
+
+    UNKNOWN keeps today's behaviour: the divergence is surfaced rather than
+    auto-resolved. That is deliberate and is the direction that fails LOUD — an
+    old snapshot must never read as "nothing changed".
+    """
+    if BASE_ASSIGNEES_KEY not in story:
+        return ASSIGNEES_UNKNOWN
+
+    local_ids, local_unresolved = _resolve_assignee_ids(story.get("assignees"), resolver)
+    remote_ids = _cu_assignee_ids(cu_task)
+    local, remote = set(local_ids), set(remote_ids)
+
+    if local == remote:
+        return ASSIGNEES_AGREE
+
+    base_declared = base_task.get(BASE_ASSIGNEES_KEY)
+    if base_declared is None:
+        return ASSIGNEES_UNKNOWN  # pre-change snapshot, or was unmanaged then
+    base_ids, base_unresolved = _resolve_assignee_ids(base_declared, resolver)
+    if base_unresolved or local_unresolved:
+        # A baseline we cannot fully resolve is not a baseline.
+        return ASSIGNEES_UNKNOWN
+    base = set(base_ids)
+
+    changed_local = local != base
+    changed_remote = remote != base
+    if changed_local and not changed_remote:
+        return ASSIGNEES_LOCAL_ONLY
+    if changed_remote and not changed_local:
+        return ASSIGNEES_REMOTE_ONLY
+    return ASSIGNEES_CONFLICT
 
 
 def _assignees_differ(story: dict, cu_task: dict, resolver: dict[str, int]) -> bool:
@@ -4033,35 +4134,54 @@ def cmd_sync(
                     # local/remote we apply that direction, but warn loudly since
                     # it can overwrite the side that didn't actually change (M1).
                     assignee_strategy = on_conflict if base_exists else conflict
-                    if base_exists and _assignees_differ(story, cu_task, assignee_resolver):
+                    story_base = base.get(story["clickup_id"], {}) if base_exists else None
+                    _assignee_verdict = (
+                        _assignees_3way(story_base, story, cu_task, assignee_resolver)
+                        if story_base is not None else ASSIGNEES_UNKNOWN
+                    )
+                    if (
+                        base_exists
+                        and _assignee_verdict in (ASSIGNEES_CONFLICT, ASSIGNEES_UNKNOWN)
+                        and _assignees_differ(story, cu_task, assignee_resolver)
+                    ):
                         # Name the values being DISCARDED, not just that a
                         # divergence exists. Someone who skipped the report
                         # above still sees, in the run log, exactly what this
                         # run threw away and on which task.
                         yaml_v = story.get("assignees", "(unmanaged)")
                         remote_v = _cu_assignee_keys(cu_task)
+                        # Two very different situations reach here, and saying
+                        # which one it is changes what the operator should do.
+                        if _assignee_verdict == ASSIGNEES_CONFLICT:
+                            why = (
+                                "BOTH sides changed since the last sync, so one "
+                                "of these is a real edit you are discarding"
+                            )
+                        else:
+                            why = (
+                                "there is no trustworthy baseline for this task "
+                                "(snapshot predates assignee tracking, or a name "
+                                "no longer resolves), so the tool cannot tell "
+                                "which side changed"
+                            )
                         if assignee_strategy == "local":
                             log.warning(
                                 f"  OVERWRITING assignees on '{story_name}': discarding "
-                                f"ClickUp's {remote_v}, writing {yaml_v}. Assignees are "
-                                f"NOT base-tracked, so if that remote value was a real "
-                                f"edit made in the UI it is now gone."
+                                f"ClickUp's {remote_v}, writing {yaml_v}. {why}."
                             )
                         elif assignee_strategy == "remote":
                             log.warning(
                                 f"  OVERWRITING assignees on '{story_name}': discarding "
-                                f"YAML's {yaml_v}, taking ClickUp's {remote_v}. Assignees "
-                                f"are NOT base-tracked, so if that YAML value was your "
-                                f"intended change it is now gone."
+                                f"YAML's {yaml_v}, taking ClickUp's {remote_v}. {why}."
                             )
                         else:
                             log.warning(
-                                f"  Assignees on '{story_name}' differ and are NOT "
-                                f"base-tracked. local={yaml_v} remote={remote_v}"
+                                f"  Assignees on '{story_name}' differ: {why}. "
+                                f"local={yaml_v} remote={remote_v}"
                             )
                     _reconcile_assignees_sync(
                         token, story, cu_task, assignee_resolver,
-                        assignee_strategy, story_name, stats,
+                        assignee_strategy, story_name, stats, base_task=story_base,
                     )
 
     # Phase 2.5: relationship-reconcile second pass (dependencies + relations).
@@ -4298,17 +4418,27 @@ def _collect_3way_conflicts(
                         "local": loc.get(field),
                         "remote": rem.get(field),
                     })
-            if _assignees_differ(story, cu_task, assignee_resolver):
+            verdict = _assignees_3way(base_task, story, cu_task, assignee_resolver)
+            if verdict == ASSIGNEES_UNKNOWN and _assignees_differ(
+                story, cu_task, assignee_resolver
+            ):
+                # No trustworthy baseline: surface it rather than guess, and say
+                # so. This is the pre-change-snapshot path and it must never
+                # read as agreement.
                 conflicts.append({
                     "task": story.get("name", "?"),
                     "field": "assignees",
                     "local": story.get("assignees", "(unmanaged)"),
                     "remote": _cu_assignee_keys(cu_task),
-                    # Assignees are NOT base-tracked, so this entry is "the two
-                    # sides differ", not "both sides changed". Flagged so the
-                    # report can say so instead of presenting it as a genuine
-                    # collision -- see NOT_BASE_TRACKED_NOTE.
                     "not_base_tracked": True,
+                })
+            elif verdict == ASSIGNEES_CONFLICT:
+                # Both sides moved, to different values. A genuine collision.
+                conflicts.append({
+                    "task": story.get("name", "?"),
+                    "field": "assignees",
+                    "local": story.get("assignees", "(unmanaged)"),
+                    "remote": _cu_assignee_keys(cu_task),
                 })
     return conflicts
 
@@ -4360,14 +4490,43 @@ def _reconcile_assignees_sync(
     conflict: str,
     task_name: str,
     stats: dict,
+    base_task: Optional[dict] = None,
 ) -> None:
-    """Reconcile assignees during ``sync``, honoring the conflict strategy.
+    """Reconcile assignees during ``sync``.
 
     Assignees are a set, not a scalar, so resolution is at the whole-set level
     (one decision per task) rather than per ClickUp user.
+
+    With a trustworthy baseline (``base_task``), a one-sided change is applied
+    in its own direction and never asks: reassigning in the YAML is an ordinary
+    edit, and making the operator pass ``--on-conflict local`` for it was the
+    whole defect — it trained people to reach for a blunt overwrite on a
+    routine operation. The conflict strategy still governs a genuine collision
+    and the no-baseline case.
     """
     if not _assignees_differ(story, cu_task, resolver):
         return
+
+    if base_task is not None:
+        verdict = _assignees_3way(base_task, story, cu_task, resolver)
+        if verdict == ASSIGNEES_LOCAL_ONLY:
+            if _sync_assignees(token, story["clickup_id"], cu_task, story, resolver):
+                log.info(
+                    f"  Assignees on '{task_name}': applied local change "
+                    f"(remote unchanged since last sync)"
+                )
+                stats["resolved_local"] += 1
+            return
+        if verdict == ASSIGNEES_REMOTE_ONLY:
+            if _pull_assignees(story, cu_task):
+                log.info(
+                    f"  Assignees on '{task_name}': pulled remote change "
+                    f"(YAML unchanged since last sync)"
+                )
+                stats["resolved_remote"] += 1
+            return
+        # CONFLICT or UNKNOWN fall through to the strategy below, which is
+        # where the loud warnings and the operator's decision live.
 
     if conflict == "local":
         if _sync_assignees(token, story["clickup_id"], cu_task, story, resolver):

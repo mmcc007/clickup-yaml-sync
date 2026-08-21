@@ -4,6 +4,35 @@
 
 ### Fixed
 
+- **Assignees are base-tracked, so reassigning in the YAML is no longer a
+  conflict** (#42).
+
+  Assignees sat outside the 3-way model, so `sync` reported *any* YAML-vs-remote
+  divergence as a conflict — including the ordinary case of changing an owner in
+  the task file, which is the operation `sync` exists to perform. The only way
+  past it was `--on-conflict local`, a blunt overwrite, and being trained to
+  reach for that on a routine edit is how a real UI change eventually gets
+  destroyed.
+
+  A one-sided change now applies in its own direction and never asks. Only a
+  genuine both-sides change is a conflict.
+
+  - **Comparison happens in id space, never string space.** Base and local are
+    resolved through the *current* workspace roster; remote comes from the task.
+    Storing raw YAML strings and comparing them against ClickUp keys was
+    considered and **refused**: it would trade a loud false conflict for a
+    silent false agreement, which is an unnoticed overwrite of someone's edit.
+  - **The base stores the YAML strings and resolves at compare time**, rather
+    than storing resolved ids. Frozen ids would go stale when a roster entry
+    changes; resolving both sides through one current roster cannot skew.
+  - **An untrustworthy baseline reads as UNKNOWN, never as agreement**, and
+    keeps the previous surface-it-loudly behaviour. That covers a snapshot
+    written before this change (every existing board, on its first run after
+    upgrading), a story that does not manage assignees, and a baseline naming
+    someone who has since left the workspace.
+  - `assignees` is deliberately **not** added to `SYNCED_FIELDS`: it is a set,
+    and letting the scalar comparer treat it as a string would be its own bug.
+
 - **An assignee conflict now says it may not be a conflict, and names what each
   flag would destroy** (#42, interim).
 
