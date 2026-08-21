@@ -283,6 +283,41 @@ be a clearly delimited block, never mixed into hand-written prose.
 > day someone rebuilds a story dict, CI fails instead of quietly deleting people's
 > provenance.
 
+## Working on this code: test the joins, not just the halves
+
+**Both halves green, the join untested, the bug invisible.** That is the shape of
+almost every defect this tool has shipped, and it is worth knowing before you add
+anything.
+
+The clearest example: `push` never removed a tag dropped from the YAML, for the whole
+life of the feature, on every board. `_collect_managed_tag_universe` had tests.
+`load_base_managed_tags` had tests. **What had no test was the wiring between them** —
+and that is exactly where the two commands diverged, with the fix landing in `sync`
+and not in `push`. Every unit was green the entire time.
+
+The same shape recurs: a lock whose acquire and release were both correct while
+nothing checked that the *tool* took it; a diagnostic that tested what it found rather
+than whether it fired; a field that survived every code path by accident, with nothing
+saying it was supposed to.
+
+So when you change something here:
+
+- **Ask what connects the pieces, and test that.** A test that two call sites produce
+  the same answer is weak — it passes again the moment someone adds a third, subtly
+  different one. Prefer one function and a test asserting the callers *use* it. That
+  is why `managed_tag_universe_for()` exists and why a test checks neither command
+  computes the universe itself.
+- **Pin behaviour that currently works by accident.** `notes:` survived every path
+  before anything declared it should; emergent behaviour breaks silently, and silence
+  is the whole problem. Name the contract (`YAML_ONLY_STORY_FIELDS`) and test each
+  property.
+- **Share the definition, not the value.** Push and the milestone lint use one
+  `MILESTONE_TAG_RE`. Two regexes for one convention drift, and the symptom would be a
+  lint quietly failing to resolve what push emits — which reads as "nothing wrong".
+- **Make failure loud.** A lock that silently skips, a sync that quietly does nothing,
+  an edge that fails into scrollback: all of them look like success. Non-zero exits and
+  end-of-run summaries exist for that reason.
+
 ## Running it: pin a copy (`clickup.py pin`)
 
 ```bash
