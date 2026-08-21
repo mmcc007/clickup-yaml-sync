@@ -3509,3 +3509,109 @@ class TestMilestoneLintIsAdvisory:
 
     def test_an_empty_project_does_not_crash(self):
         assert clickup.lint_milestone_dates({})["findings"] == []
+
+
+# ---------------------------------------------------------------------------
+# milestone_label accepts a slug (M<n>-<slug>), not just the old M0-M3 enum
+# ---------------------------------------------------------------------------
+#
+# The field exists to spare people hand-writing the tag. While it emitted a bare
+# `m1` -- a handle that tells a reader nothing -- every project bypassed it and
+# hand-rolled its own convention, and hand-rolled conventions diverge. Widening
+# it makes the agreed shape the default instead of a habit each project has to
+# remember.
+
+
+class TestMilestoneLabelSlug:
+    def test_a_slugged_label_pushes_as_a_lowercased_slug_tag(self):
+        story = _story_with("card", milestone_label="M1-infrastructure")
+        epic = _epic_with("Delivery", [story])
+        assert "m1-infrastructure" in clickup._story_desired_tags(story, epic)
+
+    def test_the_bare_form_is_unchanged(self):
+        """The Michael Moe board uses the bare form on live cards today and must
+        not be disturbed."""
+        story = _story_with("card", milestone_label="M1")
+        epic = _epic_with("Delivery", [story])
+        assert "m1" in clickup._story_desired_tags(story, epic)
+
+    def test_a_slugged_label_is_in_the_managed_tag_universe(self):
+        """Otherwise reassigning a card's milestone would leave the old tag
+        behind on the ClickUp task forever."""
+        data = _lint_data(_epic_with("Delivery", [
+            _story_with("card", milestone_label="M2-system"),
+        ]))
+        assert "m2-system" in clickup._collect_managed_tag_universe(data)
+
+    def test_the_bare_slugs_stay_permanently_managed(self):
+        """Backward compatibility: removing `milestone_label: M1` must still
+        strip the `m1` tag even with no base snapshot to diff against."""
+        universe = clickup._collect_managed_tag_universe(_lint_data())
+        assert {"m0", "m1", "m2", "m3"} <= universe
+
+    def test_the_number_is_unbounded(self):
+        """The old enum capped a project at four milestones for no reason a
+        five-milestone SOW would accept."""
+        story = _story_with("card", milestone_label="M7-handover")
+        epic = _epic_with("Delivery", [story])
+        assert "m7-handover" in clickup._story_desired_tags(story, epic)
+
+    def test_push_and_the_lint_share_one_definition_of_a_milestone_slug(self):
+        """Two regexes for one convention would drift, and the drift would show
+        up as a lint that quietly stops resolving what push emits."""
+        story = {"milestone_label": "M1-infrastructure"}
+        epic = _epic_with("Delivery", [story])
+        emitted = [t for t in clickup._story_desired_tags(story, epic) if t.startswith("m1")]
+        assert clickup._milestone_refs(story) == [(1, "infrastructure", "m1-infrastructure")]
+        assert emitted == ["m1-infrastructure"]
+
+    def test_a_slugged_label_resolves_to_its_gate_in_the_lint(self):
+        """Confirmed by running it, not inferred: the widened field needs no
+        further lint work."""
+        data = _lint_data(
+            _epic_with("Milestones", [
+                _story_with("M1 gate", milestone=True, milestone_label="M1-infrastructure",
+                            due_date="2026-09-15"),
+            ]),
+            _epic_with("Delivery", [
+                _story_with("late", milestone_label="M1-infrastructure", due_date="2026-10-01"),
+            ]),
+        )
+        assert _codes(clickup.lint_milestone_dates(data)) == [clickup.LINT_DATE_AFTER_GATE]
+
+    def test_a_label_and_an_equivalent_tag_are_one_reference_not_two(self):
+        refs = clickup._milestone_refs({
+            "milestone_label": "M1-infrastructure",
+            "tags": ["m1-infrastructure"],
+        })
+        assert refs == [(1, "infrastructure", "m1-infrastructure")]
+
+    def test_a_malformed_label_is_flagged_by_the_lint(self):
+        """It would push a tag nothing can resolve, so the card looks tagged and
+        is silently unchecked -- worth catching at the source."""
+        data = _lint_data(_epic_with("Delivery", [
+            _story_with("card", milestone_label="Milestone 1"),
+        ]))
+        assert clickup.LINT_LABEL_MALFORMED in _codes(clickup.lint_milestone_dates(data))
+
+    def test_a_well_formed_label_is_not_flagged(self):
+        data = _lint_data(_epic_with("Delivery", [
+            _story_with("a", milestone_label="M1"),
+            _story_with("b", milestone_label="M12-late-stage-handover"),
+        ]))
+        codes = _codes(clickup.lint_milestone_dates(data))
+        assert clickup.LINT_LABEL_MALFORMED not in codes
+
+    def test_the_schema_pattern_matches_what_the_tool_accepts(self):
+        """A schema that documents a different rule from the code is worse than
+        no schema -- it is believed."""
+        import re as _re
+        schema = yaml.safe_load((Path(clickup.__file__).parent / "schema.yaml").read_text())
+        node = schema["properties"]["epics"]["items"]["properties"]["stories"]["items"]
+        pattern = node["properties"]["milestone_label"]["pattern"]
+        for good in ("M1", "M0", "M1-infrastructure", "M12-late-stage-handover"):
+            assert _re.match(pattern, good), good
+            assert clickup.MILESTONE_TAG_RE.match(good), good
+        for bad in ("Milestone 1", "M", "m1-", "M1 infrastructure", "M1_infra"):
+            assert not _re.match(pattern, bad), bad
+            assert not clickup.MILESTONE_TAG_RE.match(bad), bad

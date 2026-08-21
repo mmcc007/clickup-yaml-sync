@@ -1348,6 +1348,21 @@ def _sync_tags(
 # ---------------------------------------------------------------------------
 
 
+# `m1`, `m2-system`, `m3-acceptance`. The NUMBER carries the sequence and the
+# SLUG carries the meaning. One definition, shared by tag emission and the
+# milestone-date lint -- two regexes for one convention would drift, and the
+# drift would show up as a lint that quietly stops resolving what push emits.
+#
+# The number is unbounded on purpose. The field used to be an `M0`-`M3` enum,
+# which capped a project at four milestones for no reason a five-milestone SOW
+# would accept.
+MILESTONE_TAG_RE = re.compile(r"^m(\d+)(?:-([a-z0-9][a-z0-9-]*))?$", re.IGNORECASE)
+
+# Bare slugs kept permanently in the managed-tag universe for backward
+# compatibility: removing a `milestone_label: M1` from a story must still strip
+# its `m1` tag on the next push even with no base snapshot to compare against.
+# Slugged labels rely on the base snapshot's recorded `managed_tags` for that,
+# the same way explicit `tags:` entries always have -- see the README.
 VALID_MILESTONE_LABELS = ("M0", "M1", "M2", "M3")
 
 
@@ -1360,7 +1375,8 @@ def _story_desired_tags(
       1. epic name (only when ``push_epic_tag`` — set project.push_epic_tag:
          false to let a curated Epic dropdown own the workstream axis instead)
       2. story.tags[] from YAML
-      3. lowercase milestone slug from story.milestone_label (M1 -> ``m1``)
+      3. lowercase milestone slug from story.milestone_label
+         (``M1`` -> ``m1``; ``M1-infrastructure`` -> ``m1-infrastructure``)
       4. lowercase sprint slug from story.sprint_target (1 -> ``s1``)
     """
     out: list[str] = []
@@ -4109,10 +4125,6 @@ def cmd_status(data: dict) -> None:
 # is deliberately not filed under a work epic, so no milestone relationship can
 # be inferred from one.
 
-# `m1`, `m2-system`, `m3-acceptance`. The NUMBER carries the sequence and the
-# slug carries the meaning, which is the convention that emerged on BREC.
-MILESTONE_TAG_RE = re.compile(r"^m(\d+)(?:-([a-z0-9][a-z0-9-]*))?$", re.IGNORECASE)
-
 # Codes are stable: they are what a card's `lint_exceptions:` mapping is keyed
 # on, so renaming one silently un-suppresses every acceptance that used it.
 LINT_DATE_AFTER_GATE = "milestone-date"
@@ -4120,6 +4132,7 @@ LINT_TAG_UNRESOLVED = "milestone-tag-unresolved"
 LINT_SLUG_MISMATCH = "milestone-slug-mismatch"
 LINT_AMBIGUOUS = "milestone-ambiguous"
 LINT_GATE_UNDATED = "milestone-gate-undated"
+LINT_LABEL_MALFORMED = "milestone-label-malformed"
 
 LINT_CODES = (
     LINT_DATE_AFTER_GATE,
@@ -4127,15 +4140,17 @@ LINT_CODES = (
     LINT_SLUG_MISMATCH,
     LINT_AMBIGUOUS,
     LINT_GATE_UNDATED,
+    LINT_LABEL_MALFORMED,
 )
 
 
 def _milestone_refs(story: dict) -> list[tuple[int, Optional[str], str]]:
     """Milestone references on a story, as ``(number, slug, original_tag)``.
 
-    Reads both ``tags:`` (the free-form ``m<n>-<slug>`` form projects actually
-    use) and ``milestone_label`` (the ``M0``-``M3`` enum, which push lowercases
-    into the same tag namespace). One story may carry more than one.
+    Reads both ``tags:`` and ``milestone_label`` -- push lowercases the label
+    into the same tag namespace, so ``milestone_label: M1-infrastructure`` and
+    ``tags: [m1-infrastructure]`` are the same reference by different routes.
+    One story may carry more than one.
     """
     seen: set[str] = set()
     refs: list[tuple[int, Optional[str], str]] = []
@@ -4222,6 +4237,20 @@ def lint_milestone_dates(data: dict) -> dict:
             accepted.append(finding)
         else:
             findings.append(finding)
+
+    # A malformed label is worth catching at the source: it pushes a garbage tag
+    # to ClickUp and then resolves to no gate, so the card looks tagged and is
+    # silently unchecked.
+    for epic in data.get("epics", []) or []:
+        for story in epic.get("stories", []) or []:
+            label = story.get("milestone_label")
+            if isinstance(label, str) and label.strip() and not MILESTONE_TAG_RE.match(label.strip()):
+                _record(
+                    LINT_LABEL_MALFORMED, "warning", epic, story,
+                    f"has milestone_label '{label.strip()}', which is not of the "
+                    f"form M<n> or M<n>-<slug> (e.g. 'M1', 'M1-infrastructure'). "
+                    f"It would push as a tag nothing can resolve.",
+                )
 
     by_number, untagged = _milestone_index(data)
 

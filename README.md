@@ -86,6 +86,40 @@ It does **not** look at epics. Epics are a YAML-only grouping and a diamond is
 deliberately not filed under a work epic, so no milestone relationship is inferred
 from one.
 
+### `milestone_label` — let the tool own the convention
+
+You can hand-write the tag into `tags:`, but `milestone_label` is the field for it:
+
+```yaml
+- name: M1 - Infrastructure ready
+  milestone: true
+  milestone_label: M1-infrastructure     # pushes as the tag `m1-infrastructure`
+  due_date: "2026-09-15"
+```
+
+**The number carries the sequence; the slug carries the meaning.** A bare `m1` is a
+handle that tells a reader nothing, which is why the slug form exists. `n` is
+unbounded — the field used to be an `M0`–`M3` enum, which capped a project at four
+milestones for no reason a five-milestone SOW would accept.
+
+Bare `M0`–`M3` remain valid and behave exactly as before, so existing boards are
+undisturbed. A malformed value (`Milestone 1`) is reported by the lint as
+`milestone-label-malformed` rather than rejected — it would push a tag nothing can
+resolve, so the card would *look* tagged and be silently unchecked.
+
+Use the field rather than hand-rolling the tag. While it emitted a bare `m1`, every
+project bypassed it and invented its own convention — and hand-rolled conventions
+diverge (`m1-infrastructure` here, `milestone-1` on the next board, no number on a
+third). The field makes the agreed shape the default instead of a habit each project
+has to remember.
+
+> **One nuance on removal.** Bare `m0`–`m3` are permanently in the managed-tag
+> universe, so deleting `milestone_label: M1` strips the `m1` tag on the next push
+> even with no base snapshot. A *slugged* label relies on the base snapshot's
+> recorded `managed_tags` for that, the same way explicit `tags:` entries always
+> have. In practice the snapshot is written by every push/pull/sync, so this only
+> bites on a first run against a board with no `.clickup-sync/` yet.
+
 ### How a card is tied to a gate
 
 The gate is a story with `milestone: true` carrying an `m<n>` tag; a card points at it
@@ -120,6 +154,7 @@ same tag namespace) are read.
 | `milestone-slug-mismatch` | warning | same number, different slug — likely a typo. Checked against that gate anyway, so a typo cannot silently disable the date check |
 | `milestone-ambiguous` | warning | two gates share a number, so nothing can resolve to one of them |
 | `milestone-gate-undated` | note | the gate has no due date, so no card tagged to it can be checked. Reported once per gate, not once per card |
+| `milestone-label-malformed` | warning | `milestone_label` is not `M<n>` or `M<n>-<slug>`, so it pushes a tag nothing can resolve |
 
 The resolution findings are often worth more than the date check itself: a typo'd tag
 otherwise filters to nothing, and the plan looks clean **because nothing is being
@@ -143,6 +178,23 @@ The value must be a **non-empty string**. A bare `true` is deliberately rejected
 suppression flag with no rationale tells the next reader nothing, and by the time
 anyone asks, whoever set it has moved on. Accepted findings are still **counted** in
 the report, so suppressed is not the same as gone.
+
+## Running it: use a pinned copy, not a live checkout
+
+**Operators should invoke a pinned checkout or an installed copy of `clickup.py`, not
+a working tree someone is developing in.** `clickup.py` is a single file with no
+runtime dependency on anything else in the repo (it does not read `schema.yaml`), so
+a copy of the file at a known commit is a complete, correct tool:
+
+```bash
+git -C <repo> show <commit>:clickup.py > ~/bin/clickup-<commit>.py && chmod +x ~/bin/clickup-<commit>.py
+```
+
+The lock below protects the *task file* from concurrent writers. **Nothing protects
+the tool itself from being rewritten mid-use** — a merge landing between your
+invocation and interpreter start is a narrow but real race, and a sync that half-runs
+against a client board is an expensive way to discover it. This is not hypothetical:
+it nearly happened on 2026-08-21, on a board a client was about to be invited to.
 
 ## Locking — the tool takes the flag for you
 

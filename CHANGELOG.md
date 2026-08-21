@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Changed
+
+- **`milestone_label` accepts a slug: `M<n>-<slug>`, with `n` unbounded.**
+  `M1-infrastructure` pushes as the tag `m1-infrastructure`. The number carries
+  the sequence, the slug carries the meaning — a bare `m1` is a handle that
+  tells a reader nothing, which is why every project was bypassing the field and
+  hand-rolling its own convention into `tags:`. Hand-rolled conventions diverge;
+  the field makes the agreed shape the default.
+  - **Bare `M0`–`M3` remain valid and unchanged**, so boards using them are
+    undisturbed.
+  - The old `M0`–`M3` enum capped a project at four milestones for no reason a
+    five-milestone SOW would accept. The constraint is now a pattern.
+  - Push and the milestone-date lint share **one** definition of a milestone
+    slug (`MILESTONE_TAG_RE`). Two regexes for one convention would drift, and
+    the drift would surface as a lint that quietly stops resolving what push
+    emits.
+  - New lint finding `milestone-label-malformed` for a value that is neither
+    form — it pushes a tag nothing can resolve, so the card looks tagged and is
+    silently unchecked. Flagged, not rejected.
+
 ### Added
 
 - **`lint` — a milestone-date coherence check.** A card tagged `m<n>-<slug>`
