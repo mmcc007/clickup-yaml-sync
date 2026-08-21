@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Added
+
+- **`depends_on` and `related` accept story names, not just ids.** An id does
+  not exist until the run that creates it, so on a brand-new board an id
+  reference could not be written at all — which forced two passes: one to create
+  the tasks, a second to add the edges once the ids existed. A name reference
+  links two brand-new tasks on the **first** sync, because the reconcile pass
+  runs after creates.
+
+  This is exactly the argument `parent` has used since it was built; the
+  machinery existed and was only wired to one of the three reference fields.
+
+  - Resolution is identical to `parent`'s: explicit `clickup_id` in this file,
+    then story name (case-insensitive, trimmed), then a bare token as a literal
+    id for a target outside the file.
+  - **Refuses rather than guesses, and never half-applies.** A duplicate name or
+    a name matching no story aborts the whole edge set for that story and counts
+    as an error — a half-applied dependency graph is worse than none, because it
+    looks complete.
+  - The self-edge check now runs **after** resolution, so `depends_on: [My Own
+    Name]` is caught. Checking the raw string let a story depend on itself by
+    name.
+  - Under `--dry-run` on a fresh board, a name pointing at a story the run would
+    create is reported as resolving after create rather than erroring —
+    otherwise `--dry-run` would be useless on exactly the new-project case this
+    is for.
+  - The peer-relation index and the declared-on-both-edges warning resolve names
+    too. They compare ids, so a name on one side would have silently stopped
+    matching — quietly reverting the relation union semantics to
+    this-side-authoritative and bringing back the link-oscillation footgun.
+
 ### Fixed
 
 - **A failed dependency or linked-task edge is no longer easy to miss.** Two

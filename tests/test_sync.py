@@ -3822,3 +3822,130 @@ class TestEdgeFailureVisibility:
         assert "checklist, not a diagnosis" in clickup.EDGE_FAILURE_HINT
         assert "Dependencies ClickApp" in clickup.EDGE_FAILURE_HINT
         assert "INSUFFICIENT_ACCESS" in clickup.EDGE_FAILURE_HINT
+
+
+# ---------------------------------------------------------------------------
+# depends_on / related may reference stories by NAME
+# ---------------------------------------------------------------------------
+#
+# An id does not exist until the run that creates it. The reconcile pass runs
+# AFTER creates, so a NAME reference links two brand-new tasks on the FIRST sync
+# where an id reference could not — which is the common case for any new board,
+# and previously forced a second pass. `parent` already worked this way; this
+# extends the same machinery to the edge fields.
+
+
+def _edge_ctx(*stories: dict) -> dict:
+    return clickup._build_parent_context(
+        {"project": {"clickup_list_id": "L"}, "epics": [_epic_with("E", list(stories))]}
+    )
+
+
+class TestEdgeRefsByName:
+    def test_a_story_name_resolves_to_its_clickup_id(self):
+        ctx = _edge_ctx(_story_with("Export hub", clickup_id="HUB"),
+                        _story_with("Downstream", clickup_id="T1"))
+        assert clickup._resolve_dependency_ids(["Export hub"], "T1", ctx)[0] == ["HUB"]
+
+    def test_a_raw_clickup_id_still_works(self):
+        """Targets outside this YAML have no name to reference."""
+        ctx = _edge_ctx(_story_with("Downstream", clickup_id="T1"))
+        assert clickup._resolve_dependency_ids(["EXTERNAL9"], "T1", ctx)[0] == ["EXTERNAL9"]
+
+    def test_matching_is_case_insensitive_and_trimmed(self):
+        ctx = _edge_ctx(_story_with("Export hub", clickup_id="HUB"),
+                        _story_with("D", clickup_id="T1"))
+        assert clickup._resolve_dependency_ids(["  export HUB "], "T1", ctx)[0] == ["HUB"]
+
+    def test_an_id_reference_wins_over_a_name(self):
+        """Same precedence as `parent`: explicit id first."""
+        ctx = _edge_ctx(_story_with("HUB", clickup_id="OTHER"),
+                        _story_with("x", clickup_id="HUB"))
+        assert clickup._resolve_dependency_ids(["HUB"], "T1", ctx)[0] == ["HUB"]
+
+    def test_a_duplicate_name_is_refused_not_guessed(self):
+        ctx = _edge_ctx(_story_with("Twin", clickup_id="A"),
+                        _story_with("Twin", clickup_id="B"))
+        with pytest.raises(clickup.EdgeRefUnresolved, match="ambiguous"):
+            clickup._resolve_dependency_ids(["Twin"], "T1", ctx)
+
+    def test_an_unknown_name_is_refused_rather_than_pushed_as_an_id(self):
+        """Whitespace means it was meant as a name. Pushing it to ClickUp as an
+        id gets an opaque 400 back instead of a message naming the typo."""
+        ctx = _edge_ctx(_story_with("Export hub", clickup_id="HUB"))
+        with pytest.raises(clickup.EdgeRefUnresolved, match="no story named that"):
+            clickup._resolve_dependency_ids(["No Such Story"], "T1", ctx)
+
+    def test_the_self_check_runs_after_resolution(self):
+        """Checking the raw string would let a story depend on itself by name."""
+        ctx = _edge_ctx(_story_with("Downstream", clickup_id="T1"))
+        desired, skipped, _ = clickup._resolve_dependency_ids(["Downstream"], "T1", ctx)
+        assert desired == []
+        assert skipped == ["Downstream"]
+
+    def test_no_context_preserves_the_old_id_only_behaviour(self):
+        assert clickup._resolve_dependency_ids(["HUB", "X"], "T1")[0] == ["HUB", "X"]
+
+    def test_related_uses_the_same_resolution(self):
+        ctx = _edge_ctx(_story_with("Export hub", clickup_id="HUB"),
+                        _story_with("D", clickup_id="T1"))
+        assert clickup._resolve_dependency_ids(["Export hub"], "T1", ctx, "related")[0] == ["HUB"]
+
+    def test_the_error_names_the_field_it_came_from(self):
+        ctx = _edge_ctx(_story_with("x", clickup_id="T1"))
+        with pytest.raises(clickup.EdgeRefUnresolved, match="related:"):
+            clickup._resolve_dependency_ids(["No Such Story"], "T1", ctx, "related")
+
+
+class TestEdgeRefsPendingCreate:
+    def _ctx_and_story(self):
+        pending = _story_with("Brand new")            # no clickup_id yet
+        story = _story_with("D", clickup_id="T1", depends_on=["Brand new"])
+        return _edge_ctx(pending, story), story
+
+    def test_a_name_pending_create_is_separated_from_a_real_failure(self):
+        ctx, _ = self._ctx_and_story()
+        desired, skipped, pending = clickup._resolve_dependency_ids(["Brand new"], "T1", ctx)
+        assert (desired, skipped, pending) == ([], [], ["Brand new"])
+
+    def test_dry_run_reports_it_as_resolving_later_rather_than_erroring(self):
+        """The expected state of a fresh board: nothing created, so nothing has
+        an id. Erroring here would make --dry-run useless on a new project,
+        which is exactly the case the feature is for."""
+        _, story = self._ctx_and_story()
+        clickup._handle_pending_edge_refs("depends_on", ["Brand new"], story, dry_run=True)
+
+    def test_a_real_run_refuses_rather_than_applying_a_partial_edge_set(self):
+        """The reconcile pass runs after creates, so this should be impossible.
+        A half-applied dependency graph is worse than none — it looks complete."""
+        _, story = self._ctx_and_story()
+        with pytest.raises(clickup.EdgeRefUnresolved, match="partial edge set"):
+            clickup._handle_pending_edge_refs("depends_on", ["Brand new"], story, dry_run=False)
+
+
+class TestEdgeRefsInAuxiliaryIndexes:
+    def test_the_peer_relation_index_resolves_names(self):
+        """It compares ids. A name on one side would silently stop matching, and
+        the peer-union semantics would quietly revert to this-side-authoritative
+        — bringing back the link-oscillation footgun it exists to prevent."""
+        data = {"project": {"clickup_list_id": "L"}, "epics": [_epic_with("E", [
+            _story_with("Export hub", clickup_id="HUB"),
+            _story_with("Downstream", clickup_id="T1", related=["Export hub"]),
+        ])]}
+        ctx = clickup._build_parent_context(data)
+        assert clickup._build_declared_relations(data, ctx) == {"T1": {"HUB"}}
+
+    def test_the_both_edges_warning_matches_a_name_against_an_id(self):
+        story = _story_with("D", clickup_id="T1",
+                            depends_on=["Export hub"], related=["HUB"])
+        ctx = _edge_ctx(_story_with("Export hub", clickup_id="HUB"), story)
+        assert clickup._declared_edge_ids(story, "depends_on", ctx) == {"HUB"}
+        assert clickup._declared_edge_ids(story, "related", ctx) == {"HUB"}
+
+    def test_an_unresolvable_ref_does_not_abort_an_auxiliary_index(self):
+        """These indexes are advisory. The authoritative complaint belongs to
+        the sync functions, which raise — reporting the same typo twice, or
+        letting index-building kill a run, would both be worse."""
+        story = _story_with("D", clickup_id="T1", related=["No Such Story"])
+        ctx = _edge_ctx(story)
+        assert clickup._declared_edge_ids(story, "related", ctx) == set()
