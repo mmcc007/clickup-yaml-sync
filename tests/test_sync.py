@@ -4329,9 +4329,17 @@ class TestAssignees3WayFailsLoud:
         ) == clickup.ASSIGNEES_UNKNOWN
 
     def test_an_unresolvable_baseline_name_is_unknown(self):
-        """Someone left the workspace. Silently dropping them would shrink the
-        base set and make a local-only change look like a collision — or worse,
-        make a collision look like a one-sided change."""
+        """Someone left the workspace.
+
+        **Silently dropping them would shrink the base set, which can make a
+        genuine both-sides collision look one-sided** — and a one-sided verdict
+        is applied without asking. That is the refused design (a silent false
+        agreement) arriving through a different door, so it is closed here
+        rather than left to be noticed later.
+
+        This is also why the base stores YAML strings rather than resolved ids:
+        an unresolvable name is visible, whereas a bare id that no longer
+        belongs to anyone compares perfectly well against a ghost."""
         assert self._verdict({"assignees": ["gone@nowhere.com"]},
                              ["wframe@brecslc.com"],
                              ["maurice@spark6.com"]) == clickup.ASSIGNEES_UNKNOWN

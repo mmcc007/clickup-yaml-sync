@@ -23,8 +23,11 @@
     considered and **refused**: it would trade a loud false conflict for a
     silent false agreement, which is an unnoticed overwrite of someone's edit.
   - **The base stores the YAML strings and resolves at compare time**, rather
-    than storing resolved ids. Frozen ids would go stale when a roster entry
-    changes; resolving both sides through one current roster cannot skew.
+    than storing resolved ids, because an unresolvable baseline entry is then
+    **detectable**: a name that no longer resolves returns UNKNOWN and stops the
+    run, where a bare user id would compare cleanly against a ghost and proceed
+    silently. Same loud-beats-silent asymmetry as above. It also lets the base
+    be written from code paths that have no roster or token.
   - **An untrustworthy baseline reads as UNKNOWN, never as agreement**, and
     keeps the previous surface-it-loudly behaviour. That covers a snapshot
     written before this change (every existing board, on its first run after
