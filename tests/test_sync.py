@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -3031,3 +3032,262 @@ class TestParentSameListGuard:
                 clickup._sync_parent(
                     "tok", "T1", _cu_task_parent("T1", None), story, ctx, dry_run=True
                 )
+
+
+# ---------------------------------------------------------------------------
+# Advisory locking
+# ---------------------------------------------------------------------------
+#
+# The behaviours worth pinning are the ones whose failure is INVISIBLE:
+#   - a session deadlocking against its own hook-held lock (looks like the lock
+#     working correctly);
+#   - a busy lock being treated as "nothing to do" instead of an error;
+#   - a released lock deleting a hold its own session still needs.
+
+
+def _lock_doc(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def _write_lock_doc(path: Path, session_id: str, age_ms: int = 0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "session_id": session_id,
+        "ts": int(time.time() * 1000) - age_ms,
+        "pid": 4242,
+    }))
+
+
+class TestLockPaths:
+    def test_project_tasks_yaml_maps_to_the_hooks_lock_file(self, tmp_path):
+        """Interop is the whole point: for the file the Claude Code diamond-lock
+        hook guards, this tool must land on the exact same lock path, or the two
+        mechanisms each hold a file the other is writing."""
+        yaml_file = tmp_path / "docs" / "project-tasks.yaml"
+        yaml_file.parent.mkdir(parents=True)
+        yaml_file.write_text("epics: []\n")
+        assert clickup.lock_path_for_yaml(str(yaml_file)) == yaml_file.parent / ".project-tasks.lock"
+
+    def test_other_file_names_get_their_own_lock_without_a_second_convention(self, tmp_path):
+        f = tmp_path / "roadmap.yaml"
+        f.write_text("epics: []\n")
+        assert clickup.lock_path_for_yaml(str(f)) == tmp_path / ".roadmap.lock"
+
+    def test_list_lock_is_machine_global_not_next_to_the_file(self, tmp_path, monkeypatch):
+        """Two different YAML files aimed at one ClickUp list must contend. A
+        lock beside either file would not make them."""
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        p = clickup.lock_path_for_list("901419115649")
+        assert p == tmp_path / "cache" / "clickup-yaml-sync" / "list-901419115649.lock"
+
+
+class TestLockOwnerIdentity:
+    def test_explicit_override_wins(self, monkeypatch):
+        monkeypatch.setenv("CLICKUP_LOCK_OWNER", "cron-nightly")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1")
+        assert clickup.lock_owner_id() == "cron-nightly"
+
+    def test_claude_session_id_is_the_identity_under_claude_code(self, monkeypatch):
+        """Verified against a live hook-written lock on 2026-08-21: the hook
+        writes its payload's session_id, and CLAUDE_CODE_SESSION_ID in a Bash
+        tool call holds that same UUID. (CLAUDE_SESSION_ID, without CODE, is a
+        different and empty variable -- do not switch to it.)"""
+        monkeypatch.delenv("CLICKUP_LOCK_OWNER", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "1af01d76-5f32-4e59-8165-43f9252a4a5a")
+        assert clickup.lock_owner_id() == "1af01d76-5f32-4e59-8165-43f9252a4a5a"
+
+    def test_plain_shell_identity_is_unique_per_process(self, monkeypatch):
+        """Deliberately NOT a bare pid or hostname: a stable-looking id could
+        collide with a real session's lock, and a colliding id steals a lock
+        instead of waiting for it."""
+        monkeypatch.delenv("CLICKUP_LOCK_OWNER", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        a, b = clickup.lock_owner_id(), clickup.lock_owner_id()
+        assert a != b
+        assert a.startswith("shell-")
+
+
+class TestLockAcquisition:
+    def test_acquires_when_free_and_removes_on_release(self, tmp_path):
+        path = tmp_path / ".project-tasks.lock"
+        lock = clickup.AdvisoryLock(path, "me", "YAML file")
+        lock.acquire(wait_seconds=0)
+        assert _lock_doc(path)["session_id"] == "me"
+        lock.release()
+        assert not path.exists()
+
+    def test_own_sessions_fresh_lock_is_adopted_not_waited_on(self, tmp_path):
+        """The self-deadlock case, and the one that looks like success. A Claude
+        session edits (the hook takes the lock), then syncs in the same session;
+        the sync must join that hold, not block on it for the full TTL."""
+        path = tmp_path / ".project-tasks.lock"
+        _write_lock_doc(path, "sess-A", age_ms=1000)
+        lock = clickup.AdvisoryLock(path, "sess-A", "YAML file")
+        lock.acquire(wait_seconds=0)  # would raise LockBusy if it treated it as foreign
+        assert lock.inherited is True
+
+    def test_releasing_an_adopted_lock_hands_it_back_rather_than_deleting_it(self, tmp_path):
+        """The session may still be mid-edit-burst. Deleting here would silently
+        cut short a hold it is relying on, and the next hook edit would find the
+        file free."""
+        path = tmp_path / ".project-tasks.lock"
+        _write_lock_doc(path, "sess-A", age_ms=1000)
+        lock = clickup.AdvisoryLock(path, "sess-A", "YAML file")
+        lock.acquire(wait_seconds=0)
+        before = _lock_doc(path)["ts"]
+        lock.release()
+        assert path.exists(), "an adopted lock must survive release"
+        assert _lock_doc(path)["session_id"] == "sess-A"
+        assert _lock_doc(path)["ts"] >= before, "and be refreshed, so the sync counts as activity"
+
+    def test_stale_lock_is_taken_over(self, tmp_path):
+        path = tmp_path / ".project-tasks.lock"
+        _write_lock_doc(path, "dead-session", age_ms=clickup.LOCK_TTL_MS + 5000)
+        lock = clickup.AdvisoryLock(path, "me", "YAML file")
+        lock.acquire(wait_seconds=0)
+        assert _lock_doc(path)["session_id"] == "me"
+
+    def test_foreign_fresh_lock_fails_loudly_and_changes_nothing(self, tmp_path):
+        """Never a quiet skip. A sync that silently does nothing is the failure
+        mode that hides for days."""
+        path = tmp_path / ".project-tasks.lock"
+        _write_lock_doc(path, "sess-OTHER", age_ms=1000)
+        lock = clickup.AdvisoryLock(path, "me", "YAML file")
+        with pytest.raises(clickup.LockBusy) as e:
+            lock.acquire(wait_seconds=0)
+        assert "sess-OTH" in str(e.value)
+        assert "--lock-timeout" in str(e.value), "the message must say how to wait longer"
+        assert str(path) in str(e.value), "and where the lock is, for a crashed holder"
+        assert _lock_doc(path)["session_id"] == "sess-OTHER", "the holder's lock is untouched"
+
+    def test_waits_for_a_lock_that_is_released_and_then_succeeds(self, tmp_path, monkeypatch):
+        """The ordinary case Maurice described: you do not have the flag, so you
+        wait, and the wait is short."""
+        import threading
+
+        path = tmp_path / ".project-tasks.lock"
+        _write_lock_doc(path, "sess-OTHER", age_ms=1000)
+        monkeypatch.setattr(clickup, "LOCK_POLL_SECONDS", 0.01)
+        threading.Timer(0.05, path.unlink).start()  # the holder finishes
+        lock = clickup.AdvisoryLock(path, "me", "YAML file")
+        lock.acquire(wait_seconds=10)
+        assert _lock_doc(path)["session_id"] == "me"
+
+    def test_refresh_keeps_a_long_run_from_going_stale_under_its_own_feet(self, tmp_path):
+        """A board big enough to sync for longer than the TTL would otherwise
+        let another session walk in behind it mid-run."""
+        path = tmp_path / ".project-tasks.lock"
+        lock = clickup.AdvisoryLock(path, "me", "YAML file")
+        lock.acquire(wait_seconds=0)
+        _write_lock_doc(path, "me", age_ms=clickup.LOCK_TTL_MS + 1000)  # simulate a slow run
+        assert clickup._lock_age_ms(_lock_doc(path)) >= clickup.LOCK_TTL_MS
+        lock.refresh()
+        assert clickup._lock_age_ms(_lock_doc(path)) < 1000
+
+    def test_does_not_release_a_lock_that_was_taken_over(self, tmp_path):
+        """Our TTL lapsed and someone else took it. Deleting would strip a lock
+        off a run that is actively using it."""
+        path = tmp_path / ".project-tasks.lock"
+        lock = clickup.AdvisoryLock(path, "me", "YAML file")
+        lock.acquire(wait_seconds=0)
+        _write_lock_doc(path, "sess-NEW", age_ms=0)
+        lock.release()
+        assert _lock_doc(path)["session_id"] == "sess-NEW"
+
+    def test_a_corrupt_lock_file_reads_as_free(self, tmp_path):
+        """Same as the hook. An advisory lock that failed closed on a corrupt
+        file would wedge the tool with no way out but a manual delete."""
+        path = tmp_path / ".project-tasks.lock"
+        path.write_text("{not json")
+        clickup.AdvisoryLock(path, "me", "YAML file").acquire(wait_seconds=0)
+        assert _lock_doc(path)["session_id"] == "me"
+
+    def test_lock_write_is_atomic_so_a_reader_never_sees_a_half_file(self, tmp_path):
+        path = tmp_path / ".project-tasks.lock"
+        clickup._write_lock(path, "me")
+        assert not list(tmp_path.glob("*.tmp*")), "no temp file left behind"
+        assert _lock_doc(path)["session_id"] == "me"
+
+
+class TestSyncLockComposite:
+    def test_holds_both_file_and_list_locks_and_releases_both(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        yaml_file = tmp_path / "project-tasks.yaml"
+        yaml_file.write_text("epics: []\n")
+        file_lock = tmp_path / ".project-tasks.lock"
+        list_lock = clickup.lock_path_for_list("L1")
+        with clickup.SyncLock(str(yaml_file), "L1", wait_seconds=0, owner="me"):
+            assert _lock_doc(file_lock)["session_id"] == "me"
+            assert _lock_doc(list_lock)["session_id"] == "me"
+        assert not file_lock.exists()
+        assert not list_lock.exists()
+
+    def test_a_busy_list_lock_releases_the_file_lock_it_already_took(self, tmp_path, monkeypatch):
+        """Otherwise a failed acquire leaves the file locked by a process that
+        is no longer running -- for a full TTL, for nothing."""
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        yaml_file = tmp_path / "project-tasks.yaml"
+        yaml_file.write_text("epics: []\n")
+        _write_lock_doc(clickup.lock_path_for_list("L1"), "sess-OTHER", age_ms=1000)
+        with pytest.raises(clickup.LockBusy):
+            with clickup.SyncLock(str(yaml_file), "L1", wait_seconds=0, owner="me"):
+                pass  # pragma: no cover
+        assert not (tmp_path / ".project-tasks.lock").exists()
+
+    def test_no_list_id_means_only_the_file_lock(self, tmp_path):
+        yaml_file = tmp_path / "project-tasks.yaml"
+        yaml_file.write_text("epics: []\n")
+        lock = clickup.SyncLock(str(yaml_file), None, wait_seconds=0, owner="me")
+        assert len(lock.locks) == 1
+
+    def test_locks_release_even_when_the_body_raises(self, tmp_path):
+        yaml_file = tmp_path / "project-tasks.yaml"
+        yaml_file.write_text("epics: []\n")
+        with pytest.raises(RuntimeError):
+            with clickup.SyncLock(str(yaml_file), None, wait_seconds=0, owner="me"):
+                raise RuntimeError("sync blew up")
+        assert not (tmp_path / ".project-tasks.lock").exists()
+
+
+class TestWithLockCommand:
+    def test_child_inherits_the_owner_id_so_a_nested_sync_does_not_deadlock(self, monkeypatch):
+        """Without this a plain shell deadlocks against itself: each process
+        mints a unique owner, so `with-lock ... -- clickup.py sync` would block
+        on a lock its own parent holds."""
+        monkeypatch.setenv("CLICKUP_LOCK_OWNER", "owner-X")
+        seen = {}
+
+        def _run(argv, env=None):
+            seen.update(env or {})
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(clickup.subprocess, "run", side_effect=_run):
+            assert clickup.cmd_with_lock(["true"]) == 0
+        assert seen["CLICKUP_LOCK_OWNER"] == "owner-X"
+
+    def test_returns_the_childs_exit_code(self):
+        assert clickup.cmd_with_lock(["sh", "-c", "exit 7"]) == 7
+
+    def test_missing_command_is_reported_not_swallowed(self):
+        assert clickup.cmd_with_lock(["definitely-not-a-real-command-xyz"]) == 127
+
+
+class TestPeekListId:
+    def test_reads_the_list_id_without_a_full_load(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        f.write_text("project:\n  clickup_list_id: 901419115649\nepics: []\n")
+        assert clickup._peek_list_id(str(f)) == "901419115649"
+
+    def test_unreadable_file_is_not_the_lockers_error_to_raise(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        f.write_text("{{{ not yaml")
+        assert clickup._peek_list_id(str(f)) is None
+
+
+class TestAtomicYamlSave:
+    def test_save_leaves_no_temp_file_behind(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        data = {"project": {"name": "p"}, "epics": []}
+        clickup.save_yaml(data, str(f))
+        assert yaml.safe_load(f.read_text())["epics"] == []
+        assert not list(tmp_path.glob("*.tmp*"))

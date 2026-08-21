@@ -26,6 +26,7 @@ epics:                        Tasks (flat list):
 | `sync` | Full bidirectional sync with conflict resolution |
 | `merge` | Like sync but uses GPT-4o-mini to propose merged values |
 | `status` | Offline summary table (no API calls) |
+| `with-lock` | Run any command (an editor, a script, a shell) while holding the project's lock — the supported way to hand-edit a task file |
 
 ### Which command should I use? → `sync` (default)
 
@@ -50,6 +51,128 @@ Both `push` and `pull` print a one-time warning banner describing what they'll o
 > Still good practice: **run it detached / in the background** (an agent's `run_in_background`, or `nohup … &` / a tmux pane) for very large boards, and always preview with `sync --dry-run` first (read-only).
 >
 > - **If a run *was* interrupted (older versions, or to double-check):** check `git status` on the YAML and re-run — the dedupe pass adopts any orphan tasks. If you see `⚠️ DUPLICATES` in the summary, inspect the YAML and ClickUp for duplicate tasks.
+
+## Locking — the tool takes the flag for you
+
+**`clickup.py` is the only supported writer of a task file.** Every writing command
+takes an advisory lock before it reads the YAML, holds it for the whole run, and
+releases it at the end. **You do not grab a flag by hand, and you must not** — a
+hand-written lock carries an identity nothing else can match, which locks out its own
+author.
+
+If you want to *edit* rather than sync, that also goes through the tool. Editing
+without syncing is a normal workflow — you stage cards, look at them, publish later —
+so the tool wraps whatever you would have used anyway rather than reimplementing
+text editing:
+
+```bash
+# Hand-edit inside the lock
+./clickup.py with-lock docs/project-tasks.yaml -- $EDITOR docs/project-tasks.yaml
+
+# A whole session of edits, then a sync, as one continuous hold
+./clickup.py with-lock docs/project-tasks.yaml -- bash
+```
+
+### Why the lock is in the tool and not only in the hook
+
+On this machine a Claude Code `PreToolUse` hook has long guarded hand-edits to
+`project-tasks.yaml`. A hook can only see Claude Code tool calls, so it is
+structurally blind to the writers that matter most here:
+
+| writer of the task file | hook | tool |
+|---|:--:|:--:|
+| Claude via Edit / Write / MultiEdit | ✅ | — |
+| Claude via Bash (`sed`, a heredoc) | ❌ | ✅ via `with-lock` |
+| **`sync` / `push` / `pull` / `merge` writing back to the YAML** | ❌ | ✅ |
+| a human or a cron at a shell | ❌ | ✅ |
+
+Row three is the easy one to miss. **`sync` is a writer, not just a reader**: it
+flushes each new task's `clickup_id` back to the YAML the moment the task is created,
+stamps `project.last_synced`, and `pull` rewrites story rows wholesale. It also
+mutates a second piece of shared state, the 3-way base snapshot under
+`.clickup-sync/`. Two runs against one list can interleave a read-modify-write on
+both.
+
+So the critical section is **the whole transaction — acquire → edit → sync →
+release** — not the individual write.
+
+### What it locks, and where
+
+| lock | path | protects |
+|---|---|---|
+| file | `<dir>/.<stem>.lock` — e.g. `docs/.project-tasks.lock` | the YAML and its `.clickup-sync/` base snapshot |
+| list | `${XDG_CACHE_HOME:-~/.cache}/clickup-yaml-sync/list-<id>.lock` | the ClickUp list itself |
+
+Both are taken, **file first and then list**, a fixed order that cannot deadlock. They
+are not the same lock and one does not imply the other: **two different YAML files
+pointed at one ClickUp list is a real configuration**, and file-level locking does
+nothing for it.
+
+**Add `.project-tasks.lock` (or `.*.lock` beside your task file) to the consuming
+repo's `.gitignore`.** It is per-machine runtime state; committing it has already
+caused confusion elsewhere.
+
+### Interop with the Claude Code hook
+
+The file lock is deliberately the *same* lock the hook uses — same path, same JSON
+(`{session_id, ts, pid}`), same 5-minute TTL — and under Claude Code the **same
+identity**. `CLAUDE_CODE_SESSION_ID` is exported into Bash tool calls and holds
+exactly the session UUID the hook writes (verified against a live hook-written lock,
+2026-08-21; note `CLAUDE_SESSION_ID`, without `CODE`, is a different and empty
+variable).
+
+That is what makes a session's edit and its sync **one continuous hold of one lock**
+rather than two mechanisms taking turns on a file the other is writing. Concretely:
+
+- A fresh lock already held by **our own session** is *adopted*, not waited on — so a
+  session that just edited does not deadlock against itself for a full TTL.
+- On release, an adopted lock is **handed back** rather than deleted, because that
+  session may still be mid-edit-burst. A lock this tool created is deleted.
+- The hook still earns its place: it catches a hand-edit made without the tool, and
+  tells that session to wait.
+
+Outside Claude Code (a plain shell, a cron), the tool mints a unique per-process
+identity. `with-lock` exports `CLICKUP_LOCK_OWNER` to its child, so a nested
+`clickup.py sync` **joins** the hold instead of blocking on its own parent.
+
+### When someone else holds it
+
+The run waits, visibly, then **fails loudly** — it never quietly skips the work:
+
+```
+Waiting for YAML file lock held by 852d7779 (held 12s) -- up to 120s...
+ERROR: YAML file is locked by 852d7779 (held 132s, expires in 168s).
+  lock file: /path/to/docs/.project-tasks.lock
+  Waited 120s and gave up. Nothing was changed -- rerun when that holder is done.
+  Raise the wait with --lock-timeout SECONDS. ...
+```
+
+Exit code **3**, distinct from `1`, so a caller can tell "busy, try again" from
+"failed".
+
+| flag / env | effect |
+|---|---|
+| `--lock-timeout SECONDS` | how long to wait before failing (default 120) |
+| `--no-lock`, `CLICKUP_NO_LOCK=1` | skip locking entirely — the escape hatch. You are then responsible for knowing nothing else is writing |
+| `CLICKUP_LOCK_OWNER=<id>` | pin the identity (tests; a cron that wants a stable name) |
+
+**Which commands lock:** `push`, `pull`, `sync`, `merge`, `with-lock`. Not `status`
+(offline) or `diff` (reads both sides, writes neither). **`--dry-run` does not lock**
+either — it writes nothing, so making it queue behind a real run costs more than it
+buys; the plan it prints is a preview, and the real run that follows locks properly.
+
+### Crash safety
+
+A process killed mid-sync leaves a lock that **expires** after the 5-minute TTL,
+never one held forever. A long run refreshes its locks on a background heartbeat, so
+a sync slower than the TTL does not go stale under its own feet. A corrupt or
+unreadable lock file reads as *free* (the same choice the hook makes) — an advisory
+lock that failed closed would wedge the tool with no way out but a manual delete.
+
+One residual race, stated rather than hidden: this tool writes lock files
+**atomically**, but the hook writes in place, so a reader can in principle catch a
+hook write half-finished and read the file as free. The window is microseconds and
+the mechanism is advisory by design; the durable arbiter is still git.
 
 ## Multi-Tag, Milestones, and Custom Dropdowns
 
@@ -549,6 +672,12 @@ python3 clickup.py merge project.yaml
 
 # Offline status summary
 python3 clickup.py status project.yaml
+
+# Hand-edit a task file inside the lock (the supported edit path)
+./clickup.py with-lock docs/project-tasks.yaml -- $EDITOR docs/project-tasks.yaml
+
+# Wait longer for a lock held by another session
+./clickup.py sync docs/project-tasks.yaml --lock-timeout 300
 
 # Dry run (show what would happen)
 python3 clickup.py push project.yaml --dry-run
