@@ -689,6 +689,36 @@ CLICKUP_BASE = "https://api.clickup.com/api/v2"
 RATE_LIMIT_SLEEP = 0.5
 
 
+class ClickUpAPIError(RuntimeError):
+    """A ClickUp API call that failed, carrying the response body.
+
+    ``urllib``'s ``HTTPError`` stringifies to just ``HTTP Error 403: Forbidden``,
+    and by the time a caller sees it the body has already been consumed reading
+    it for the log. So every ``except Exception as e: log.warning(f"...: {e}")``
+    in this file printed the status and threw away the only part that says WHY
+    -- ClickUp's ``err`` message and its ``ECODE``. The real reason then existed
+    only on a separate ERROR line, correlated with the failure by adjacency.
+    """
+
+    def __init__(self, status: int, body: str, method: str, url: str) -> None:
+        self.status = status
+        self.body = body
+        self.method = method
+        self.url = url
+        self.ecode: Optional[str] = None
+        self.err: Optional[str] = None
+        try:
+            doc = json.loads(body)
+            if isinstance(doc, dict):
+                self.ecode = doc.get("ECODE")
+                self.err = doc.get("err")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        detail = self.err or (body[:200] if body else "(no body)")
+        code = f" [{self.ecode}]" if self.ecode else ""
+        super().__init__(f"HTTP {status}{code}: {detail}")
+
+
 def _api_request(
     method: str,
     url: str,
@@ -720,7 +750,7 @@ def _api_request(
                 time.sleep(wait)
                 continue
             log.error(f"HTTP {e.code}: {resp_body}")
-            raise
+            raise ClickUpAPIError(e.code, resp_body, method, url) from e
         except urllib.error.URLError as e:
             log.error(f"URL error: {e.reason}")
             raise
@@ -1880,6 +1910,69 @@ def _resolve_dependency_ids(
     return desired, unresolved
 
 
+# Edge failures are per-edge and easy to lose: a 13-card board can emit 13
+# warnings that scroll past while the run reports success. These accumulate them
+# so the end of the run can say so plainly -- the same principle as the lock
+# failing loudly rather than doing nothing quietly.
+_EDGE_FAILURES: list[str] = []
+_EDGE_HINT_SHOWN = False
+
+# Printed ONCE per run on the first edge failure. Deliberately phrased as things
+# to check rather than as a diagnosis: these are the plausible causes on this
+# account, not a reading of the error. The error itself is in the message above
+# it, and it is authoritative.
+#
+# STILL UNEXERCISED AGAINST A REAL FAILURE (as of 2026-08-21). This was written
+# expecting the guest-shared BREC space to refuse edge writes -- it did not. The
+# Dependencies ClickApp turned out to be ENABLED there, and all 9 dependencies
+# and 2 relations applied with no error. So the one live guest-shared client
+# board we have does NOT reproduce the case this hint describes, and the
+# INSUFFICIENT_ACCESS line in particular remains a plausible cause nobody has
+# seen here. That is the reason it is a checklist rather than a diagnosis: if a
+# real failure ever arrives, put its actual ECODE in here and narrow it.
+EDGE_FAILURE_HINT = (
+    "    Edge operations (dependencies / linked tasks) can fail for reasons the "
+    "task itself is fine for. Worth checking:\n"
+    "      - the Dependencies ClickApp may be disabled on this Space\n"
+    "      - a guest-shared Space can refuse reads/writes the token can make "
+    "elsewhere (INSUFFICIENT_ACCESS)\n"
+    "      - the target task may be in a different Space or already deleted\n"
+    "    The API's own message on the line above is authoritative; this is a "
+    "checklist, not a diagnosis."
+)
+
+
+def _record_edge_failure(kind: str, label: str, target: str, err: Exception) -> None:
+    """Log one edge failure, show the checklist once, and remember it for the
+    end-of-run summary."""
+    global _EDGE_HINT_SHOWN
+    log.warning(f"    Failed to {kind} on {target} for {label}: {err}")
+    _EDGE_FAILURES.append(f"{kind}: {label} -> {target}: {err}")
+    if not _EDGE_HINT_SHOWN:
+        _EDGE_HINT_SHOWN = True
+        log.warning(EDGE_FAILURE_HINT)
+
+
+def report_edge_failures() -> None:
+    """Surface accumulated edge failures at the end of a run.
+
+    Without this the run prints its normal success summary and the failures are
+    somewhere in the scrollback -- so a board that silently has none of its
+    declared dependencies looks like a board that synced fine.
+    """
+    if not _EDGE_FAILURES:
+        return
+    print("\n" + "=" * 68)
+    print(f"EDGE OPERATIONS FAILED: {len(_EDGE_FAILURES)}")
+    print("=" * 68)
+    print("The tasks themselves synced. These relationships did NOT get created,")
+    print("so the board is missing structure the YAML declares:")
+    for f in _EDGE_FAILURES:
+        print(f"  - {f}")
+    print("\n" + EDGE_FAILURE_HINT.replace("    ", "  "))
+    print("=" * 68)
+
+
 def _edge_label(story: dict, task_id: str) -> str:
     """``'story name' (task id)`` — so an edge log line says which task it means.
 
@@ -1946,14 +2039,14 @@ def _sync_dependencies(
             log.info(f"    Added dependency: {label} waits on {dep_id}")
             changed = True
         except Exception as e:
-            log.warning(f"    Failed to add dependency on {dep_id}: {e}")
+            _record_edge_failure("add dependency", label, dep_id, e)
     for dep_id in rem:
         try:
             clickup_remove_dependency(token, task_id, dep_id)
             log.info(f"    Removed dependency: {label} no longer waits on {dep_id}")
             changed = True
         except Exception as e:
-            log.warning(f"    Failed to remove dependency on {dep_id}: {e}")
+            _record_edge_failure("remove dependency", label, dep_id, e)
     return changed
 
 
@@ -2099,14 +2192,14 @@ def _sync_relations(
             log.info(f"    Added relation: {label} linked to {rid}")
             changed = True
         except Exception as e:
-            log.warning(f"    Failed to add relation to {rid}: {e}")
+            _record_edge_failure("add relation", label, rid, e)
     for rid in rem:
         try:
             clickup_remove_link(token, task_id, rid)
             log.info(f"    Removed relation: {label} no longer linked to {rid}")
             changed = True
         except Exception as e:
-            log.warning(f"    Failed to remove relation to {rid}: {e}")
+            _record_edge_failure("remove relation", label, rid, e)
     return changed
 
 
@@ -4657,6 +4750,9 @@ def _dispatch(args: argparse.Namespace, rest: list[str]) -> int:
     # that contradicts a gate -- that is exactly the case worth seeing). Never
     # changes the exit code: this reports a guideline, not a failure. Wrapped
     # because a lint defect must not fail an otherwise-good sync.
+    # Edge failures first: a board missing its declared dependencies is a
+    # structural problem, and it must not be buried under a lint report.
+    report_edge_failures()
     try:
         print_lint_report(lint_milestone_dates(data))
     except Exception as e:  # pragma: no cover - defensive

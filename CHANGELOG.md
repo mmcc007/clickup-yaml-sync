@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A failed dependency or linked-task edge is no longer easy to miss.** Two
+  separate problems, both of which made a board silently end up without the
+  structure its YAML declares:
+  - **The API's reason never reached the caller.** `urllib`'s `HTTPError`
+    stringifies to `HTTP Error 403: Forbidden`, and the response body was
+    already consumed reading it for the log — so every
+    `except Exception as e: log.warning(f"...: {e}")` printed the status and
+    threw away ClickUp's own `err` message and `ECODE`. The real reason existed
+    only on a separate ERROR line, correlated with the failure by adjacency.
+    A new `ClickUpAPIError` carries status, body, `err` and `ECODE`, so any
+    caller's message is now informative.
+  - **Failures were per-edge warnings and nothing else.** On a 13-card board
+    that is 13 warnings scrolling past while the run reports success. Edge
+    failures are now collected and reported in an end-of-run block naming every
+    edge that did not get created, with a once-per-run checklist of plausible
+    causes (Dependencies ClickApp disabled on the Space, a guest-shared Space
+    refusing access, a target in another Space or deleted). The checklist says
+    explicitly that the API's own message is authoritative and that it is a
+    checklist, not a diagnosis — presenting a guess as a diagnosis sends people
+    down the wrong path with confidence.
+
+  A failed edge still does not abort the run: the tasks themselves are fine, and
+  the point is that the failure is *reported*, not that it becomes fatal.
+
 ### Added
 
 - **Story-level `notes:` — YAML-only context that never reaches ClickUp.** The
