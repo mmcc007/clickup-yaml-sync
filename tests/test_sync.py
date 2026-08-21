@@ -4032,3 +4032,131 @@ class TestPushAndSyncShareOneUniverse:
         assert "_collect_managed_tag_universe(" not in sync_src
         assert "load_base_managed_tags(" not in sync_src, \
             "sync must not union the base itself either — one function, one place"
+
+
+# ---------------------------------------------------------------------------
+# Assignee conflicts: say they are not base-tracked, and show what is discarded
+# ---------------------------------------------------------------------------
+#
+# Issue #42. The reported cause was "the base snapshot records assignees as
+# None on create" — it does not: the key is ABSENT, because comparable_local()
+# returns seven scalar keys and assignees is not one of them. The real cause is
+# that assignees sit outside the 3-way model entirely, so _collect_3way_conflicts
+# reports ANY divergence as a conflict. That makes it broader than reported:
+# every deliberate reassignment made in the YAML is a conflict, which is the
+# exact operation someone runs `sync` to perform.
+#
+# This is the INTERIM. It does not fix the false conflict — it defuses the
+# thing that is actually dangerous, which is the operator's way out of it.
+# `--on-conflict local` is a blunt overwrite, and someone who has seen the same
+# spurious conflict three times reaches for it without checking the remote. One
+# day that lands on a real edit made in the ClickUp UI.
+
+
+# One id map shared by the fake roster and the fake ClickUp tasks. Getting these
+# out of step silently inverts every assertion — the divergent case reads as
+# agreement and vice versa — so they are derived from one source on purpose.
+_USER_IDS = {"wframe@brecslc.com": 101, "maurice@spark6.com": 102}
+_RESOLVER = dict(_USER_IDS)
+
+
+def _assignee_story(assignees=None, name="Confirm RealSynergy access", **extra):
+    s = _story_with(name, clickup_id="T1", **extra)
+    if assignees is not None:
+        s["assignees"] = assignees
+    return s
+
+
+def _cu_with_assignees(*emails, name="Confirm RealSynergy access"):
+    return {
+        "id": "T1", "name": name,
+        "status": {"status": "backlog"}, "description": "", "tags": [],
+        "priority": None, "due_date": None, "start_date": None,
+        "custom_fields": [], "date_updated": "1", "url": "u",
+        "assignees": [{"id": _USER_IDS[e], "email": e, "username": e.split("@")[0]}
+                      for e in emails],
+    }
+
+
+class TestBaseSnapshotDoesNotTrackAssignees:
+    def test_the_key_is_absent_not_null(self):
+        """Pinning the corrected diagnosis. 'Records assignees as None' would
+        imply a create-time defect; absent means assignees are outside the
+        model, which is a different and broader bug."""
+        data = _lint_data(_epic_with("E", [_assignee_story(["a@x.com"])]))
+        record = clickup.build_base_from_yaml(data, {})["T1"]
+        assert "assignees" not in record
+
+    def test_the_scalar_field_set_is_unchanged(self):
+        data = _lint_data(_epic_with("E", [_assignee_story(["a@x.com"])]))
+        assert set(clickup.build_base_from_yaml(data, {})["T1"]) == {
+            "name", "status", "description", "priority",
+            "milestone", "due_date", "start_date",
+        }
+
+
+class TestAssigneeConflictIsFlagged:
+    def _conflicts(self, story, cu):
+        return clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])),
+            {"T1": cu},
+            {"T1": clickup.comparable_local(story, {})},   # base agrees on scalars
+            {},
+            _RESOLVER,
+        )
+
+    def test_the_fixture_ids_line_up(self):
+        """Guard on the fixtures themselves: if the fake roster and the fake
+        ClickUp task disagree on ids, every assertion in this class silently
+        inverts and still 'passes' something."""
+        cu = _cu_with_assignees("maurice@spark6.com")
+        assert clickup._cu_assignee_ids(cu) == {_RESOLVER["maurice@spark6.com"]}
+
+    def test_a_diverging_assignee_set_is_marked_not_base_tracked(self):
+        c = self._conflicts(_assignee_story(["wframe@brecslc.com"]),
+                            _cu_with_assignees("maurice@spark6.com"))
+        assert len(c) == 1
+        assert c[0]["field"] == "assignees"
+        assert c[0]["not_base_tracked"] is True
+
+    def test_it_still_carries_both_sides(self):
+        """Showing the two sets IS the check the operator would otherwise do by
+        hand against the API."""
+        c = self._conflicts(_assignee_story(["wframe@brecslc.com"]),
+                            _cu_with_assignees("maurice@spark6.com"))
+        assert c[0]["local"] == ["wframe@brecslc.com"]
+        assert "maurice@spark6.com" in c[0]["remote"]
+
+    def test_agreeing_assignees_are_not_a_conflict(self):
+        assert self._conflicts(_assignee_story(["maurice@spark6.com"]),
+                               _cu_with_assignees("maurice@spark6.com")) == []
+
+    def test_a_scalar_conflict_is_not_marked_not_base_tracked(self):
+        """Only the untracked fields get the note. Marking everything would
+        make it noise and it would stop being read."""
+        story = _assignee_story(["maurice@spark6.com"], name="Local name")
+        cu = _cu_with_assignees("maurice@spark6.com", name="Remote name")
+        c = clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])), {"T1": cu},
+            {"T1": {"name": "Base name"}}, {}, _RESOLVER,
+        )
+        names = [x for x in c if x["field"] == "name"]
+        assert names and not names[0].get("not_base_tracked")
+
+
+class TestNotBaseTrackedNote:
+    def test_it_says_this_may_not_be_a_collision(self):
+        note = clickup.NOT_BASE_TRACKED_NOTE
+        assert "not base-tracked" in note
+        assert "may be an ordinary local edit" in note
+
+    def test_it_names_what_each_flag_destroys(self):
+        """A warning that says 'be careful' gets scrolled past. One that says
+        which values each flag discards is the check itself."""
+        note = clickup.NOT_BASE_TRACKED_NOTE
+        assert "--on-conflict local  OVERWRITES the remote" in note
+        assert "--on-conflict remote OVERWRITES your YAML" in note
+
+    def test_it_tells_the_operator_how_to_decide(self):
+        assert "did not change the assignees in the ClickUp UI" in clickup.NOT_BASE_TRACKED_NOTE
+        assert "check the task in ClickUp first" in clickup.NOT_BASE_TRACKED_NOTE

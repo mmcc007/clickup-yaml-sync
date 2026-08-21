@@ -4,6 +4,34 @@
 
 ### Fixed
 
+- **An assignee conflict now says it may not be a conflict, and names what each
+  flag would destroy** (#42, interim).
+
+  Assignees sit outside the 3-way model — `comparable_local()` returns seven
+  scalar keys and assignees is not one of them, so the base snapshot has no
+  assignee record at all (the key is **absent**, not null). `sync` therefore
+  reports *any* YAML-vs-remote divergence as a conflict. That makes it broader
+  than a create-time defect: **every deliberate reassignment made in the YAML is
+  a conflict**, which is the exact operation someone runs `sync` to perform.
+  Creates just guarantee you meet it in week one.
+
+  **The danger is the way out, not the false alarm.** The only route forward is
+  `--on-conflict local`, a blunt overwrite. Someone who has seen the same
+  spurious conflict three times reaches for it without checking the remote, and
+  one day that lands on a real edit made in the ClickUp UI. So:
+  - the abort report says how many conflicts are on non-base-tracked fields and
+    that those may be local-only edits — they are no longer called "true
+    conflicts", because some of them are not;
+  - each carries a note stating that the tool cannot tell which side moved, that
+    `--on-conflict local` overwrites the remote values shown and
+    `--on-conflict remote` overwrites the YAML values shown, and how to decide;
+  - at the moment of overwrite the log names the values being **discarded**, so
+    an operator who skipped the report still sees what the run threw away.
+
+  This does not fix the false conflict. Base-tracking assignees properly is a
+  separate change, deliberately kept separate so the safe fix is not held up by
+  the correct one.
+
 - **`push` now strips a tag dropped from the YAML. It never used to.**
   `cmd_sync` unioned the base snapshot's `managed_tags` into its managed-tag
   universe; `cmd_push` did not. A tag removed from `tags:` (or a removed
