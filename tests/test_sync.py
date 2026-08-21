@@ -4160,3 +4160,75 @@ class TestNotBaseTrackedNote:
     def test_it_tells_the_operator_how_to_decide(self):
         assert "did not change the assignees in the ClickUp UI" in clickup.NOT_BASE_TRACKED_NOTE
         assert "check the task in ClickUp first" in clickup.NOT_BASE_TRACKED_NOTE
+
+
+# ---------------------------------------------------------------------------
+# CHARACTERISATION: assignee behaviour BEFORE base-tracking (#42)
+# ---------------------------------------------------------------------------
+#
+# Written before anything moved, per the refactor condition. These pin what the
+# tool does today so the diff proves what changed rather than what was hoped.
+#
+# Several of these assert BEHAVIOUR THAT IS WRONG. That is the point: they are
+# a baseline, not an endorsement. The ones that describe the bug are named for
+# it and are replaced in the same commit that fixes it.
+
+
+class TestCharacterisationAssigneesToday:
+    def test_base_records_no_assignees(self):
+        """BASELINE (the defect). Nothing about assignees reaches the snapshot,
+        so the 3-way merge has no prior state to reason from."""
+        data = _lint_data(_epic_with("E", [_assignee_story(["wframe@brecslc.com"])]))
+        assert "assignees" not in clickup.build_base_from_yaml(data, {})["T1"]
+
+    def test_assignees_are_not_in_the_synced_scalar_fields(self):
+        """Which is why three_way_plan() never classifies them — it iterates
+        SYNCED_FIELDS. Pinned because base-tracking must NOT change this: a set
+        compared as a scalar string is its own bug."""
+        assert "assignees" not in clickup.SYNCED_FIELDS
+
+    def test_any_divergence_is_reported_as_a_conflict(self):
+        """BASELINE (the defect). Not just after a create — every YAML-side
+        reassignment lands here, which is the operation sync exists to perform."""
+        story = _assignee_story(["wframe@brecslc.com"])
+        conflicts = clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])),
+            {"T1": _cu_with_assignees("maurice@spark6.com")},
+            {"T1": clickup.comparable_local(story, {})},
+            {}, _RESOLVER,
+        )
+        assert [c["field"] for c in conflicts] == ["assignees"]
+
+    def test_matching_assignees_produce_no_conflict(self):
+        """CORRECT TODAY and must stay correct."""
+        story = _assignee_story(["maurice@spark6.com"])
+        assert clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])),
+            {"T1": _cu_with_assignees("maurice@spark6.com")},
+            {"T1": clickup.comparable_local(story, {})},
+            {}, _RESOLVER,
+        ) == []
+
+    def test_an_unmanaged_story_differs_only_if_clickup_has_assignees(self):
+        """CORRECT TODAY and must stay correct: a story with no `assignees` key
+        is UNMANAGED — ClickUp is left alone, and the divergence only exists so
+        `sync ask` can offer to capture remote assignees into the YAML."""
+        unmanaged = _assignee_story(None)
+        assert clickup._assignees_differ(unmanaged, _cu_with_assignees(), _RESOLVER) is False
+        assert clickup._assignees_differ(
+            unmanaged, _cu_with_assignees("maurice@spark6.com"), _RESOLVER) is True
+
+    def test_comparison_happens_in_id_space_not_string_space(self):
+        """CORRECT TODAY and the property base-tracking must preserve. YAML
+        strings are resolved through the workspace roster to ClickUp user ids
+        before comparison, because a YAML email and a ClickUp key need not be
+        the same string. Comparing strings to remote keys would trade a false
+        conflict for a false AGREEMENT, which is silent."""
+        story = {"assignees": ["MAURICE@spark6.com  "]}   # case and whitespace
+        cu = _cu_with_assignees("maurice@spark6.com")
+        assert clickup._assignees_differ(story, cu, _RESOLVER) is False
+
+    def test_an_unresolvable_assignee_is_reported_not_silently_dropped(self):
+        ids, unresolved = clickup._resolve_assignee_ids(["nobody@nowhere.com"], _RESOLVER)
+        assert ids == []
+        assert unresolved == ["nobody@nowhere.com"]
