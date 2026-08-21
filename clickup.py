@@ -3883,13 +3883,23 @@ def cmd_sync(
             data, cu_by_id, base, status_map, assignee_resolver
         )
         if conflicts and on_conflict == "stop":
+            untracked = sum(1 for c in conflicts if c.get("not_base_tracked"))
             log.info(f"\n{'='*80}")
-            log.info(f"SYNC ABORTED — {len(conflicts)} true conflict(s); NO changes made.")
+            log.info(f"SYNC ABORTED — {len(conflicts)} conflict(s); NO changes made.")
+            if untracked:
+                # Do not call these "true conflicts". Some of them are not, and
+                # saying so is what stops the flag being reached for blind.
+                log.info(
+                    f"  ({untracked} of them on fields that are NOT base-tracked "
+                    f"— see the notes below; those may be local-only edits.)"
+                )
             log.info(f"{'='*80}")
             for c in conflicts:
                 log.info(f"  [CONFLICT] '{c['task']}' {c['field']}:")
                 log.info(f"      local:  {_truncate(str(c['local']), 60)}")
                 log.info(f"      remote: {_truncate(str(c['remote']), 60)}")
+                if c.get("not_base_tracked"):
+                    log.info(NOT_BASE_TRACKED_NOTE)
             log.info(
                 "Resolve each (set the YAML to the intended value, or re-run with "
                 "--on-conflict local|remote), then sync again."
@@ -4024,12 +4034,31 @@ def cmd_sync(
                     # it can overwrite the side that didn't actually change (M1).
                     assignee_strategy = on_conflict if base_exists else conflict
                     if base_exists and _assignees_differ(story, cu_task, assignee_resolver):
-                        log.warning(
-                            f"  Assignees on '{story_name}' differ and are NOT base-tracked; "
-                            f"applying --on-conflict={on_conflict} may overwrite the unchanged "
-                            f"side. local={story.get('assignees', '(unmanaged)')} "
-                            f"remote={_cu_assignee_keys(cu_task)}"
-                        )
+                        # Name the values being DISCARDED, not just that a
+                        # divergence exists. Someone who skipped the report
+                        # above still sees, in the run log, exactly what this
+                        # run threw away and on which task.
+                        yaml_v = story.get("assignees", "(unmanaged)")
+                        remote_v = _cu_assignee_keys(cu_task)
+                        if assignee_strategy == "local":
+                            log.warning(
+                                f"  OVERWRITING assignees on '{story_name}': discarding "
+                                f"ClickUp's {remote_v}, writing {yaml_v}. Assignees are "
+                                f"NOT base-tracked, so if that remote value was a real "
+                                f"edit made in the UI it is now gone."
+                            )
+                        elif assignee_strategy == "remote":
+                            log.warning(
+                                f"  OVERWRITING assignees on '{story_name}': discarding "
+                                f"YAML's {yaml_v}, taking ClickUp's {remote_v}. Assignees "
+                                f"are NOT base-tracked, so if that YAML value was your "
+                                f"intended change it is now gone."
+                            )
+                        else:
+                            log.warning(
+                                f"  Assignees on '{story_name}' differ and are NOT "
+                                f"base-tracked. local={yaml_v} remote={remote_v}"
+                            )
                     _reconcile_assignees_sync(
                         token, story, cu_task, assignee_resolver,
                         assignee_strategy, story_name, stats,
@@ -4213,6 +4242,29 @@ def _resolve_conflicts(
                 stats["skipped"] += 1
 
 
+# Printed under any conflict on a field that is not base-tracked.
+#
+# The dangerous failure here is NOT the false conflict -- it is the operator's
+# way out of it. The only route forward is `--on-conflict local`, which is a
+# blunt overwrite, and someone who has seen the same spurious conflict three
+# times will reach for it without checking the remote. One day that lands on a
+# real edit somebody made in the ClickUp UI.
+#
+# A warning telling them to go and check is the thing that gets scrolled past.
+# So the report SHOWS both sides and says exactly what each flag would discard:
+# reading it IS the check they would otherwise do by hand against the API.
+NOT_BASE_TRACKED_NOTE = (
+    "      NOTE: assignees are not base-tracked, so the tool cannot tell which\n"
+    "            side changed. This may be an ordinary local edit rather than a\n"
+    "            collision -- reassigning in the YAML looks exactly like this.\n"
+    "            --on-conflict local  OVERWRITES the remote values above.\n"
+    "            --on-conflict remote OVERWRITES your YAML values above.\n"
+    "            If you did not change the assignees in the ClickUp UI, the\n"
+    "            remote value is just what a previous run wrote, and local is\n"
+    "            safe. If you are not sure, check the task in ClickUp first."
+)
+
+
 def _collect_3way_conflicts(
     data: dict,
     cu_by_id: dict,
@@ -4252,6 +4304,11 @@ def _collect_3way_conflicts(
                     "field": "assignees",
                     "local": story.get("assignees", "(unmanaged)"),
                     "remote": _cu_assignee_keys(cu_task),
+                    # Assignees are NOT base-tracked, so this entry is "the two
+                    # sides differ", not "both sides changed". Flagged so the
+                    # report can say so instead of presenting it as a genuine
+                    # collision -- see NOT_BASE_TRACKED_NOTE.
+                    "not_base_tracked": True,
                 })
     return conflicts
 
