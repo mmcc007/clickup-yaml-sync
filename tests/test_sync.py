@@ -4078,18 +4078,30 @@ def _cu_with_assignees(*emails, name="Confirm RealSynergy access"):
     }
 
 
-class TestBaseSnapshotDoesNotTrackAssignees:
-    def test_the_key_is_absent_not_null(self):
-        """Pinning the corrected diagnosis. 'Records assignees as None' would
-        imply a create-time defect; absent means assignees are outside the
-        model, which is a different and broader bug."""
-        data = _lint_data(_epic_with("E", [_assignee_story(["a@x.com"])]))
+class TestBaseSnapshotAssigneeKey:
+    """These pinned the corrected diagnosis of #42 while the bug was open: the
+    base recorded NO assignee key (the report said "records assignees as None",
+    which would have implied a create-time defect rather than assignees being
+    outside the model entirely).
+
+    That behaviour is now deliberately changed — assignees are base-tracked —
+    so the assertions are inverted here rather than deleted. The distinction
+    they were written to protect still matters and is kept: a MISSING key is
+    what an old snapshot and an unmanaged story both look like, and both must
+    read as UNKNOWN rather than as agreement.
+    """
+
+    def test_a_managed_story_now_records_its_assignees(self):
+        data = _lint_data(_epic_with("E", [_assignee_story(["maurice@spark6.com"])]))
         record = clickup.build_base_from_yaml(data, {})["T1"]
-        assert "assignees" not in record
+        assert record["assignees"] == ["maurice@spark6.com"]
 
     def test_the_scalar_field_set_is_unchanged(self):
-        data = _lint_data(_epic_with("E", [_assignee_story(["a@x.com"])]))
-        assert set(clickup.build_base_from_yaml(data, {})["T1"]) == {
+        """The seven scalars are untouched; assignees rides alongside them and
+        is classified separately, never by the scalar comparer."""
+        data = _lint_data(_epic_with("E", [_assignee_story(["maurice@spark6.com"])]))
+        record = clickup.build_base_from_yaml(data, {})["T1"]
+        assert set(record) - {"assignees"} == {
             "name", "status", "description", "priority",
             "milestone", "due_date", "start_date",
         }
