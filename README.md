@@ -224,6 +224,65 @@ suppression flag with no rationale tells the next reader nothing, and by the tim
 anyone asks, whoever set it has moved on. Accepted findings are still **counted** in
 the report, so suppressed is not the same as gone.
 
+## Story `notes:` — context that stays out of ClickUp
+
+A per-story field that lives in the YAML and **never reaches ClickUp**. Nothing
+pushes it, `pull` never overwrites it, and it is invisible to every diff and conflict
+path — it has no remote counterpart, so it cannot conflict. The story-scale
+equivalent of `project.notes`.
+
+```yaml
+- name: Stand up the ingest pipeline
+  description: |
+    Ingest the nightly carrier feed into the staging table and alert on a
+    failed run. Done when a failed run pages and a clean run does not.
+  notes: |
+    Threshold split routine vs adversarial per Eric on the 2026-08-14 kick-off.
+    SOW clause 4b makes the acceptance window ten business days, which is why
+    the gate is 2026-09-15. Considered a single combined check and rejected it —
+    the two have different escalation paths.
+```
+
+### Which goes where — the line that keeps the board useful
+
+| | `description` | `notes` |
+|---|---|---|
+| **Answers** | what a reader needs in order to **act** | **why** the card is the way it is |
+| **Read by** | everyone working the board, including the client | whoever maintains the file |
+| **Holds** | scope, acceptance criteria, definition of done | provenance: who said it, which clause, what was rejected |
+
+**Do not let `notes` become a second description.** Acceptance criteria and
+definition-of-done are description material; moving them into `notes` hides them from
+everyone actually working the board, which makes it worse rather than better.
+
+### Why the field exists
+
+A description that accumulates context helps whoever **writes** the card and actively
+harms whoever **reads** it. A card nobody reads has stopped being a coordination
+artefact and become a filing cabinet — and on a client-visible board, an over-long
+description spends the client's attention on our reasoning instead of their action.
+
+The cut context is usually not worthless; it is provenance. Without somewhere adjacent
+to keep it, the only options are on the card (where it hurts the reader) or in a
+separate document (where it drifts away from the card it describes). `notes:` is the
+third option.
+
+### It is authored, not derived
+
+**`pull` writes nothing into it, by decision.** A sync that appended to `notes` would
+make the field untrustworthy — you could no longer tell what a human meant from what a
+tool deposited. If a future change ever does need to record something there, it should
+be a clearly delimited block, never mixed into hand-written prose.
+
+> **Implementation note.** Unknown story keys already survive every code path, because
+> push and pull work from explicit field lists and mutate story dicts in place rather
+> than rebuilding them. `notes:` therefore needed no new machinery — but the behaviour
+> was *emergent*, and emergent behaviour breaks silently. `YAML_ONLY_STORY_FIELDS`
+> names the contract and a test class pins each property (never pushed, never pulled,
+> never compared, never snapshotted, never in an API body, survives save/reload). The
+> day someone rebuilds a story dict, CI fails instead of quietly deleting people's
+> provenance.
+
 ## Running it: use a pinned copy, not a live checkout
 
 **Operators should invoke a pinned checkout or an installed copy of `clickup.py`, not

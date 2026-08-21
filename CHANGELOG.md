@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Added
+
+- **Story-level `notes:` — YAML-only context that never reaches ClickUp.** The
+  story-scale equivalent of `project.notes`. Never pushed, never overwritten by
+  `pull`, invisible to every diff and conflict path (it has no remote
+  counterpart, so it cannot conflict).
+
+  A description that accumulates context helps whoever *writes* the card and
+  harms whoever *reads* it — and on a client-visible board an over-long
+  description spends the client's attention on our reasoning instead of their
+  action. The material being cut is usually provenance (who said it on which
+  call, which SOW clause, what was rejected), and its only previous homes were
+  the card itself, where it hurts the reader, or a separate document, where it
+  drifts away from what it describes.
+
+  **`description` = what a reader needs to act. `notes` = why it is like that.**
+  Acceptance criteria belong in the description; putting them in notes hides
+  them from everyone working the board.
+
+  **Authored, not derived** — `pull` writes nothing into it, by decision. A sync
+  that appended there would make the field untrustworthy.
+
+  No new machinery was needed: unknown story keys already survived every path,
+  because push and pull work from explicit field lists and mutate story dicts in
+  place. But that behaviour was *emergent*, and emergent behaviour breaks
+  silently — so `YAML_ONLY_STORY_FIELDS` names the contract and a test class
+  pins each property. The day someone rebuilds a story dict, CI fails instead of
+  quietly deleting the material people kept precisely because it was too
+  valuable to delete.
+
 ### Changed
 
 - **`milestone_label` accepts a slug: `M<n>-<slug>`, with `n` unbounded.**

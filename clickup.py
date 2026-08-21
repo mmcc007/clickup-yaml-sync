@@ -221,6 +221,33 @@ def get_openai_key() -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# YAML-only story fields
+# ---------------------------------------------------------------------------
+#
+# Fields that live in the task file and NEVER reach ClickUp. They are authored,
+# not derived: nothing pushes them, nothing pulls them, and no remote
+# counterpart exists for them to conflict with.
+#
+# Why they exist. A card description accumulates context that helps whoever
+# WRITES the card and actively harms whoever READS it -- provenance, mostly:
+# who said a thing on a call, why a threshold is set where it is, which SOW
+# clause an obligation comes from. On a client-visible board an over-long
+# description also spends the client's attention on our reasoning instead of
+# their action. Without somewhere adjacent to put that material the only
+# choices are on the card (where it hurts the reader) or in a separate
+# document (where it drifts away from the card it describes).
+#
+# This constant is documentation with teeth, not machinery: nothing reads it at
+# runtime. Unknown story keys already survive every code path -- push and pull
+# both work from an explicit field list and mutate story dicts in place rather
+# than rebuilding them. That is a property worth NAMING and TESTING rather than
+# relying on, because the day someone rebuilds a story dict or adds a field to
+# `comparable_local`, this material disappears silently. It is exactly the
+# material people put here because it was too valuable to delete.
+YAML_ONLY_STORY_FIELDS = ("notes",)
+
+
 def load_yaml(path: str) -> dict:
     with open(path, "r") as f:
         data = yaml.safe_load(f)
