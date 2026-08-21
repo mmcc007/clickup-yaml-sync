@@ -3615,3 +3615,107 @@ class TestMilestoneLabelSlug:
         for bad in ("Milestone 1", "M", "m1-", "M1 infrastructure", "M1_infra"):
             assert not _re.match(pattern, bad), bad
             assert not clickup.MILESTONE_TAG_RE.match(bad), bad
+
+
+# ---------------------------------------------------------------------------
+# YAML-only story fields (`notes:`)
+# ---------------------------------------------------------------------------
+#
+# These pass against the code as it already stands -- unknown story keys survive
+# every path today, because push and pull both work from explicit field lists
+# and mutate story dicts in place rather than rebuilding them.
+#
+# That is precisely why the tests exist. The behaviour is emergent, and the day
+# someone rebuilds a story dict or adds a field to comparable_local, this
+# material disappears with no error and no diff entry. It is the material people
+# put here BECAUSE it was too valuable to delete, so the failure would be silent
+# data loss of the worst kind. These tests turn an accident into a contract.
+
+
+def _noted_story(**extra) -> dict:
+    return _story_with(
+        "Card",
+        clickup_id="T1",
+        description="short and readable",
+        notes="Eric said on the kick-off call that the threshold is split "
+              "routine vs adversarial; SOW clause 4b.",
+        **extra,
+    )
+
+
+def _noted_cu_task() -> dict:
+    return {
+        "id": "T1", "name": "Card", "status": {"status": "backlog"},
+        "description": "short and readable", "tags": [], "priority": None,
+        "due_date": None, "start_date": None, "custom_fields": [],
+        "assignees": [], "date_updated": "1", "url": "u",
+    }
+
+
+class TestYamlOnlyStoryFields:
+    def test_notes_is_declared_yaml_only(self):
+        assert "notes" in clickup.YAML_ONLY_STORY_FIELDS
+
+    def test_pull_does_not_delete_notes(self):
+        """The headline failure: write notes, run pull, notes vanish because the
+        remote has no counterpart."""
+        story = _noted_story()
+        clickup._apply_clickup_to_yaml(story, _noted_cu_task(), {})
+        assert story["notes"].startswith("Eric said")
+
+    def test_notes_never_enters_the_comparison(self):
+        """It has no remote counterpart, so it can never conflict. If it reached
+        compare_task it would report a permanent phantom difference."""
+        assert "notes" not in clickup.comparable_local(_noted_story(), {})
+
+    def test_notes_never_enters_the_base_snapshot(self):
+        data = _lint_data(_epic_with("E", [_noted_story()]))
+        assert "notes" not in clickup.build_base_from_yaml(data, {})["T1"]
+
+    def test_notes_is_not_appended_to_the_pushed_description(self):
+        """The whole point is that a reader of the ClickUp card never sees it."""
+        assert "Eric said" not in clickup.description_with_meta(_noted_story())
+
+    def test_notes_does_not_become_a_tag(self):
+        story = _noted_story()
+        epic = _epic_with("E", [story])
+        assert not any("eric" in t.lower() for t in clickup._story_desired_tags(story, epic))
+
+    def test_notes_is_not_in_the_create_or_update_api_body(self):
+        """The last line of defence: whatever else happens, it must not be sent."""
+        story = _noted_story()
+        body = clickup.build_task_body(story, _epic_with("E", [story]), {}, {})
+        assert "Eric said" not in json.dumps(body)
+        assert "notes" not in body
+
+    def test_notes_survives_a_full_save_and_reload(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        data = _lint_data(_epic_with("E", [_noted_story()]))
+        clickup.save_yaml(data, str(f))
+        reloaded = clickup.load_yaml(str(f))
+        assert reloaded["epics"][0]["stories"][0]["notes"].startswith("Eric said")
+
+    def test_a_story_imported_from_clickup_has_no_notes_rather_than_a_fake_one(self):
+        """A card that arrives from ClickUp has no provenance to record. An empty
+        string would look authored; absent is honest."""
+        story = clickup._clickup_task_to_yaml_story(_noted_cu_task(), {})
+        assert "notes" not in story
+
+    def test_merge_resolution_does_not_disturb_notes(self):
+        """cmd_merge writes resolved values field by field into the existing
+        story dict -- pinned so a future rewrite cannot start replacing it."""
+        story = _noted_story()
+        with mock.patch.object(clickup, "clickup_update_task"):
+            clickup._apply_merged_value(story, _noted_cu_task(), "name", "New name", {}, "tok")
+        assert story["name"] == "New name"
+        assert story["notes"].startswith("Eric said")
+
+    def test_pull_writes_nothing_into_notes(self):
+        """Decision: notes is authored, not derived. A pull that appended to it
+        would make it untrustworthy -- you could no longer tell what a human
+        meant from what a sync deposited."""
+        story = _noted_story()
+        before = story["notes"]
+        clickup._apply_clickup_to_yaml(story, _noted_cu_task(), {})
+        clickup._sync_metadata(story, _noted_cu_task())
+        assert story["notes"] == before

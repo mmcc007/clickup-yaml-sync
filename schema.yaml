@@ -350,6 +350,43 @@ properties:
                   Start date as YYYY-MM-DD (date-only). Same handling as due_date.
                 example: "2026-06-15"
 
+              notes:
+                type: [string, "null"]
+                description: >
+                  YAML-only working notes for this story. **Never pushed to
+                  ClickUp, never overwritten by pull, never part of any diff or
+                  conflict** — it has no remote counterpart, so it cannot
+                  conflict. The story-scale equivalent of `project.notes`.
+
+                  **What belongs here: why the card is the way it is.**
+                  Provenance — who said a thing on a call, why a threshold is
+                  set where it is, which SOW clause an obligation comes from,
+                  what was considered and rejected.
+
+                  **What does NOT belong here: anything a reader needs in order
+                  to act.** That goes in `description`, which is what people
+                  actually read. Acceptance criteria, scope and definition-of-
+                  done are description material; putting them in notes hides
+                  them from everyone working the board and makes it worse rather
+                  than better.
+
+                  The field exists because a description that accumulates
+                  context helps whoever WRITES the card and harms whoever READS
+                  it — and on a client-visible board an over-long description
+                  spends the client's attention on our reasoning instead of
+                  their action. Keeping that material adjacent to the card beats
+                  the alternatives: on the card, where it hurts the reader, or in
+                  a separate document, where it drifts away from what it
+                  describes.
+
+                  Authored, not derived: `pull` writes nothing into it. A sync
+                  that deposited text here would make it impossible to tell what
+                  a human meant from what a tool left behind.
+                example: >
+                  Threshold split routine vs adversarial per Eric on the
+                  2026-08-14 kick-off. SOW clause 4b makes the acceptance window
+                  ten business days, which is why the gate is 2026-09-15.
+
               lint_exceptions:
                 type: object
                 description: >
