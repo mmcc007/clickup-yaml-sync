@@ -2,7 +2,44 @@
 
 ## Unreleased
 
+### Added
+
+- **The advisory lock is enforced inside the tool, across the whole transaction.**
+  `clickup.py` previously had no concept of the lock protecting the files it
+  writes. The lock existed only as a Claude Code `PreToolUse` hook, which can
+  only see Claude Code tool calls — so it never covered this tool's own
+  writeback (`clickup_id` flush, `last_synced`, pulled rows, the
+  `.clickup-sync/` base snapshot) or a human/cron at a shell. Every writing
+  command now holds a **file lock and a ClickUp-list lock** for the whole run:
+  acquire → edit → sync → release.
+  - Same lock path, JSON shape and TTL as the hook, and under Claude Code the
+    same identity (`CLAUDE_CODE_SESSION_ID`), so a session's edit and its sync
+    are one continuous hold rather than two mechanisms taking turns. A lock
+    already held by our own session is adopted, and handed back on release.
+  - A held lock waits **visibly** and then fails **loudly** — exit code `3`,
+    never a silent no-op.
+  - Crash-safe via the TTL; a heartbeat keeps a long run's locks fresh.
+  - `--lock-timeout`, `--no-lock` / `CLICKUP_NO_LOCK`, `CLICKUP_LOCK_OWNER`.
+  - See the README's **Locking** section. Add `.project-tasks.lock` to the
+    consuming repo's `.gitignore`.
+
+- **`with-lock <file> -- <command>`** — run any command (an editor, a script, a
+  shell, a Claude session) inside the project's lock. `clickup.py` is now the
+  only supported writer of a task file, and editing without syncing is a normal
+  workflow, so the tool wraps whatever you would have used rather than
+  reimplementing text editing. The child inherits `CLICKUP_LOCK_OWNER` so a
+  nested `sync` joins the hold instead of deadlocking against its own parent.
+
+- **CI.** The repo had a test suite and no workflow, so nothing could be run
+  against a change. `.github/workflows/ci.yml` runs the suite on PRs and on
+  pushes to `main`.
+
 ### Fixed
+
+- **`save_yaml` is now atomic** (temp file + `os.replace`). `push`/`sync` flush
+  the task file once per created task; a crash partway through the previous
+  truncate-and-write left the project's task file truncated.
+
 
 - **Dependency/relation edges are now fully visible in `--dry-run`.**
   - A story the run would **create** no longer has its declared `depends_on` /

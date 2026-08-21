@@ -4186,13 +4186,16 @@ def main() -> None:
              "~/bin/clickup-sandbox.env) instead of production.",
     )
 
-    parser.add_argument(
-        "rest",
-        nargs=argparse.REMAINDER,
-        help="For with-lock: '--' followed by the command to run under the lock.",
-    )
+    # Split the with-lock payload off BEFORE argparse sees it. argparse's
+    # REMAINDER would swallow trailing options too, breaking the long-standing
+    # `clickup.py sync <file> --dry-run` form.
+    argv = sys.argv[1:]
+    rest: list[str] = []
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, rest = argv[:cut], argv[cut + 1:]
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.sandbox:
         os.environ["CLICKUP_SANDBOX"] = "1"
@@ -4201,9 +4204,6 @@ def main() -> None:
         log.error(f"YAML file not found: {args.yaml_file}")
         sys.exit(1)
 
-    rest = list(args.rest)
-    if rest and rest[0] == "--":
-        rest = rest[1:]
     if args.command == "with-lock":
         if not rest:
             parser.error(
@@ -4211,7 +4211,9 @@ def main() -> None:
                 "clickup.py with-lock <file> -- <command> [args...]"
             )
     elif rest:
-        parser.error(f"unexpected extra arguments: {' '.join(rest)}")
+        parser.error(
+            f"only with-lock takes a '--' command; got: {' '.join(rest)}"
+        )
 
     # Which commands need the lock, and why the others do not:
     #   status  -- offline, reads the YAML and prints. No writes anywhere.
