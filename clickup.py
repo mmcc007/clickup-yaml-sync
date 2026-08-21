@@ -8,6 +8,7 @@ Commands:
   sync    Full bidirectional sync with per-conflict resolution strategy
   merge   LLM-assisted conflict resolution (pull + push with intelligent merging)
   status  Show summary of project state from YAML (offline, no API calls)
+  lint    Report milestone-date incoherence (advisory; flags, never modifies)
   with-lock  Run any command (an editor, a script, a shell) while holding the
              project's advisory lock -- the supported way to hand-edit a task
              file, since every write goes through this tool
@@ -4075,6 +4076,266 @@ def cmd_status(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Milestone-date lint
+# ---------------------------------------------------------------------------
+#
+# A card tagged to a milestone should be due on or before that milestone's own
+# due date. If the work has to be finished before a gate, a date after the gate
+# is a contradiction.
+#
+# This is a LINT, not a constraint, and the distinction is deliberate. ClickUp
+# enforces nothing here: a "milestone" is a task *type* on an ordinary task,
+# rendered as a diamond at a point in time. It contains nothing and groups
+# nothing -- the only structural relationships ClickUp has are dependencies and
+# subtasks. So the slug tag is the ONLY association that exists between a card
+# and its gate, and a date check over that tag is the only way to catch an
+# incoherent plan.
+#
+# Three rules it follows, and each exists for a reason:
+#
+#   1. It flags; it never modifies. A date is a human's decision.
+#   2. Findings can be accepted per-card, with a written reason. A date set in
+#      the ClickUp UI arrives here via `pull` and is legitimate data, not
+#      necessarily a mistake -- so there has to be a way to say "yes, we know"
+#      that does not nag forever and does not lose why.
+#   3. Missing data is silent. Most cards have no due date at all; an undated
+#      card is not a violation and must not be reported as one.
+#
+# It is never a blocker. A lint that stops a sync over a guideline gets
+# bypassed, and a bypassed lint is worse than no lint. `lint --strict` is the
+# opt-in for anyone who does want a non-zero exit (CI, a pre-merge gate).
+#
+# Note it does NOT look at epics. Epics are a YAML-only grouping and a diamond
+# is deliberately not filed under a work epic, so no milestone relationship can
+# be inferred from one.
+
+# `m1`, `m2-system`, `m3-acceptance`. The NUMBER carries the sequence and the
+# slug carries the meaning, which is the convention that emerged on BREC.
+MILESTONE_TAG_RE = re.compile(r"^m(\d+)(?:-([a-z0-9][a-z0-9-]*))?$", re.IGNORECASE)
+
+# Codes are stable: they are what a card's `lint_exceptions:` mapping is keyed
+# on, so renaming one silently un-suppresses every acceptance that used it.
+LINT_DATE_AFTER_GATE = "milestone-date"
+LINT_TAG_UNRESOLVED = "milestone-tag-unresolved"
+LINT_SLUG_MISMATCH = "milestone-slug-mismatch"
+LINT_AMBIGUOUS = "milestone-ambiguous"
+LINT_GATE_UNDATED = "milestone-gate-undated"
+
+LINT_CODES = (
+    LINT_DATE_AFTER_GATE,
+    LINT_TAG_UNRESOLVED,
+    LINT_SLUG_MISMATCH,
+    LINT_AMBIGUOUS,
+    LINT_GATE_UNDATED,
+)
+
+
+def _milestone_refs(story: dict) -> list[tuple[int, Optional[str], str]]:
+    """Milestone references on a story, as ``(number, slug, original_tag)``.
+
+    Reads both ``tags:`` (the free-form ``m<n>-<slug>`` form projects actually
+    use) and ``milestone_label`` (the ``M0``-``M3`` enum, which push lowercases
+    into the same tag namespace). One story may carry more than one.
+    """
+    seen: set[str] = set()
+    refs: list[tuple[int, Optional[str], str]] = []
+    candidates = [t for t in (story.get("tags") or []) if isinstance(t, str)]
+    label = story.get("milestone_label")
+    if isinstance(label, str) and label.strip():
+        candidates.append(label.strip())
+    for raw in candidates:
+        tag = raw.strip().lower()
+        if tag in seen:
+            continue
+        m = MILESTONE_TAG_RE.match(tag)
+        if m:
+            seen.add(tag)
+            refs.append((int(m.group(1)), m.group(2), tag))
+    return refs
+
+
+def _lint_exception(story: dict, code: str) -> Optional[str]:
+    """The written reason this card accepts ``code``, or None.
+
+    A reason string, deliberately, not a boolean: a bare suppression flag tells
+    the next reader nothing about why the contradiction is fine, and by the time
+    anyone asks, whoever set it has moved on. An empty or non-string value is
+    treated as NOT an exception -- silently accepting `true` would let the
+    self-documenting requirement rot away one card at a time.
+    """
+    block = story.get("lint_exceptions")
+    if not isinstance(block, dict):
+        return None
+    reason = block.get(code)
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return None
+
+
+def _lint_finding(code: str, severity: str, epic: dict, story: dict, message: str) -> dict:
+    return {
+        "code": code,
+        "severity": severity,
+        "epic": epic.get("name", "?"),
+        "story": story.get("name", "?"),
+        "clickup_id": story.get("clickup_id"),
+        "message": message,
+    }
+
+
+def _milestone_index(data: dict) -> tuple[dict, list[dict]]:
+    """Map every milestone card's number -> the cards claiming it, and report
+    the diamonds that carry no milestone tag at all (they cannot be referenced,
+    so nothing can ever resolve to them)."""
+    by_number: dict[int, list[dict]] = {}
+    untagged: list[dict] = []
+    for epic in data.get("epics", []) or []:
+        for story in epic.get("stories", []) or []:
+            if not story.get("milestone"):
+                continue
+            refs = _milestone_refs(story)
+            if not refs:
+                untagged.append({"epic": epic, "story": story})
+                continue
+            for number, slug, tag in refs:
+                by_number.setdefault(number, []).append(
+                    {"epic": epic, "story": story, "slug": slug, "tag": tag}
+                )
+    return by_number, untagged
+
+
+def lint_milestone_dates(data: dict) -> dict:
+    """Return ``{"findings": [...], "accepted": [...]}``.
+
+    ``accepted`` holds findings a card explicitly accepted with a reason. They
+    are kept rather than dropped so the report can say how many there are
+    without listing them -- suppressed is not the same as gone.
+    """
+    findings: list[dict] = []
+    accepted: list[dict] = []
+
+    def _record(code: str, severity: str, epic: dict, story: dict, message: str) -> None:
+        finding = _lint_finding(code, severity, epic, story, message)
+        reason = _lint_exception(story, code)
+        if reason:
+            finding["accepted_because"] = reason
+            accepted.append(finding)
+        else:
+            findings.append(finding)
+
+    by_number, untagged = _milestone_index(data)
+
+    for entry in untagged:
+        _record(
+            LINT_TAG_UNRESOLVED, "warning", entry["epic"], entry["story"],
+            "is a milestone but carries no m<n> tag, so no card can be tied to "
+            "it. Add a tag like 'm1-infrastructure'.",
+        )
+
+    # A gate with no date silently disables the check for every card pointing at
+    # it -- reported once per gate, not once per card, and not as a violation.
+    for number, holders in sorted(by_number.items()):
+        for holder in holders:
+            if _norm_yaml_date(holder["story"].get("due_date")) is None:
+                _record(
+                    LINT_GATE_UNDATED, "info", holder["epic"], holder["story"],
+                    f"is the m{number} gate but has no due_date, so no card "
+                    f"tagged m{number} can be date-checked against it.",
+                )
+
+    for number, holders in sorted(by_number.items()):
+        if len(holders) > 1:
+            names = ", ".join(sorted(f"'{h['story'].get('name', '?')}'" for h in holders))
+            for holder in holders:
+                _record(
+                    LINT_AMBIGUOUS, "warning", holder["epic"], holder["story"],
+                    f"shares milestone number m{number} with another milestone "
+                    f"card ({names}). A card tagged m{number} cannot be resolved "
+                    f"to one gate.",
+                )
+
+    for epic in data.get("epics", []) or []:
+        for story in epic.get("stories", []) or []:
+            if story.get("milestone"):
+                continue  # a gate is not checked against itself
+            for number, slug, tag in _milestone_refs(story):
+                holders = by_number.get(number) or []
+                if not holders:
+                    _record(
+                        LINT_TAG_UNRESOLVED, "warning", epic, story,
+                        f"is tagged '{tag}' but no milestone card carries m{number}. "
+                        f"Typo, or the gate has not been created yet.",
+                    )
+                    continue
+                if len(holders) > 1:
+                    continue  # already reported as ambiguous on the gates
+                gate = holders[0]
+                if slug and gate["slug"] and slug != gate["slug"]:
+                    _record(
+                        LINT_SLUG_MISMATCH, "warning", epic, story,
+                        f"is tagged '{tag}' but the m{number} gate "
+                        f"'{gate['story'].get('name', '?')}' is tagged "
+                        f"'{gate['tag']}'. Same number, different slug -- likely "
+                        f"a typo. Checked against that gate anyway.",
+                    )
+                gate_due = _norm_yaml_date(gate["story"].get("due_date"))
+                story_due = _norm_yaml_date(story.get("due_date"))
+                # Missing data is silent, on either side. Most cards have no due
+                # date, and that is not a contradiction.
+                if gate_due is None or story_due is None:
+                    continue
+                if story_due > gate_due:
+                    _record(
+                        LINT_DATE_AFTER_GATE, "error", epic, story,
+                        f"is due {story_due}, after the m{number} gate "
+                        f"'{gate['story'].get('name', '?')}' on {gate_due}. Work "
+                        f"needed for a gate cannot be due after it.",
+                    )
+
+    return {"findings": findings, "accepted": accepted}
+
+
+def print_lint_report(result: dict, *, only_if_findings: bool = True) -> None:
+    """Print the lint report. Advisory tone throughout: this reports a
+    guideline, and phrasing it as a failure invites someone to route around it."""
+    findings = result.get("findings") or []
+    accepted = result.get("accepted") or []
+    if not findings and only_if_findings:
+        if accepted:
+            print(
+                f"\nMilestone-date lint: clean "
+                f"({len(accepted)} accepted exception(s))."
+            )
+        return
+    if not findings:
+        print("\nMilestone-date lint: clean.")
+        return
+
+    order = {"error": 0, "warning": 1, "info": 2}
+    print("\n" + "=" * 68)
+    print("MILESTONE-DATE LINT (advisory -- nothing was changed)")
+    print("=" * 68)
+    for f in sorted(findings, key=lambda f: (order.get(f["severity"], 9), f["epic"], f["story"])):
+        label = {"error": "CONTRADICTION", "warning": "WARNING", "info": "note"}[f["severity"]]
+        print(f"  [{label}] {f['epic']} / '{f['story']}'")
+        print(f"      {f['message']}")
+        print(f"      (accept with lint_exceptions: {{{f['code']}: \"<why>\"}})")
+    if accepted:
+        print(f"\n  {len(accepted)} finding(s) accepted on the card with a written reason.")
+    print("=" * 68)
+
+
+def cmd_lint(data: dict, strict: bool = False) -> int:
+    result = lint_milestone_dates(data)
+    print_lint_report(result, only_if_findings=False)
+    if strict and result["findings"]:
+        # Opt-in only. The default stays zero because this is a guideline, and a
+        # guideline that breaks builds gets deleted rather than obeyed.
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # with-lock: run any command inside the project's lock
 # ---------------------------------------------------------------------------
 
@@ -4123,7 +4384,7 @@ def main() -> None:
     )
     parser.add_argument(
         "command",
-        choices=["push", "pull", "diff", "sync", "merge", "status", "with-lock"],
+        choices=["push", "pull", "diff", "sync", "merge", "status", "lint", "with-lock"],
         help="Command to execute",
     )
     parser.add_argument(
@@ -4169,6 +4430,14 @@ def main() -> None:
         action="store_true",
         help="Disable the automatic backup-before-push (ClickUp snapshot) and "
              "backup-before-pull (YAML-file copy).",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="lint only: exit non-zero when the milestone-date lint has "
+             "findings. Off by default -- the lint reports a guideline, and a "
+             "guideline that breaks builds gets routed around rather than "
+             "obeyed. Opt in for CI or a pre-merge gate.",
     )
     parser.add_argument(
         "--no-lock",
@@ -4230,7 +4499,7 @@ def main() -> None:
     # Everything else writes the YAML (clickup_id flush, last_synced stamp,
     # pulled story rows) and the .clickup-sync/ base snapshot, and with-lock
     # exists precisely to hold the lock for someone else.
-    needs_lock = args.command not in ("status", "diff")
+    needs_lock = args.command not in ("status", "diff", "lint")
     if args.dry_run and args.command != "with-lock":
         # A dry run writes nothing, so making it queue behind (or block) a real
         # run costs more than it buys. It can therefore read a file another
@@ -4286,6 +4555,9 @@ def _dispatch(args: argparse.Namespace, rest: list[str]) -> int:
 
     data = load_yaml(args.yaml_file)
 
+    if args.command == "lint":
+        return cmd_lint(data, strict=args.strict)
+
     if args.command == "status":
         cmd_status(data)
     elif args.command == "push":
@@ -4323,6 +4595,16 @@ def _dispatch(args: argparse.Namespace, rest: list[str]) -> int:
             backup_path=args.backup_to,
             backup_default=False,
         )
+
+    # Advisory tail on every command, run against the POST-run state so it
+    # reflects what the YAML actually says now (a pull can bring back a UI date
+    # that contradicts a gate -- that is exactly the case worth seeing). Never
+    # changes the exit code: this reports a guideline, not a failure. Wrapped
+    # because a lint defect must not fail an otherwise-good sync.
+    try:
+        print_lint_report(lint_milestone_dates(data))
+    except Exception as e:  # pragma: no cover - defensive
+        log.warning(f"Milestone-date lint could not run: {e}")
     return 0
 
 

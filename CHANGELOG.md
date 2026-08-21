@@ -4,6 +4,25 @@
 
 ### Added
 
+- **`lint` — a milestone-date coherence check.** A card tagged `m<n>-<slug>`
+  should be due on or before the due date of the milestone card carrying that
+  tag; work needed for a gate cannot be due after it. ClickUp enforces nothing
+  here (a milestone is a task *type* rendered as a diamond — it contains and
+  groups nothing), so the tag is the only association that exists and a date
+  check over it is the only way to catch an incoherent plan.
+  - **Flags, never modifies.** A date is a human's decision.
+  - **Never blocks.** Runs as an advisory tail on every command and does not
+    affect the exit code. `lint --strict` is the opt-in for a non-zero exit.
+  - **Missing data is silent** — an undated card is not a violation.
+  - Also reports the resolution failures, which are often worth more than the
+    date check: a tag pointing at no gate, two gates sharing a number, a
+    same-number/different-slug typo (still date-checked, so a typo cannot
+    silently disable the check), and an undated gate (once per gate).
+  - **`lint_exceptions:`** accepts a finding per card by code, with a required
+    **written reason** — a date set in the ClickUp UI arrives via `pull` as
+    legitimate data. A bare `true` is rejected; accepted findings are still
+    counted, so suppressed is not the same as gone.
+
 - **The advisory lock is enforced inside the tool, across the whole transaction.**
   `clickup.py` previously had no concept of the lock protecting the files it
   writes. The lock existed only as a Claude Code `PreToolUse` hook, which can
