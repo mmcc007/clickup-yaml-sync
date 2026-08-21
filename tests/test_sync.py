@@ -3719,3 +3719,106 @@ class TestYamlOnlyStoryFields:
         clickup._apply_clickup_to_yaml(story, _noted_cu_task(), {})
         clickup._sync_metadata(story, _noted_cu_task())
         assert story["notes"] == before
+
+
+# ---------------------------------------------------------------------------
+# API error detail, and edge-failure visibility
+# ---------------------------------------------------------------------------
+#
+# The failure this prevents: a board syncs its tasks fine, every declared
+# dependency silently fails to be created, and the run reports success. On a
+# 13-card board that is 13 warnings scrolling past a summary that says nothing
+# is wrong -- and the resulting board is missing structure the YAML declares.
+
+
+@pytest.fixture(autouse=True)
+def _reset_edge_failures():
+    clickup._EDGE_FAILURES.clear()
+    clickup._EDGE_HINT_SHOWN = False
+    yield
+    clickup._EDGE_FAILURES.clear()
+    clickup._EDGE_HINT_SHOWN = False
+
+
+class TestClickUpAPIError:
+    def test_the_error_message_carries_the_api_reason_not_just_the_status(self):
+        """urllib's HTTPError stringifies to 'HTTP Error 403: Forbidden' and the
+        body is already consumed by the time a caller sees it -- so every
+        `except Exception as e: log(...{e})` printed the status and threw away
+        the only part that says why."""
+        e = clickup.ClickUpAPIError(
+            403, '{"err":"Dependencies are not enabled","ECODE":"OAUTH_027"}',
+            "POST", "https://api.clickup.com/api/v2/task/T1/dependency",
+        )
+        assert "Dependencies are not enabled" in str(e)
+        assert "OAUTH_027" in str(e)
+        assert e.ecode == "OAUTH_027"
+        assert e.status == 403
+
+    def test_a_non_json_body_still_produces_a_usable_message(self):
+        e = clickup.ClickUpAPIError(502, "<html>Bad Gateway</html>", "POST", "u")
+        assert "502" in str(e)
+        assert "Bad Gateway" in str(e)
+
+    def test_an_empty_body_does_not_produce_a_bare_colon(self):
+        assert "(no body)" in str(clickup.ClickUpAPIError(500, "", "POST", "u"))
+
+
+class TestEdgeFailureVisibility:
+    def _story(self) -> dict:
+        return _story_with("Gate work", clickup_id="T1", depends_on=["T2"])
+
+    def _cu(self) -> dict:
+        return {"id": "T1", "name": "Gate work", "dependencies": [], "linked_tasks": []}
+
+    def test_a_failed_dependency_is_recorded_for_the_end_of_run_summary(self):
+        err = clickup.ClickUpAPIError(403, '{"err":"no","ECODE":"X"}', "POST", "u")
+        with mock.patch.object(clickup, "clickup_add_dependency", side_effect=err):
+            clickup._sync_dependencies("tok", "T1", self._cu(), self._story())
+        assert len(clickup._EDGE_FAILURES) == 1
+        assert "T2" in clickup._EDGE_FAILURES[0]
+
+    def test_a_failed_edge_does_not_abort_the_rest_of_the_sync(self):
+        """Tasks still sync. The point is that the failure is reported, not that
+        it becomes fatal."""
+        err = clickup.ClickUpAPIError(403, "{}", "POST", "u")
+        with mock.patch.object(clickup, "clickup_add_dependency", side_effect=err):
+            clickup._sync_dependencies("tok", "T1", self._cu(), self._story())  # no raise
+
+    def test_the_checklist_is_shown_once_per_run_not_once_per_edge(self):
+        """Thirteen cards failing the same way should not print the same four
+        bullet points thirteen times."""
+        err = clickup.ClickUpAPIError(403, "{}", "POST", "u")
+        story = _story_with("s", clickup_id="T1", depends_on=["T2", "T3", "T4"])
+        with mock.patch.object(clickup, "clickup_add_dependency", side_effect=err):
+            clickup._sync_dependencies("tok", "T1", self._cu(), story)
+        assert len(clickup._EDGE_FAILURES) == 3
+        assert clickup._EDGE_HINT_SHOWN is True
+
+    def test_a_failed_relation_is_recorded_too(self):
+        err = clickup.ClickUpAPIError(403, "{}", "POST", "u")
+        story = _story_with("s", clickup_id="T1", related=["T2"])
+        with mock.patch.object(clickup, "clickup_add_link", side_effect=err):
+            clickup._sync_relations("tok", "T1", self._cu(), story)
+        assert len(clickup._EDGE_FAILURES) == 1
+
+    def test_the_summary_names_every_failed_edge(self, capsys):
+        clickup._EDGE_FAILURES.extend(["add dependency: 'a' -> T2: boom",
+                                       "add dependency: 'b' -> T3: boom"])
+        clickup.report_edge_failures()
+        out = capsys.readouterr().out
+        assert "EDGE OPERATIONS FAILED: 2" in out
+        assert "T2" in out and "T3" in out
+        assert "missing structure the YAML declares" in out
+
+    def test_the_summary_is_silent_when_nothing_failed(self, capsys):
+        clickup.report_edge_failures()
+        assert capsys.readouterr().out == ""
+
+    def test_the_checklist_does_not_claim_to_diagnose(self):
+        """These are plausible causes on this account, not a reading of the
+        error. Presenting a guess as a diagnosis sends people down the wrong
+        path with confidence."""
+        assert "checklist, not a diagnosis" in clickup.EDGE_FAILURE_HINT
+        assert "Dependencies ClickApp" in clickup.EDGE_FAILURE_HINT
+        assert "INSUFFICIENT_ACCESS" in clickup.EDGE_FAILURE_HINT
