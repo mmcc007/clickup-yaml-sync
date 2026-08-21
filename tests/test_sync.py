@@ -4053,21 +4053,28 @@ class TestPushAndSyncShareOneUniverse:
 # day that lands on a real edit made in the ClickUp UI.
 
 
-def _assignee_story(assignees=None, **extra):
-    s = _story_with("Confirm RealSynergy access", clickup_id="T1", **extra)
+# One id map shared by the fake roster and the fake ClickUp tasks. Getting these
+# out of step silently inverts every assertion — the divergent case reads as
+# agreement and vice versa — so they are derived from one source on purpose.
+_USER_IDS = {"wframe@brecslc.com": 101, "maurice@spark6.com": 102}
+_RESOLVER = dict(_USER_IDS)
+
+
+def _assignee_story(assignees=None, name="Confirm RealSynergy access", **extra):
+    s = _story_with(name, clickup_id="T1", **extra)
     if assignees is not None:
         s["assignees"] = assignees
     return s
 
 
-def _cu_with_assignees(*emails):
+def _cu_with_assignees(*emails, name="Confirm RealSynergy access"):
     return {
-        "id": "T1", "name": "Confirm RealSynergy access",
+        "id": "T1", "name": name,
         "status": {"status": "backlog"}, "description": "", "tags": [],
         "priority": None, "due_date": None, "start_date": None,
         "custom_fields": [], "date_updated": "1", "url": "u",
-        "assignees": [{"id": i, "email": e, "username": e.split("@")[0]}
-                      for i, e in enumerate(emails, start=1)],
+        "assignees": [{"id": _USER_IDS[e], "email": e, "username": e.split("@")[0]}
+                      for e in emails],
     }
 
 
@@ -4095,8 +4102,15 @@ class TestAssigneeConflictIsFlagged:
             {"T1": cu},
             {"T1": clickup.comparable_local(story, {})},   # base agrees on scalars
             {},
-            {"wframe@brecslc.com": 1, "maurice@spark6.com": 2},
+            _RESOLVER,
         )
+
+    def test_the_fixture_ids_line_up(self):
+        """Guard on the fixtures themselves: if the fake roster and the fake
+        ClickUp task disagree on ids, every assertion in this class silently
+        inverts and still 'passes' something."""
+        cu = _cu_with_assignees("maurice@spark6.com")
+        assert clickup._cu_assignee_ids(cu) == {_RESOLVER["maurice@spark6.com"]}
 
     def test_a_diverging_assignee_set_is_marked_not_base_tracked(self):
         c = self._conflicts(_assignee_story(["wframe@brecslc.com"]),
@@ -4121,12 +4135,10 @@ class TestAssigneeConflictIsFlagged:
         """Only the untracked fields get the note. Marking everything would
         make it noise and it would stop being read."""
         story = _assignee_story(["maurice@spark6.com"], name="Local name")
-        cu = _cu_with_assignees("maurice@spark6.com")
-        cu["name"] = "Remote name"
+        cu = _cu_with_assignees("maurice@spark6.com", name="Remote name")
         c = clickup._collect_3way_conflicts(
             _lint_data(_epic_with("E", [story])), {"T1": cu},
-            {"T1": {"name": "Base name"}}, {},
-            {"maurice@spark6.com": 2},
+            {"T1": {"name": "Base name"}}, {}, _RESOLVER,
         )
         names = [x for x in c if x["field"] == "name"]
         assert names and not names[0].get("not_base_tracked")
