@@ -1645,6 +1645,26 @@ def _story_desired_tags(
     return out
 
 
+def managed_tag_universe_for(data: dict, yaml_path: str, list_id: str) -> set[str]:
+    """The full managed-tag universe for a run: what the YAML declares NOW,
+    unioned with what this tool managed as of the last base snapshot.
+
+    Both halves are required and the second is the easy one to forget. Without
+    it a tag DROPPED from the YAML since the last run is no longer in the
+    current universe, so it looks like an untouched UI tag and is preserved
+    forever -- the reconcile can only remove what it knows it owns.
+
+    This exists as one function because it previously existed as two call sites
+    and only one of them had the union: ``cmd_sync`` did, ``cmd_push`` did not,
+    so `push` silently never removed a dropped tag. Both halves were unit-tested;
+    the WIRING between them was not, which is exactly how they diverged. One
+    function means the next fix cannot land in only one of them.
+    """
+    universe = _collect_managed_tag_universe(data)
+    universe |= load_base_managed_tags(base_snapshot_path(yaml_path, str(list_id)))
+    return universe
+
+
 def _collect_managed_tag_universe(data: dict) -> set[str]:
     """All tags this tool considers under its management — used to decide
     which pre-existing ClickUp tags are stale vs untouched UI additions."""
@@ -3080,7 +3100,7 @@ def cmd_push(
             backup_default=backup_default,
         )
 
-    managed_universe = _collect_managed_tag_universe(data)
+    managed_universe = managed_tag_universe_for(data, yaml_path, list_id)
     # Dedupe index — adopt an existing ClickUp task rather than create a
     # duplicate when a prior run was interrupted before id writeback (BUG #14).
     dedupe_index = _build_create_dedupe_index(cu_tasks)
@@ -3833,7 +3853,7 @@ def cmd_sync(
     seen_cu_ids: set[str] = set(t["id"] for t in cu_tasks)
     all_yaml_ids: set[str] = _all_yaml_story_ids(data)
     project_cfg = data.get("project", {})
-    managed_universe = _collect_managed_tag_universe(data)
+    managed_universe = managed_tag_universe_for(data, yaml_path, list_id)
     # Dedupe index: lets a create detect a task that already exists in ClickUp
     # (e.g. an orphan from a prior run killed before its id was written back),
     # so a retry adopts it instead of creating a duplicate (BUG #14).
@@ -3856,11 +3876,6 @@ def cmd_sync(
         )
         stats["errors"] += 1
         return stats
-    # Tags the tool managed as of the base snapshot are "known managed" too, so an
-    # epic/tag dropped from the YAML since then gets REMOVED instead of accumulating.
-    # (UI-added tags are never in our managed universe, so they stay preserved.)
-    managed_universe |= load_base_managed_tags(base_snapshot_path(yaml_path, list_id))
-
     base_exists = bool(base)
     if base_exists:
         log.info(f"3-way mode: base snapshot has {len(base)} task(s).")
