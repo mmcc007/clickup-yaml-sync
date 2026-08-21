@@ -8,6 +8,18 @@ Commands:
   sync    Full bidirectional sync with per-conflict resolution strategy
   merge   LLM-assisted conflict resolution (pull + push with intelligent merging)
   status  Show summary of project state from YAML (offline, no API calls)
+  with-lock  Run any command (an editor, a script, a shell) while holding the
+             project's advisory lock -- the supported way to hand-edit a task
+             file, since every write goes through this tool
+
+Locking:
+  Every writing command holds an advisory lock on the task file AND on the
+  ClickUp list for the whole run, and releases it at the end. A second
+  concurrent run waits, visibly, then fails loudly rather than doing nothing.
+  The lock is the same file, format and TTL the Claude Code diamond-lock hook
+  uses, and under Claude Code the same identity, so a session's edit and its
+  sync are one continuous hold. --no-lock opts out; --lock-timeout tunes the
+  wait.
 
 Conflict strategies (--conflict flag for sync):
   local    YAML wins all conflicts (same as push)
@@ -23,9 +35,12 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -208,8 +223,20 @@ def load_yaml(path: str) -> dict:
 def save_yaml(data: dict, path: str) -> None:
     data = copy.deepcopy(data)
     data["project"]["last_synced"] = datetime.now(timezone.utc).isoformat()
-    with open(path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False, width=120)
+    # Atomic: the task file is the source of truth for a whole project, and
+    # push/sync flush it once per created task. A crash partway through a plain
+    # truncate-and-write would leave it truncated.
+    tmp = Path(path).with_suffix(Path(path).suffix + f".tmp{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False, width=120)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     log.info(f"YAML saved to {path}")
     # Refresh the 3-way base snapshot so the next sync can tell who-changed-what.
     # Persisting here (the single chokepoint for push/pull/sync) keeps the base
@@ -225,6 +252,300 @@ def save_yaml(data: dict, path: str) -> None:
             )
     except Exception as e:  # pragma: no cover - defensive
         log.warning(f"Could not write base snapshot: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Advisory locking (interoperates with the Claude Code "diamond lock" hook)
+# ---------------------------------------------------------------------------
+#
+# Why this lives in the tool and not only in a harness hook
+# --------------------------------------------------------
+# A PreToolUse hook can only see Claude Code tool calls, so it guards a
+# hand-edit made with Edit/Write and nothing else. It is structurally blind to
+# the two writers that matter most here:
+#
+#   * this tool itself -- ``sync``/``push``/``pull``/``merge`` are WRITERS of the
+#     YAML (each new task's ``clickup_id`` is flushed back immediately on
+#     create, ``last_synced`` is stamped, ``pull`` rewrites story rows), and
+#     they also rewrite the 3-way base snapshot under ``.clickup-sync/``;
+#   * a human or a cron invoking this tool from a plain shell.
+#
+# So the critical section is the whole transaction -- acquire, edit, sync,
+# release -- not the individual write. Holding a lock only across the edit
+# leaves the sync outside the protected span, which is precisely the gap this
+# closes.
+#
+# Interop, not a second mechanism
+# -------------------------------
+# The lock file, its location, its JSON shape and its TTL are deliberately
+# identical to the hook's, and under Claude Code this tool uses THE SAME
+# IDENTITY the hook does, so a session's edit-then-sync is one continuous hold
+# of one lock rather than two mechanisms taking turns on a file the other is
+# writing. Verified 2026-08-21: the hook writes ``session_id`` from its payload,
+# and ``$CLAUDE_CODE_SESSION_ID`` in a Bash tool call holds that same UUID.
+# (``$CLAUDE_SESSION_ID`` -- no ``CODE`` -- is a different, empty variable.)
+#
+# Consequence, and it is the important one: when this tool finds a fresh lock
+# already held by its OWN session, it adopts it instead of blocking, and on
+# release it hands it BACK rather than deleting it -- the session may still be
+# mid-edit-burst, and the hook must keep recognising the lock afterwards.
+#
+# Two locks, always taken in the same order
+# -----------------------------------------
+# A file lock protects the YAML; a list lock protects the ClickUp list. They are
+# not the same thing -- two YAML files pointed at one list is a real
+# configuration, and file-level locking does nothing for it -- so both are
+# taken, file first and then list, a fixed global order that cannot deadlock.
+#
+# Crash safety comes from the TTL: a process killed mid-sync leaves a lock that
+# expires, never one held forever. A long sync refreshes its locks on a
+# background heartbeat so a slow run does not go stale under its own feet.
+
+LOCK_TTL_MS = 5 * 60 * 1000            # must match the hook's LOCK_TTL_MS
+LOCK_POLL_SECONDS = 2.0
+LOCK_WAIT_DEFAULT_SECONDS = 120.0      # "the wait shouldn't be more than a minute"
+LOCK_HEARTBEAT_SECONDS = 60.0
+LOCK_EXIT_CODE = 3                     # distinct from 1, so a caller can tell "busy" from "failed"
+
+
+class LockBusy(RuntimeError):
+    """Another owner holds a fresh lock and did not release it in time."""
+
+
+def lock_owner_id() -> str:
+    """Identity to claim locks under.
+
+    Order matters:
+
+    1. ``CLICKUP_LOCK_OWNER`` -- explicit override, used by tests and by anyone
+       who needs to pin an identity (a cron job that wants a stable name).
+    2. ``CLAUDE_CODE_SESSION_ID`` -- under Claude Code this is exactly what the
+       hook writes, which is what makes edit-then-sync a single hold.
+    3. A unique per-process id for a plain shell. Deliberately unique rather
+       than something like ``os.getpid()`` alone: a stable-looking id risks
+       colliding with a real session's lock, and a colliding id would let this
+       process silently steal a lock instead of waiting for it.
+    """
+    explicit = os.environ.get("CLICKUP_LOCK_OWNER", "").strip()
+    if explicit:
+        return explicit
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if session:
+        return session
+    return f"shell-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def lock_path_for_yaml(yaml_path: str) -> Path:
+    """``<dir>/.<stem>.lock`` -- for ``project-tasks.yaml`` this is exactly the
+    ``.project-tasks.lock`` the hook guards, and it generalises to any other
+    task file without inventing a second convention."""
+    p = Path(yaml_path).resolve()
+    return p.parent / f".{p.stem}.lock"
+
+
+def lock_path_for_list(list_id: str) -> Path:
+    """Machine-global, because the whole point is to catch two *different* YAML
+    files aimed at one ClickUp list. A path next to either file would not."""
+    cache = os.environ.get("XDG_CACHE_HOME", "").strip() or str(Path.home() / ".cache")
+    return Path(cache) / "clickup-yaml-sync" / f"list-{list_id}.lock"
+
+
+def _read_lock(path: Path) -> Optional[dict]:
+    """Absent, unreadable or malformed all mean 'free' -- same as the hook. An
+    advisory lock that fails closed on a corrupt file would wedge the tool."""
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) and doc.get("session_id") else None
+
+
+def _write_lock(path: Path, owner: str) -> None:
+    """Atomic, so a concurrent reader never sees a half-written lock and
+    concludes the file is free. (The hook writes in place; that residual race is
+    the hook's, and is noted in the README.)"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {"session_id": owner, "ts": int(time.time() * 1000), "pid": os.getpid()}
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(doc) + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _lock_age_ms(lock: dict) -> float:
+    try:
+        return time.time() * 1000 - float(lock.get("ts") or 0)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+class AdvisoryLock:
+    """One lock file. Not reentrant across processes; adoption of our own
+    session's lock is what stands in for reentrancy here."""
+
+    def __init__(self, path: Path, owner: str, label: str) -> None:
+        self.path = path
+        self.owner = owner
+        self.label = label
+        self.held = False
+        # True when the lock already existed under OUR identity -- i.e. our own
+        # Claude session took it while editing. We must hand it back on release,
+        # not delete it, or we cut short a hold the session is still relying on.
+        self.inherited = False
+
+    def acquire(self, wait_seconds: float) -> None:
+        deadline = time.time() + max(0.0, wait_seconds)
+        announced = False
+        while True:
+            lock = _read_lock(self.path)
+            if lock is None:
+                break
+            same_owner = str(lock.get("session_id")) == self.owner
+            age = _lock_age_ms(lock)
+            if same_owner:
+                self.inherited = True
+                log.info(
+                    f"Lock ({self.label}) already held by this session "
+                    f"({self.owner[:8]}) -- continuing the same hold."
+                )
+                break
+            if age >= LOCK_TTL_MS:
+                log.warning(
+                    f"Taking over a stale lock ({self.label}) from "
+                    f"{str(lock.get('session_id'))[:8]} -- last touched "
+                    f"{age / 1000:.0f}s ago, TTL {LOCK_TTL_MS / 1000:.0f}s. "
+                    f"{self.path}"
+                )
+                break
+            if time.time() >= deadline:
+                raise LockBusy(
+                    f"{self.label} is locked by {str(lock.get('session_id'))[:8]} "
+                    f"(held {age / 1000:.0f}s, expires in "
+                    f"{max(0.0, (LOCK_TTL_MS - age) / 1000):.0f}s).\n"
+                    f"  lock file: {self.path}\n"
+                    f"  Waited {wait_seconds:.0f}s and gave up. Nothing was "
+                    f"changed -- rerun when that holder is done.\n"
+                    f"  Raise the wait with --lock-timeout SECONDS. If that "
+                    f"holder crashed, the lock self-expires; --no-lock bypasses "
+                    f"this check entirely (see README)."
+                )
+            if not announced:
+                # Visible, once, on stderr as well as the log: a sync that
+                # appears to hang must say why it is waiting.
+                msg = (
+                    f"Waiting for {self.label} lock held by "
+                    f"{str(lock.get('session_id'))[:8]} (held {age / 1000:.0f}s) "
+                    f"-- up to {wait_seconds:.0f}s..."
+                )
+                print(msg, file=sys.stderr, flush=True)
+                log.info(msg)
+                announced = True
+            time.sleep(LOCK_POLL_SECONDS)
+
+        _write_lock(self.path, self.owner)
+        self.held = True
+        log.info(f"Lock acquired ({self.label}) by {self.owner[:8]}: {self.path}")
+
+    def refresh(self) -> None:
+        if self.held:
+            try:
+                _write_lock(self.path, self.owner)
+            except OSError as e:  # pragma: no cover - defensive
+                log.warning(f"Could not refresh {self.label} lock: {e}")
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        self.held = False
+        current = _read_lock(self.path)
+        if current is not None and str(current.get("session_id")) != self.owner:
+            # Someone took over (our TTL lapsed). Not ours to delete.
+            log.warning(
+                f"Not releasing {self.label} lock: it now belongs to "
+                f"{str(current.get('session_id'))[:8]}."
+            )
+            return
+        if self.inherited:
+            # Hand it back to the session that was already holding it, with a
+            # fresh timestamp so the sync we just ran counts as activity.
+            try:
+                _write_lock(self.path, self.owner)
+            except OSError:  # pragma: no cover - defensive
+                pass
+            log.info(f"Lock ({self.label}) returned to this session's own hold.")
+            return
+        try:
+            self.path.unlink()
+            log.info(f"Lock released ({self.label}): {self.path}")
+        except FileNotFoundError:
+            pass
+        except OSError as e:  # pragma: no cover - defensive
+            log.warning(f"Could not remove {self.label} lock {self.path}: {e}")
+
+
+class SyncLock:
+    """The file lock and (when a list id is configured) the list lock, held
+    together for the whole run, refreshed on a heartbeat, released in reverse.
+
+    Use as a context manager. ``acquire`` raises :class:`LockBusy`; the caller
+    turns that into a loud, non-zero exit. It must never degrade into skipping
+    the work quietly -- a sync that silently does nothing is the failure that
+    hides for days.
+    """
+
+    def __init__(
+        self,
+        yaml_path: str,
+        list_id: Optional[str],
+        *,
+        wait_seconds: float = LOCK_WAIT_DEFAULT_SECONDS,
+        owner: Optional[str] = None,
+    ) -> None:
+        self.owner = owner or lock_owner_id()
+        self.wait_seconds = wait_seconds
+        self.locks = [AdvisoryLock(lock_path_for_yaml(yaml_path), self.owner, "YAML file")]
+        if list_id:
+            self.locks.append(
+                AdvisoryLock(lock_path_for_list(str(list_id)), self.owner, f"ClickUp list {list_id}")
+            )
+        self._stop = threading.Event()
+        self._heartbeat: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "SyncLock":
+        acquired: list[AdvisoryLock] = []
+        try:
+            for lock in self.locks:  # fixed order: file, then list
+                lock.acquire(self.wait_seconds)
+                acquired.append(lock)
+        except BaseException:
+            for lock in reversed(acquired):
+                lock.release()
+            raise
+        self._heartbeat = threading.Thread(target=self._beat, daemon=True)
+        self._heartbeat.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        if self._heartbeat is not None:
+            self._heartbeat.join(timeout=LOCK_POLL_SECONDS)
+        for lock in reversed(self.locks):
+            lock.release()
+
+    def _beat(self) -> None:
+        # A big board can take longer than the TTL. Without this, a slow sync
+        # lets its own lock go stale and another session walks in behind it.
+        while not self._stop.wait(LOCK_HEARTBEAT_SECONDS):
+            for lock in self.locks:
+                lock.refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -3744,6 +4065,47 @@ def cmd_status(data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# with-lock: run any command inside the project's lock
+# ---------------------------------------------------------------------------
+
+
+def cmd_with_lock(argv: list[str]) -> int:
+    """Run ``argv`` while holding this project's locks, then release them.
+
+    This is the edit path. `clickup.py` is the only supported writer of a task
+    file, but "writer" does not have to mean "editor": editing without syncing
+    is a normal workflow -- you stage cards, look at them, and publish later --
+    so the tool wraps whatever you would have used anyway ($EDITOR, a script, a
+    shell, a Claude session) instead of reimplementing text editing inside a
+    sync tool.
+
+        clickup.py with-lock docs/project-tasks.yaml -- $EDITOR docs/project-tasks.yaml
+        clickup.py with-lock docs/project-tasks.yaml -- ./restructure.sh
+
+    The child inherits ``CLICKUP_LOCK_OWNER``, so a nested ``clickup.py sync``
+    joins this hold rather than blocking on it. Without that a plain shell would
+    deadlock against itself: outside Claude Code each process mints its own
+    unique owner id, and the nested run would see a fresh lock it does not
+    recognise. Under Claude Code the identity is the session id either way, so
+    the hook firing on an edit inside the wrapper also sees its own lock and
+    allows it.
+
+    Returns the child's exit code, so the wrapper is transparent to callers.
+    """
+    env = dict(os.environ)
+    env["CLICKUP_LOCK_OWNER"] = os.environ.get("CLICKUP_LOCK_OWNER") or lock_owner_id()
+    try:
+        proc = subprocess.run(argv, env=env)
+    except FileNotFoundError:
+        log.error(f"with-lock: command not found: {argv[0]}")
+        return 127
+    except PermissionError:
+        log.error(f"with-lock: not executable: {argv[0]}")
+        return 126
+    return proc.returncode
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Bidirectional sync between YAML project files and ClickUp",
@@ -3752,7 +4114,7 @@ def main() -> None:
     )
     parser.add_argument(
         "command",
-        choices=["push", "pull", "diff", "sync", "merge", "status"],
+        choices=["push", "pull", "diff", "sync", "merge", "status", "with-lock"],
         help="Command to execute",
     )
     parser.add_argument(
@@ -3800,11 +4162,34 @@ def main() -> None:
              "backup-before-pull (YAML-file copy).",
     )
     parser.add_argument(
+        "--no-lock",
+        action="store_true",
+        help="Skip the advisory lock entirely. The escape hatch, for when a "
+             "lock is known-wrong and waiting it out is not an option; you are "
+             "then responsible for knowing nothing else is writing. Also "
+             "settable as CLICKUP_NO_LOCK=1.",
+    )
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=LOCK_WAIT_DEFAULT_SECONDS,
+        metavar="SECONDS",
+        help=f"How long to wait for a held lock before failing loudly "
+             f"(default: {LOCK_WAIT_DEFAULT_SECONDS:.0f}s). Never skips the "
+             f"work silently -- a timeout is a non-zero exit.",
+    )
+    parser.add_argument(
         "--sandbox",
         action="store_true",
         help="Use the sandbox ClickUp account (token from pass "
              "clickup/sandbox-api-token, env CLICKUP_API_TOKEN_SANDBOX, or "
              "~/bin/clickup-sandbox.env) instead of production.",
+    )
+
+    parser.add_argument(
+        "rest",
+        nargs=argparse.REMAINDER,
+        help="For with-lock: '--' followed by the command to run under the lock.",
     )
 
     args = parser.parse_args()
@@ -3815,6 +4200,78 @@ def main() -> None:
     if not os.path.exists(args.yaml_file):
         log.error(f"YAML file not found: {args.yaml_file}")
         sys.exit(1)
+
+    rest = list(args.rest)
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    if args.command == "with-lock":
+        if not rest:
+            parser.error(
+                "with-lock needs a command to run: "
+                "clickup.py with-lock <file> -- <command> [args...]"
+            )
+    elif rest:
+        parser.error(f"unexpected extra arguments: {' '.join(rest)}")
+
+    # Which commands need the lock, and why the others do not:
+    #   status  -- offline, reads the YAML and prints. No writes anywhere.
+    #   diff    -- reads YAML and ClickUp, writes neither.
+    # Everything else writes the YAML (clickup_id flush, last_synced stamp,
+    # pulled story rows) and the .clickup-sync/ base snapshot, and with-lock
+    # exists precisely to hold the lock for someone else.
+    needs_lock = args.command not in ("status", "diff")
+    if args.dry_run and args.command != "with-lock":
+        # A dry run writes nothing, so making it queue behind (or block) a real
+        # run costs more than it buys. It can therefore read a file another
+        # process is mid-way through rewriting -- the plan it prints is a
+        # preview, and the real run that follows takes the lock properly.
+        needs_lock = False
+        log.info("Dry run: not taking the lock (nothing will be written).")
+    if os.environ.get("CLICKUP_NO_LOCK", "").strip() not in ("", "0"):
+        args.no_lock = True
+    if args.no_lock and needs_lock:
+        needs_lock = False
+        log.warning(
+            "--no-lock: running without the advisory lock. Nothing is stopping "
+            "another session from writing this file at the same time."
+        )
+
+    def _run() -> int:
+        return _dispatch(args, rest)
+
+    if not needs_lock:
+        sys.exit(_run())
+
+    # The list id is read cheaply and separately from load_yaml, because the
+    # lock has to be held BEFORE the file is read -- reading first would mean
+    # acting on a snapshot taken outside the protected span.
+    list_id = _peek_list_id(args.yaml_file)
+    try:
+        with SyncLock(args.yaml_file, list_id, wait_seconds=args.lock_timeout):
+            sys.exit(_run())
+    except LockBusy as e:
+        # Loud and non-zero. Never a quiet no-op: a sync that silently does
+        # nothing is the failure mode that hides for days.
+        print(f"ERROR: {e}", file=sys.stderr, flush=True)
+        log.error(f"Lock busy, aborting: {e}")
+        sys.exit(LOCK_EXIT_CODE)
+
+
+def _peek_list_id(yaml_path: str) -> Optional[str]:
+    """Read just ``project.clickup_list_id``, tolerating anything unreadable --
+    a malformed file is load_yaml's error to report, not the locker's."""
+    try:
+        with open(yaml_path) as f:
+            doc = yaml.safe_load(f)
+        list_id = (doc or {}).get("project", {}).get("clickup_list_id")
+        return str(list_id) if list_id else None
+    except Exception:
+        return None
+
+
+def _dispatch(args: argparse.Namespace, rest: list[str]) -> int:
+    if args.command == "with-lock":
+        return cmd_with_lock(rest)
 
     data = load_yaml(args.yaml_file)
 
@@ -3855,6 +4312,7 @@ def main() -> None:
             backup_path=args.backup_to,
             backup_default=False,
         )
+    return 0
 
 
 if __name__ == "__main__":
