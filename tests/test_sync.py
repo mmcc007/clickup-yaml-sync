@@ -3822,3 +3822,141 @@ class TestEdgeFailureVisibility:
         assert "checklist, not a diagnosis" in clickup.EDGE_FAILURE_HINT
         assert "Dependencies ClickApp" in clickup.EDGE_FAILURE_HINT
         assert "INSUFFICIENT_ACCESS" in clickup.EDGE_FAILURE_HINT
+
+
+# ---------------------------------------------------------------------------
+# Run provenance
+# ---------------------------------------------------------------------------
+#
+# The hazard is NOT a running process having its code swapped -- Python reads
+# this single file fully at interpreter start and git replaces files by rename.
+# It is that nobody can say which version ran. Witnessed 2026-08-21: an operator
+# prepared a client-board sync against one commit, the tree moved to another
+# while they prepared, and the only reason it was noticed was an unrelated
+# message.
+#
+# Two goals, deliberately kept apart, because conflating them makes the
+# mechanism drift:
+#   - ATTRIBUTION: say exactly what ran. A content hash does this completely,
+#     including for uncommitted code.
+#   - NOT WRITING UNTESTED CODE TO A CLIENT BOARD: the only goal that justifies
+#     a refusal.
+# Which is why the bypass MARKS a run and never blinds one.
+
+
+class TestToolProvenance:
+    def test_a_pinned_copy_outside_git_is_reported_not_refused(self):
+        """The recommended way to run this tool must stay frictionless."""
+        prov = {"path": "/home/x/bin/clickup-abc.py", "sha256": "deadbeef" * 8,
+                "commit": None, "dirty": None, "in_git": False}
+        line = clickup.format_provenance(prov)
+        assert "pinned copy" in line
+        assert "deadbeef" in line
+        clickup.assert_attributable(prov, "sync", allow_dirty=False)  # no raise
+
+    def test_a_clean_checkout_names_its_commit(self):
+        prov = {"path": "/repo/clickup.py", "sha256": "a" * 64,
+                "commit": "b451d96abc", "dirty": False, "in_git": True}
+        assert "b451d96" in clickup.format_provenance(prov)
+        assert "clean" in clickup.format_provenance(prov)
+
+    def test_every_run_can_state_a_content_hash(self):
+        """Attribution does not depend on being committed -- that is what lets
+        the bypass be a mark rather than a hole."""
+        assert clickup.tool_provenance()["sha256"]
+
+
+class TestWritingCommandRefusal:
+    DIRTY = {"path": "/repo/clickup.py", "sha256": "c" * 64,
+             "commit": "b451d96", "dirty": True, "in_git": True}
+
+    def test_a_writing_command_is_refused_on_uncommitted_code(self):
+        with pytest.raises(RuntimeError, match="never been tested"):
+            clickup.assert_attributable(self.DIRTY, "sync", allow_dirty=False)
+
+    def test_every_writing_command_is_covered(self):
+        for cmd in clickup.WRITING_COMMANDS:
+            with pytest.raises(RuntimeError):
+                clickup.assert_attributable(self.DIRTY, cmd, allow_dirty=False)
+
+    def test_read_only_commands_are_never_refused(self):
+        """Reading the world can always be accounted for by re-reading it."""
+        for cmd in ("status", "diff", "lint", "with-lock", "pin"):
+            clickup.assert_attributable(self.DIRTY, cmd, allow_dirty=False)
+
+    def test_the_refusal_names_the_easy_path_first_not_just_the_flag(self):
+        """An error that only says what you did wrong sends people straight to
+        the bypass. A guard with a convenient bypass is decoration."""
+        with pytest.raises(RuntimeError) as e:
+            clickup.assert_attributable(self.DIRTY, "sync", allow_dirty=False)
+        msg = str(e.value)
+        assert "pin" in msg
+        assert msg.index("pin") < msg.index("--allow-dirty"), \
+            "the pinned-copy path must be offered before the bypass"
+
+    def test_the_refusal_states_what_ran(self):
+        with pytest.raises(RuntimeError, match="sha256"):
+            clickup.assert_attributable(self.DIRTY, "sync", allow_dirty=False)
+
+
+class TestBypassMarksRatherThanBlinds:
+    DIRTY = {"path": "/repo/clickup.py", "sha256": "d" * 64,
+             "commit": "b451d96", "dirty": True, "in_git": True}
+
+    def test_allow_dirty_permits_the_run(self):
+        clickup.assert_attributable(self.DIRTY, "sync", allow_dirty=True)
+
+    def test_a_bypassed_run_is_still_fully_attributable(self):
+        """The whole reason the bypass is acceptable: the hash still identifies
+        the exact bytes that ran."""
+        line = clickup.format_provenance(self.DIRTY, bypassed=True)
+        assert "d" * 12 in line
+
+    def test_a_bypassed_run_is_stamped_as_one(self):
+        line = clickup.format_provenance(self.DIRTY, bypassed=True)
+        assert "BYPASS" in line
+        assert "untested" in line
+
+    def test_an_ordinary_run_carries_no_bypass_stamp(self):
+        assert "BYPASS" not in clickup.format_provenance(self.DIRTY, bypassed=False)
+
+
+class TestPinnedCopyPath:
+    def test_named_for_the_commit_it_pins(self):
+        prov = {"commit": "b451d96abcdef", "sha256": "e" * 64, "dirty": False}
+        assert clickup.pinned_copy_path(prov).name == "clickup-b451d96.py"
+
+    def test_a_dirty_pin_is_named_so_it_cannot_be_mistaken_for_a_release(self):
+        prov = {"commit": "b451d96abcdef", "sha256": "e" * 64, "dirty": True}
+        assert "dirty" in clickup.pinned_copy_path(prov).name
+
+    def test_pin_refuses_a_modified_tool(self, monkeypatch, tmp_path):
+        """A pinned copy is meant to be a known, committed version. Pinning a
+        dirty one would launder untested code into something that looks pinned."""
+        monkeypatch.setattr(clickup, "tool_provenance",
+                            lambda: {"commit": "abc", "sha256": "f" * 64,
+                                     "dirty": True, "in_git": True,
+                                     "path": str(tmp_path / "clickup.py")})
+        assert clickup.cmd_pin() == clickup.PROVENANCE_EXIT_CODE
+
+
+class TestHeadMovedDuringRun:
+    def test_a_moved_checkout_is_reported(self, capsys, monkeypatch):
+        """The exact event of 2026-08-21, which previously produced no signal."""
+        monkeypatch.setattr(clickup, "_git_out", lambda *a: "newsha1234567")
+        clickup.warn_if_head_moved("oldsha1234567", "sync")
+        assert "moved during this run" in capsys.readouterr().err
+
+    def test_an_unmoved_checkout_is_silent(self, capsys, monkeypatch):
+        monkeypatch.setattr(clickup, "_git_out", lambda *a: "samesha123456")
+        clickup.warn_if_head_moved("samesha123456", "sync")
+        assert capsys.readouterr().err == ""
+
+    def test_read_only_commands_do_not_report_it(self, capsys, monkeypatch):
+        monkeypatch.setattr(clickup, "_git_out", lambda *a: "newsha1234567")
+        clickup.warn_if_head_moved("oldsha1234567", "status")
+        assert capsys.readouterr().err == ""
+
+    def test_a_pinned_copy_has_no_head_to_compare(self, capsys):
+        clickup.warn_if_head_moved(None, "sync")
+        assert capsys.readouterr().err == ""

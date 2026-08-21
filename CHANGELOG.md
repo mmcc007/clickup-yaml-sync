@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Added
+
+- **Run provenance: every run states which code produced it.** The line
+  (path, commit, clean/modified, content hash) is logged before anything is
+  touched, and `--version` prints the same.
+
+  The hazard is **unattributable runs**, not torn reads: Python loads this
+  single file fully at interpreter start and git replaces files by rename, so a
+  running process cannot have its code swapped. On 2026-08-21 an operator
+  prepared a client-board sync against one commit, the tree moved to another
+  while they prepared, and the only reason it was noticed was an unrelated
+  message. Every corpus board is invoked from a live development checkout.
+
+- **`clickup.py pin`** — writes an immutable copy to `~/bin/clickup-<commit>.py`
+  and prints how to use it. The recommended way to run a board: it cannot change
+  under you when someone merges, and it reports its own hash. One argument-free
+  command, deliberately easier than the bypass below — a guard with a convenient
+  bypass becomes decoration.
+
+- **A writing command (`push`/`pull`/`sync`/`merge`) refuses to run from a
+  modified `clickup.py`.** Attribution is already solved by the content hash;
+  what the refusal buys is separate and is the only thing that justifies a stop:
+  **untested code does not write to a client's board.** `status`, `diff`,
+  `lint`, `with-lock` and `pin` are never refused.
+  - `--allow-dirty` bypasses it. **The bypass marks a run; it never blinds one**
+    — the exact content hash is still logged and the run is stamped as a bypass
+    of untested code, on stderr and in the log.
+  - **Behaviour change for anyone running from a checkout they edit:** a local
+    modification to `clickup.py` now stops the next writing command until you
+    pin, commit, or pass the flag.
+
+- **A checkout that moves during a writing run is reported on the way out**,
+  naming the commit that actually ran. That is the 2026-08-21 event, which
+  previously produced no signal at all.
+
 ### Fixed
 
 - **A failed dependency or linked-task edge is no longer easy to miss.** Two

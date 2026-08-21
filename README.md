@@ -283,22 +283,73 @@ be a clearly delimited block, never mixed into hand-written prose.
 > day someone rebuilds a story dict, CI fails instead of quietly deleting people's
 > provenance.
 
-## Running it: use a pinned copy, not a live checkout
-
-**Operators should invoke a pinned checkout or an installed copy of `clickup.py`, not
-a working tree someone is developing in.** `clickup.py` is a single file with no
-runtime dependency on anything else in the repo (it does not read `schema.yaml`), so
-a copy of the file at a known commit is a complete, correct tool:
+## Running it: pin a copy (`clickup.py pin`)
 
 ```bash
-git -C <repo> show <commit>:clickup.py > ~/bin/clickup-<commit>.py && chmod +x ~/bin/clickup-<commit>.py
+./clickup.py pin          # writes ~/bin/clickup-<commit>.py and tells you how to use it
+~/bin/clickup-<commit>.py sync docs/project-tasks.yaml
 ```
 
-The lock below protects the *task file* from concurrent writers. **Nothing protects
-the tool itself from being rewritten mid-use** — a merge landing between your
-invocation and interpreter start is a narrow but real race, and a sync that half-runs
-against a client board is an expensive way to discover it. This is not hypothetical:
-it nearly happened on 2026-08-21, on a board a client was about to be invited to.
+**Run boards through a pinned copy, not through a development checkout.** A pinned
+copy cannot change under you when somebody merges, and it reports its own content
+hash. `clickup.py` is a single file with no runtime dependency on anything else in
+the repo (it does not read `schema.yaml`), so a copy at a known commit is a complete,
+correct tool.
+
+### Every run says what produced it
+
+```bash
+./clickup.py --version
+# clickup.py /home/…/clickup.py | commit b451d96 (clean) | sha256 4c4a79014723
+```
+
+The same line is logged at the start of **every** run, before anything is touched.
+
+**The hazard being closed is unattributable runs — not torn reads.** Python loads
+this file fully at interpreter start and git replaces files by rename, so a running
+process cannot have its code swapped. What actually goes wrong is subtler: on
+2026-08-21 an operator prepared a client-board sync against one commit, the working
+tree moved to another commit while they prepared, and the only reason anyone noticed
+was an unrelated message. There was no record either way. Every corpus board is
+invoked from a live development checkout, so that is the normal case, not an accident.
+
+If the checkout moves *during* a writing run, the run says so on the way out and
+names the commit that actually ran.
+
+### A writing command will not run from a modified `clickup.py`
+
+```
+ERROR: Refusing to run 'sync': clickup.py has uncommitted changes, so these bytes
+have never been tested and this is a writing command.
+```
+
+**Two different goals, and only one of them justifies a refusal.** *Attribution* is
+solved completely by the content hash — even uncommitted code is fully identified.
+What refusal buys is separate: **it stops untested code writing to a client's board.**
+
+Three ways forward, and the message lists them easiest-first:
+
+1. **`clickup.py pin`** — one argument-free command. This is the recommended path and
+   it is deliberately easier than the bypass; a guard with a convenient bypass becomes
+   decoration, because everyone types the flag and it then fires on nothing.
+2. Commit the change and run again.
+3. **`--allow-dirty`**, for deliberately testing an uncommitted change.
+
+**The bypass marks a run; it never blinds one.** `--allow-dirty` still logs the exact
+content hash and stamps the run — on stderr and in the log — as a bypass of untested
+code. That is what makes marking it sufficient rather than a hole.
+
+Only `push`, `pull`, `sync` and `merge` are refused. `status`, `diff`, `lint`,
+`with-lock` and `pin` never are — reading the world can always be accounted for by
+reading it again.
+
+> **This is a behaviour change for anyone running from a working tree they edit.**
+> If your checkout has local modifications to `clickup.py`, your next writing command
+> stops until you pin, commit, or pass the flag. That is intended: the thing on the
+> other side is an unattributable, untested write to a client's board.
+
+The lock below protects the *task file* from concurrent writers; this protects the
+question *which code did that*.
 
 ## Locking — the tool takes the flag for you
 
