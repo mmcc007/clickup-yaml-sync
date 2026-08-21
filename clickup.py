@@ -1921,6 +1921,15 @@ _EDGE_HINT_SHOWN = False
 # to check rather than as a diagnosis: these are the plausible causes on this
 # account, not a reading of the error. The error itself is in the message above
 # it, and it is authoritative.
+#
+# STILL UNEXERCISED AGAINST A REAL FAILURE (as of 2026-08-21). This was written
+# expecting the guest-shared BREC space to refuse edge writes -- it did not. The
+# Dependencies ClickApp turned out to be ENABLED there, and all 9 dependencies
+# and 2 relations applied with no error. So the one live guest-shared client
+# board we have does NOT reproduce the case this hint describes, and the
+# INSUFFICIENT_ACCESS line in particular remains a plausible cause nobody has
+# seen here. That is the reason it is a checklist rather than a diagnosis: if a
+# real failure ever arrives, put its actual ECODE in here and narrow it.
 EDGE_FAILURE_HINT = (
     "    Edge operations (dependencies / linked tasks) can fail for reasons the "
     "task itself is fine for. Worth checking:\n"
