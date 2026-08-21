@@ -66,12 +66,21 @@ def setup_logging() -> logging.Logger:
     logger = logging.getLogger("clickup_sync")
     logger.setLevel(logging.DEBUG)
 
-    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    )
-    logger.addHandler(file_handler)
+    # The debug log is a convenience, not a dependency. Import-time used to
+    # hard-crash on any box where ~/tmp did not exist (CI, a fresh checkout, a
+    # container) -- and it crashed on *import*, so nothing in the tool ran at
+    # all. Create the directory, and fall back to console-only if we still
+    # cannot write there.
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        )
+        logger.addHandler(file_handler)
+    except OSError as e:
+        print(f"WARNING: file logging disabled ({LOG_PATH}: {e})", file=sys.stderr)
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)

@@ -36,6 +36,13 @@
 
 ### Fixed
 
+- **Importing `clickup.py` no longer hard-crashes when `~/tmp` does not exist.**
+  `setup_logging()` opened the debug log at import time with no directory
+  creation and no fallback, so on a fresh checkout, in a container or on CI the
+  whole tool failed to load with a `FileNotFoundError`. The directory is now
+  created, and file logging degrades to console-only if it still cannot be
+  written. (Found the moment this repo got CI.)
+
 - **`save_yaml` is now atomic** (temp file + `os.replace`). `push`/`sync` flush
   the task file once per created task; a crash partway through the previous
   truncate-and-write left the project's task file truncated.
