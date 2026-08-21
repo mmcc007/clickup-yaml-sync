@@ -26,6 +26,7 @@ epics:                        Tasks (flat list):
 | `sync` | Full bidirectional sync with conflict resolution |
 | `merge` | Like sync but uses GPT-4o-mini to propose merged values |
 | `status` | Offline summary table (no API calls) |
+| `lint` | Report milestone-date incoherence — advisory, flags but never modifies |
 | `with-lock` | Run any command (an editor, a script, a shell) while holding the project's lock — the supported way to hand-edit a task file |
 
 ### Which command should I use? → `sync` (default)
@@ -51,6 +52,97 @@ Both `push` and `pull` print a one-time warning banner describing what they'll o
 > Still good practice: **run it detached / in the background** (an agent's `run_in_background`, or `nohup … &` / a tmux pane) for very large boards, and always preview with `sync --dry-run` first (read-only).
 >
 > - **If a run *was* interrupted (older versions, or to double-check):** check `git status` on the YAML and re-run — the dedupe pass adopts any orphan tasks. If you see `⚠️ DUPLICATES` in the summary, inspect the YAML and ClickUp for duplicate tasks.
+
+## Milestone-date lint
+
+**A card tagged to a milestone should be due on or before that milestone's own due
+date.** If work has to be finished before a gate, a date after the gate is a
+contradiction. `clickup.py lint <file>` reports those, and so does every other
+command, as an advisory tail.
+
+```bash
+./clickup.py lint docs/project-tasks.yaml
+```
+
+### It is a lint, not a constraint — and that is deliberate
+
+**ClickUp enforces nothing here.** A "milestone" is a task *type* on an ordinary
+task, rendered as a diamond at a point in time. It contains nothing and groups
+nothing; the only structural relationships ClickUp has are dependencies and subtasks.
+So the `m<n>-<slug>` tag is the **only** association that exists between a card and
+its gate, and a date check over that tag is the only way to catch an incoherent plan.
+
+Three rules follow from that, and each is load-bearing:
+
+1. **It flags; it never modifies.** A date is a human's decision.
+2. **Missing data is silent.** Most cards have no due date. An undated card is not a
+   violation and is never reported as one.
+3. **It never blocks.** Every command's tail is advisory and the exit code is
+   unaffected. A lint that stops a sync over a guideline gets bypassed, and a
+   bypassed lint is worse than no lint. `lint --strict` is the opt-in for anyone who
+   *does* want a non-zero exit (CI, a pre-merge gate).
+
+It does **not** look at epics. Epics are a YAML-only grouping and a diamond is
+deliberately not filed under a work epic, so no milestone relationship is inferred
+from one.
+
+### How a card is tied to a gate
+
+The gate is a story with `milestone: true` carrying an `m<n>` tag; a card points at it
+with the same tag. The **number** carries the sequence, the **slug** carries the
+meaning:
+
+```yaml
+epics:
+  - name: Milestones
+    stories:
+      - name: M1 - Infrastructure ready
+        milestone: true
+        due_date: "2026-09-15"
+        tags: [m1-infrastructure]
+
+  - name: Delivery
+    stories:
+      - name: Stand up the ingest pipeline
+        due_date: "2026-10-01"        # after the gate -> CONTRADICTION
+        tags: [m1-infrastructure]
+```
+
+Both `tags:` and the `milestone_label` enum (`M0`–`M3`, which push lowercases into the
+same tag namespace) are read.
+
+### What it reports
+
+| code | severity | meaning |
+|---|---|---|
+| `milestone-date` | contradiction | the card is due after its gate |
+| `milestone-tag-unresolved` | warning | no gate carries that number — a typo, or the gate does not exist yet |
+| `milestone-slug-mismatch` | warning | same number, different slug — likely a typo. Checked against that gate anyway, so a typo cannot silently disable the date check |
+| `milestone-ambiguous` | warning | two gates share a number, so nothing can resolve to one of them |
+| `milestone-gate-undated` | note | the gate has no due date, so no card tagged to it can be checked. Reported once per gate, not once per card |
+
+The resolution findings are often worth more than the date check itself: a typo'd tag
+otherwise filters to nothing, and the plan looks clean **because nothing is being
+checked**.
+
+### Accepting a finding
+
+A date set in the ClickUp UI arrives here via `pull` and is legitimate data, not
+necessarily a mistake. A card can accept a finding by its code, **with a written
+reason**:
+
+```yaml
+- name: Late but agreed
+  due_date: "2026-11-01"
+  tags: [m1-infrastructure]
+  lint_exceptions:
+    milestone-date: "Client moved the acceptance window; agreed with Eric 2026-08-20"
+```
+
+The value must be a **non-empty string**. A bare `true` is deliberately rejected — a
+suppression flag with no rationale tells the next reader nothing, and by the time
+anyone asks, whoever set it has moved on. Accepted findings are still **counted** in
+the report, so suppressed is not the same as gone.
 
 ## Locking — the tool takes the flag for you
 
@@ -672,6 +764,9 @@ python3 clickup.py merge project.yaml
 
 # Offline status summary
 python3 clickup.py status project.yaml
+
+# Check milestone-date coherence (advisory; never changes anything)
+./clickup.py lint docs/project-tasks.yaml
 
 # Hand-edit a task file inside the lock (the supported edit path)
 ./clickup.py with-lock docs/project-tasks.yaml -- $EDITOR docs/project-tasks.yaml

@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -3291,3 +3292,220 @@ class TestAtomicYamlSave:
         clickup.save_yaml(data, str(f))
         assert yaml.safe_load(f.read_text())["epics"] == []
         assert not list(tmp_path.glob("*.tmp*"))
+
+
+# ---------------------------------------------------------------------------
+# Milestone-date lint
+# ---------------------------------------------------------------------------
+#
+# The lint reports a guideline ClickUp does not enforce. The behaviours worth
+# pinning are the three Maurice stated as requirements -- flag never modify,
+# exceptions must be possible and self-documenting, missing data stays silent --
+# plus the resolution rules, because a tag that silently resolves to nothing is
+# the failure that makes the whole check look clean when it is not running.
+
+
+def _lint_data(*epics: dict) -> dict:
+    return {"project": {"name": "p"}, "status_map": {}, "epics": list(epics)}
+
+
+def _gate(name: str, tag: str, due: str | None = None, **extra) -> dict:
+    return _story_with(name, milestone=True, tags=[tag], due_date=due, **extra)
+
+
+def _codes(result: dict) -> list[str]:
+    return sorted(f["code"] for f in result["findings"])
+
+
+class TestMilestoneLintResolution:
+    def test_reads_both_free_form_tags_and_the_milestone_label_enum(self):
+        refs = clickup._milestone_refs({"tags": ["m2-system", "not-a-milestone"],
+                                        "milestone_label": "M1"})
+        assert sorted((n, s) for n, s, _ in refs) == [(1, None), (2, "system")]
+
+    def test_ignores_tags_that_only_look_like_milestones(self):
+        assert clickup._milestone_refs({"tags": ["mx", "milestone", "s1", "m"]}) == []
+
+    def test_a_tag_pointing_at_no_gate_is_reported(self):
+        """The most valuable finding: a typo'd tag otherwise filters to nothing
+        and the plan looks clean because nothing is being checked."""
+        data = _lint_data(_epic_with("Delivery", [
+            _story_with("orphan", tags=["m7-nope"], due_date="2026-01-01"),
+        ]))
+        assert clickup.LINT_TAG_UNRESOLVED in _codes(clickup.lint_milestone_dates(data))
+
+    def test_two_gates_sharing_a_number_are_reported_as_ambiguous(self):
+        data = _lint_data(_epic_with("Milestones", [
+            _gate("M1 a", "m1-alpha", "2026-09-01"),
+            _gate("M1 b", "m1-beta", "2026-09-02"),
+        ]))
+        assert _codes(clickup.lint_milestone_dates(data)) == [
+            clickup.LINT_AMBIGUOUS, clickup.LINT_AMBIGUOUS,
+        ]
+
+    def test_a_card_under_an_ambiguous_number_is_not_date_checked(self):
+        """It cannot be resolved to one gate, so a date verdict would be a
+        coin flip presented as a finding."""
+        data = _lint_data(
+            _epic_with("Milestones", [
+                _gate("M1 a", "m1-alpha", "2026-09-01"),
+                _gate("M1 b", "m1-beta", "2026-12-01"),
+            ]),
+            _epic_with("Delivery", [
+                _story_with("late", tags=["m1-alpha"], due_date="2026-11-01"),
+            ]),
+        )
+        assert clickup.LINT_DATE_AFTER_GATE not in _codes(clickup.lint_milestone_dates(data))
+
+    def test_same_number_different_slug_is_flagged_but_still_checked(self):
+        """A typo'd slug must not silently disable the date check -- that would
+        turn a typo into an invisible gap."""
+        data = _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infrastructure", "2026-09-15")]),
+            _epic_with("Delivery", [
+                _story_with("typo", tags=["m1-infrastrucutre"], due_date="2026-10-01"),
+            ]),
+        )
+        assert _codes(clickup.lint_milestone_dates(data)) == [
+            clickup.LINT_DATE_AFTER_GATE, clickup.LINT_SLUG_MISMATCH,
+        ]
+
+    def test_a_milestone_with_no_tag_cannot_be_referenced_and_is_reported(self):
+        data = _lint_data(_epic_with("Milestones", [
+            _story_with("nameless gate", milestone=True, due_date="2026-09-01"),
+        ]))
+        assert clickup.LINT_TAG_UNRESOLVED in _codes(clickup.lint_milestone_dates(data))
+
+    def test_epics_are_never_used_to_infer_a_milestone(self):
+        """A diamond is deliberately not filed under a work epic, so sharing an
+        epic must imply nothing."""
+        data = _lint_data(_epic_with("Delivery", [
+            _gate("M1", "m1-infra", "2026-09-01"),
+            _story_with("untagged sibling", due_date="2026-12-01"),
+        ]))
+        assert clickup.lint_milestone_dates(data)["findings"] == []
+
+
+class TestMilestoneLintDates:
+    def test_due_after_the_gate_is_a_contradiction(self):
+        data = _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infra", "2026-09-15")]),
+            _epic_with("Delivery", [_story_with("late", tags=["m1-infra"], due_date="2026-10-01")]),
+        )
+        findings = clickup.lint_milestone_dates(data)["findings"]
+        assert [f["code"] for f in findings] == [clickup.LINT_DATE_AFTER_GATE]
+        assert findings[0]["severity"] == "error"
+
+    def test_due_on_the_gate_date_is_fine(self):
+        """On or before. A card finishing on the gate day is coherent."""
+        data = _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infra", "2026-09-15")]),
+            _epic_with("Delivery", [_story_with("ok", tags=["m1-infra"], due_date="2026-09-15")]),
+        )
+        assert clickup.lint_milestone_dates(data)["findings"] == []
+
+    def test_a_card_with_no_due_date_is_silent(self):
+        """Today most cards have no date at all. Noise here would bury the real
+        findings on every board in the account."""
+        data = _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infra", "2026-09-15")]),
+            _epic_with("Delivery", [_story_with("undated", tags=["m1-infra"])]),
+        )
+        assert clickup.lint_milestone_dates(data)["findings"] == []
+
+    def test_an_undated_gate_is_a_note_once_not_a_violation_per_card(self):
+        data = _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infra")]),
+            _epic_with("Delivery", [
+                _story_with("a", tags=["m1-infra"], due_date="2026-10-01"),
+                _story_with("b", tags=["m1-infra"], due_date="2026-11-01"),
+            ]),
+        )
+        findings = clickup.lint_milestone_dates(data)["findings"]
+        assert [f["code"] for f in findings] == [clickup.LINT_GATE_UNDATED]
+        assert findings[0]["severity"] == "info"
+
+    def test_a_gate_is_not_checked_against_itself(self):
+        data = _lint_data(_epic_with("Milestones", [_gate("M1", "m1-infra", "2026-09-15")]))
+        assert clickup.lint_milestone_dates(data)["findings"] == []
+
+
+class TestMilestoneLintExceptions:
+    def _late(self, **story_extra) -> dict:
+        return _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infra", "2026-09-15")]),
+            _epic_with("Delivery", [
+                _story_with("late", tags=["m1-infra"], due_date="2026-10-01", **story_extra),
+            ]),
+        )
+
+    def test_a_written_reason_accepts_the_finding(self):
+        result = clickup.lint_milestone_dates(self._late(
+            lint_exceptions={"milestone-date": "Client moved the window, agreed 2026-08-20"},
+        ))
+        assert result["findings"] == []
+        assert len(result["accepted"]) == 1
+        assert "Client moved the window" in result["accepted"][0]["accepted_because"]
+
+    def test_a_bare_true_is_not_an_exception(self):
+        """A suppression flag with no rationale tells the next reader nothing,
+        and accepting one would let the self-documenting rule rot away a card at
+        a time."""
+        result = clickup.lint_milestone_dates(self._late(lint_exceptions={"milestone-date": True}))
+        assert _codes(result) == [clickup.LINT_DATE_AFTER_GATE]
+
+    def test_an_empty_reason_is_not_an_exception(self):
+        result = clickup.lint_milestone_dates(self._late(lint_exceptions={"milestone-date": "  "}))
+        assert _codes(result) == [clickup.LINT_DATE_AFTER_GATE]
+
+    def test_an_exception_for_a_different_code_does_not_suppress_this_one(self):
+        result = clickup.lint_milestone_dates(self._late(
+            lint_exceptions={"milestone-tag-unresolved": "different finding entirely"},
+        ))
+        assert _codes(result) == [clickup.LINT_DATE_AFTER_GATE]
+
+    def test_accepted_findings_are_counted_not_discarded(self):
+        """Suppressed is not the same as gone -- the report still says how many."""
+        result = clickup.lint_milestone_dates(self._late(
+            lint_exceptions={"milestone-date": "known and agreed"},
+        ))
+        assert len(result["accepted"]) == 1
+
+
+class TestMilestoneLintIsAdvisory:
+    def test_the_lint_never_modifies_the_data_it_reads(self):
+        """Flag, never modify. A date is a human's decision."""
+        data = _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infra", "2026-09-15")]),
+            _epic_with("Delivery", [_story_with("late", tags=["m1-infra"], due_date="2026-10-01")]),
+        )
+        before = copy.deepcopy(data)
+        clickup.lint_milestone_dates(data)
+        assert data == before
+
+    def test_cmd_lint_exits_zero_even_with_findings(self, capsys):
+        """A lint that breaks a build over a guideline gets routed around, and a
+        routed-around lint is worse than none."""
+        data = _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infra", "2026-09-15")]),
+            _epic_with("Delivery", [_story_with("late", tags=["m1-infra"], due_date="2026-10-01")]),
+        )
+        assert clickup.cmd_lint(data) == 0
+        assert "CONTRADICTION" in capsys.readouterr().out
+
+    def test_strict_is_the_opt_in_for_a_non_zero_exit(self):
+        data = _lint_data(
+            _epic_with("Milestones", [_gate("M1", "m1-infra", "2026-09-15")]),
+            _epic_with("Delivery", [_story_with("late", tags=["m1-infra"], due_date="2026-10-01")]),
+        )
+        assert clickup.cmd_lint(data, strict=True) == 1
+
+    def test_strict_still_exits_zero_when_clean(self):
+        assert clickup.cmd_lint(_lint_data(), strict=True) == 0
+
+    def test_a_clean_board_prints_nothing_on_the_advisory_tail(self, capsys):
+        clickup.print_lint_report(clickup.lint_milestone_dates(_lint_data()))
+        assert capsys.readouterr().out == ""
+
+    def test_an_empty_project_does_not_crash(self):
+        assert clickup.lint_milestone_dates({})["findings"] == []

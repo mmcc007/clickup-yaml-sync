@@ -332,3 +332,31 @@ properties:
                 description: >
                   Start date as YYYY-MM-DD (date-only). Same handling as due_date.
                 example: "2026-06-15"
+
+              lint_exceptions:
+                type: object
+                description: >
+                  Per-card acceptances for the milestone-date lint, keyed by the
+                  lint's finding code, with a written reason as the value. The
+                  lint reports a guideline ClickUp does not enforce, and a date
+                  set in the ClickUp UI arrives here via `pull` as legitimate
+                  data — so a card needs a way to say "yes, we know" without the
+                  lint nagging forever.
+
+                  The value must be a NON-EMPTY STRING explaining why. A bare
+                  `true` is deliberately not accepted: a suppression flag with
+                  no rationale tells the next reader nothing, and by the time
+                  anyone asks, whoever set it has moved on. Accepted findings
+                  are still counted in the report, so suppressed is not the same
+                  as gone.
+
+                  Codes: `milestone-date` (due after the gate),
+                  `milestone-tag-unresolved` (no gate carries that number),
+                  `milestone-slug-mismatch` (same number, different slug),
+                  `milestone-ambiguous` (two gates share a number),
+                  `milestone-gate-undated` (the gate itself has no due date).
+                additionalProperties:
+                  type: string
+                  minLength: 1
+                example:
+                  milestone-date: "Client moved the acceptance window; agreed with Eric 2026-08-20"
