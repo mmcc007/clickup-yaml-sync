@@ -185,12 +185,29 @@ properties:
               milestone_label:
                 type: [string, "null"]
                 description: >
-                  Optional SOW billing milestone slug (M0/M1/M2/M3). When set,
-                  push appends a lowercased tag (M1 -> `m1`) to the story's
-                  tag set, on top of the epic-name tag and any explicit tags[].
-                  Purely a convenience over manually adding the slug to tags[].
-                enum: [M0, M1, M2, M3, null]
-                example: "M1"
+                  Optional SOW milestone reference, as `M<n>` or
+                  `M<n>-<slug>`. When set, push appends the lowercased value as
+                  a tag (`M1` -> `m1`, `M1-infrastructure` ->
+                  `m1-infrastructure`), on top of the epic-name tag and any
+                  explicit tags[]. A convenience over hand-writing the slug into
+                  tags[] — and the point of using it is that the convention then
+                  comes from the tool instead of being re-invented per project.
+
+                  **The number carries the sequence; the slug carries the
+                  meaning.** A bare `m1` is a handle that tells a reader
+                  nothing, which is why the slug form exists. `n` is unbounded:
+                  this field was previously an `M0`–`M3` enum, which capped a
+                  project at four milestones for no reason a five-milestone SOW
+                  would accept.
+
+                  Bare `M0`–`M3` remain valid and unchanged — existing boards
+                  using them are not disturbed.
+
+                  The milestone-date lint resolves a card to its gate through
+                  this field or through an equivalent `tags:` entry; the two are
+                  the same reference by different routes.
+                pattern: "^[Mm][0-9]+(-[a-z0-9][a-z0-9-]*)?$"
+                examples: ["M1", "M1-infrastructure", "M2-system", "M3-acceptance"]
 
               sprint_target:
                 type: [integer, "null"]
@@ -354,7 +371,9 @@ properties:
                   `milestone-tag-unresolved` (no gate carries that number),
                   `milestone-slug-mismatch` (same number, different slug),
                   `milestone-ambiguous` (two gates share a number),
-                  `milestone-gate-undated` (the gate itself has no due date).
+                  `milestone-gate-undated` (the gate itself has no due date),
+                  `milestone-label-malformed` (milestone_label is not M<n> or
+                  M<n>-<slug>).
                 additionalProperties:
                   type: string
                   minLength: 1
