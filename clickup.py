@@ -854,10 +854,24 @@ def build_base_from_yaml(data: dict, status_map: dict) -> dict:
         what stops a YAML email being matched against a ClickUp key as raw
         strings, which would trade a loud false conflict for a SILENT false
         agreement.
-      * Storing resolved ids instead would freeze a stale id into the snapshot,
-        so a roster change (someone's email updated) would make base and local
-        disagree spuriously. Storing strings and resolving both sides through
-        the SAME current roster cannot produce that skew.
+      * An unresolvable baseline entry is DETECTABLE. If a name in the base no
+        longer resolves — someone left the workspace — the tool can see that
+        and return UNKNOWN, which stops the run loudly. A base holding a bare
+        user id gives it no way to notice: an id that no longer belongs to
+        anyone still compares equal or unequal perfectly well, so the run would
+        proceed against a ghost, silently. That is the same loud-beats-silent
+        asymmetry that ruled out storing raw strings and comparing them to
+        remote keys.
+      * The base can be written from any code path without a roster or a
+        token. save_base_snapshot() is a chokepoint reached from every command,
+        and a base that could only be written where an API session exists would
+        be either incomplete or a lie about what it recorded.
+
+    NOT a reason, though an earlier version of this comment claimed it was: a
+    frozen id going stale when someone's email changes. ClickUp user ids are
+    stable across an email change, so a base holding id 123 and a YAML string
+    resolving to id 123 would still agree. The argument was wrong, and a wrong
+    justification left in a comment gets applied somewhere it does not hold.
 
     A story that does not manage assignees records no key, so it stays
     unmanaged and an old snapshot is indistinguishable from it — see
