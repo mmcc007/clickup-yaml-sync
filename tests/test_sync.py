@@ -1206,22 +1206,31 @@ class TestCuWaitingOnIds:
 
 
 class TestResolveDependencyIds:
+    """Id-only behaviour, with no resolution context — unchanged.
+
+    The return arity grew to ``(desired, skipped, pending)`` when name
+    references were added: a *skipped* self-edge and a *pending* create are
+    different outcomes and collapsing them into one bucket would make the caller
+    unable to tell "harmless, carry on" from "abort this story's edges".
+    """
+
     def test_dedup_order_preserving(self):
-        desired, unresolved = clickup._resolve_dependency_ids(["A", "B", "A"], "SELF")
+        desired, skipped, pending = clickup._resolve_dependency_ids(["A", "B", "A"], "SELF")
         assert desired == ["A", "B"]
-        assert unresolved == []
+        assert skipped == []
+        assert pending == []
 
     def test_drops_blanks(self):
-        desired, _ = clickup._resolve_dependency_ids(["A", "", "  ", "B"], "SELF")
+        desired, _, _ = clickup._resolve_dependency_ids(["A", "", "  ", "B"], "SELF")
         assert desired == ["A", "B"]
 
     def test_rejects_self_dependency(self):
-        desired, unresolved = clickup._resolve_dependency_ids(["SELF", "A"], "SELF")
+        desired, skipped, _ = clickup._resolve_dependency_ids(["SELF", "A"], "SELF")
         assert desired == ["A"]
-        assert unresolved == ["SELF"]
+        assert skipped == ["SELF"]
 
     def test_none_input(self):
-        assert clickup._resolve_dependency_ids(None, "SELF") == ([], [])
+        assert clickup._resolve_dependency_ids(None, "SELF") == ([], [], [])
 
 
 class TestSyncDependencies:
