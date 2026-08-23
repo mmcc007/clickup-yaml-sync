@@ -4,6 +4,20 @@
 
 ### Added
 
+- **The two task-file lock hooks now live in this repo** (`hooks/`), with tests
+  (`tests/hooks/diamond-lock.test.js`) that run in CI.
+
+  They encode this tool's file format and its lock protocol — same path, same
+  JSON, same TTL, same identity — so being versioned separately from it and
+  unreachable by its CI is what let them drift. That is not a tidiness argument:
+  it is why `stop-diamond-lock-release.js` kept a hardcoded path to one project
+  long after a second had a task file, and why both ran for their whole life
+  with **zero tests** while guarding live client files.
+
+  Register them from their new location in `~/.claude/settings.json`; see the
+  README.
+
+
 - **`depends_on` and `related` accept story names, not just ids.** An id does
   not exist until the run that creates it, so on a brand-new board an id
   reference could not be written at all — which forced two passes: one to create
