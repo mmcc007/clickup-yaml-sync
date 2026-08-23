@@ -9,6 +9,8 @@ Commands:
   merge   LLM-assisted conflict resolution (pull + push with intelligent merging)
   status  Show summary of project state from YAML (offline, no API calls)
   lint    Report milestone-date incoherence (advisory; flags, never modifies)
+  pin     Write an immutable, pinned copy of this tool and print its path --
+          the recommended way to run a board (it cannot change under you)
   with-lock  Run any command (an editor, a script, a shell) while holding the
              project's advisory lock -- the supported way to hand-edit a task
              file, since every write goes through this tool
@@ -31,6 +33,7 @@ Conflict strategies (--conflict flag for sync):
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -219,6 +222,186 @@ def get_openai_key() -> str:
 # ---------------------------------------------------------------------------
 # YAML loading / saving
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Run provenance: which code produced this run
+# ---------------------------------------------------------------------------
+#
+# The hazard this closes is NOT that a running process has its code swapped --
+# Python reads this single file fully at interpreter start and git replaces
+# files by rename, so that does not happen. It is that **nobody can say which
+# version ran**.
+#
+# Witnessed 2026-08-21: an operator prepared a client-board sync against one
+# commit of this file, the working tree moved to another commit while they were
+# preparing, and the only reason anyone noticed was an unrelated message. There
+# was no record either way, before or after. Every corpus board is invoked from
+# a live development checkout, so this is the normal case, not an accident.
+#
+# Two goals, and they are NOT the same one -- keeping them apart is what stops
+# the mechanism drifting:
+#
+#   * ATTRIBUTION -- say exactly what ran. A content hash achieves this
+#     completely, including for uncommitted code. Every run states its
+#     provenance; `--version` reports the same.
+#   * NOT WRITING UNTESTED CODE TO A CLIENT BOARD -- a separate goal, and the
+#     only one that justifies a refusal. This is why a writing command stops on
+#     a modified `clickup.py`: not because the run would be unattributable (the
+#     hash handles that) but because nothing has tested those bytes.
+#
+# So the bypass MARKS a run; it never blinds one. `--allow-dirty` still records
+# the full provenance and stamps the run as bypassed, prominently.
+#
+# The guard is only as good as the easy path around it: a guard with a
+# convenient bypass becomes decoration, because everyone types the flag and it
+# then fires on nothing. `clickup.py pin` therefore makes the SAFE path a single
+# argument-free command -- easier than remembering a flag, which is the point.
+
+TOOL_PATH = Path(__file__).resolve()
+PROVENANCE_EXIT_CODE = 4  # distinct from 1 (failed) and 3 (lock busy)
+
+# Commands that write to the YAML, to ClickUp, or to both. Only these are
+# refused: reading the world can always be accounted for by re-reading it.
+WRITING_COMMANDS = ("push", "pull", "sync", "merge")
+
+
+def _git_out(*args: str) -> Optional[str]:
+    """Run git in the tool's own directory; None on any failure.
+
+    None means "not a git checkout, or git unavailable" -- both legitimate (an
+    installed or pinned copy), never an error.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(TOOL_PATH.parent), *args],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _file_sha256(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:  # pragma: no cover - defensive
+        return None
+
+
+def tool_provenance() -> dict:
+    """Where this specific `clickup.py` came from.
+
+    ``dirty`` is about THIS FILE, not the whole working tree: an unrelated
+    change elsewhere in the repo does not make a run untested, and refusing on
+    it would block people for no safety gain.
+    """
+    sha256 = _file_sha256(TOOL_PATH)
+    commit = _git_out("rev-parse", "HEAD")
+    if commit is None:
+        return {"path": str(TOOL_PATH), "sha256": sha256,
+                "commit": None, "dirty": None, "in_git": False}
+    status = _git_out("status", "--porcelain", "--", str(TOOL_PATH))
+    return {"path": str(TOOL_PATH), "sha256": sha256,
+            "commit": commit, "dirty": bool(status), "in_git": True}
+
+
+def format_provenance(prov: dict, bypassed: bool = False) -> str:
+    """One line naming what ran. The sha256 is always present, so even a
+    bypassed run is fully attributable -- that is what makes marking it enough."""
+    sha = (prov.get("sha256") or "?")[:12]
+    mark = "  [!! --allow-dirty BYPASS: untested code !!]" if bypassed else ""
+    if not prov.get("in_git"):
+        return f"clickup.py {prov['path']} | sha256 {sha} | pinned copy (not a git checkout){mark}"
+    state = "MODIFIED" if prov.get("dirty") else "clean"
+    return (f"clickup.py {prov['path']} | commit {(prov.get('commit') or '?')[:7]} "
+            f"({state}) | sha256 {sha}{mark}")
+
+
+def pinned_copy_path(prov: dict) -> Path:
+    stamp = (prov.get("commit") or prov.get("sha256") or "unknown")[:7]
+    suffix = "-dirty" if prov.get("dirty") else ""
+    return Path.home() / "bin" / f"clickup-{stamp}{suffix}.py"
+
+
+def cmd_pin() -> int:
+    """Write a pinned, immutable copy of this tool and print its path.
+
+    The safe path has to be EASIER than the bypass or the guard is decoration.
+    This is one argument-free command; the alternative is remembering a flag.
+    """
+    prov = tool_provenance()
+    if prov.get("dirty"):
+        log.error(
+            "Refusing to pin a MODIFIED clickup.py: a pinned copy is meant to "
+            "be a known, committed version. Commit first, then pin."
+        )
+        return PROVENANCE_EXIT_CODE
+    dest = pinned_copy_path(prov)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(TOOL_PATH, dest)
+    dest.chmod(0o755)
+    print(f"Pinned: {dest}")
+    print(f"  {format_provenance(prov)}")
+    print("\nRun boards through this copy from now on. It cannot change under "
+          "you when someone merges, and it reports its own hash:")
+    print(f"  {dest} sync <yaml-file>")
+    return 0
+
+
+def assert_attributable(prov: dict, command: str, allow_dirty: bool) -> None:
+    """Refuse a writing command running from untested (uncommitted) code."""
+    if command not in WRITING_COMMANDS or not prov.get("dirty"):
+        return
+    if allow_dirty:
+        return  # marked, not blinded -- the caller stamps the run as bypassed
+    dest = pinned_copy_path({**prov, "dirty": False})
+    raise RuntimeError(
+        "Refusing to run '" + command + "': clickup.py has uncommitted changes, "
+        "so these bytes have never been tested and this is a writing command.\n"
+        "  " + format_provenance(prov) + "\n"
+        "  Three ways forward, easiest first:\n"
+        "    1. Run a pinned copy instead of the development tree (recommended, "
+        "and the reason this exists):\n"
+        "         " + str(TOOL_PATH) + " pin\n"
+        "       ...then invoke " + str(dest) + " instead. It cannot change under "
+        "you when someone merges.\n"
+        "    2. Commit the change and run again.\n"
+        "    3. --allow-dirty, if you are deliberately testing an uncommitted "
+        "change. The run still records its exact content hash and is stamped as "
+        "a bypass -- it is marked, not hidden."
+    )
+
+
+def warn_if_head_moved(before: Optional[str], command: str) -> None:
+    """Report a checkout that moved while the run was in flight.
+
+    The run itself is unaffected -- this process loaded its code at start. What
+    changed is that the tree no longer matches what ran, so anyone reading it
+    afterwards to work out what happened reads the wrong thing. That is the
+    exact event of 2026-08-21, and it previously produced no signal at all.
+    """
+    if not before or command not in WRITING_COMMANDS:
+        return
+    after = _git_out("rev-parse", "HEAD")
+    if after and after != before:
+        msg = ("NOTE: the checkout moved during this run (" + before[:7] + " -> "
+               + after[:7] + "). This run used " + before[:7] + "; the files on "
+               "disk no longer match it. Attribute this run to " + before[:7]
+               + ", not to what is checked out now.")
+        print("\n" + msg, file=sys.stderr, flush=True)
+        log.warning(msg)
+
+
+class _VersionAction(argparse.Action):
+    """Prints provenance and exits, without requiring the yaml_file positional."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(format_provenance(tool_provenance()))
+        parser.exit()
 
 
 # ---------------------------------------------------------------------------
@@ -641,14 +824,69 @@ def load_base_managed_tags(path: Path) -> set[str]:
     return {str(t).lower() for t in (doc.get("managed_tags") or [])}
 
 
+# Key under which the base records the assignee set. Deliberately NOT in
+# SYNCED_FIELDS: assignees are a SET, and letting three_way_plan() compare them
+# as a scalar string would be its own bug (["a","b"] != ["b","a"]). They get
+# their own 3-way classifier, _assignees_3way().
+BASE_ASSIGNEES_KEY = "assignees"
+
+
+def _normalised_assignees(story: dict) -> Optional[list[str]]:
+    """The story's assignee list in a canonical, order-independent form, or
+    None when the story does not manage assignees at all.
+
+    None and [] are different and both meaningful: no key means UNMANAGED
+    (ClickUp is left alone), an empty list means MANAGED-AND-EMPTY (clear them).
+    """
+    if BASE_ASSIGNEES_KEY not in story:
+        return None
+    return sorted({str(a).strip().lower() for a in (story.get("assignees") or []) if str(a).strip()})
+
+
 def build_base_from_yaml(data: dict, status_map: dict) -> dict:
-    """Comparable scalar snapshot for every story that has a clickup_id."""
+    """Comparable snapshot for every story that has a clickup_id.
+
+    Scalars come from comparable_local(). Assignees are recorded separately, as
+    the YAML STRINGS rather than resolved ClickUp ids — deliberately:
+
+      * Resolution happens at COMPARE time, where the workspace roster is in
+        hand, and base/local/remote are then all compared in id space. That is
+        what stops a YAML email being matched against a ClickUp key as raw
+        strings, which would trade a loud false conflict for a SILENT false
+        agreement.
+      * An unresolvable baseline entry is DETECTABLE. If a name in the base no
+        longer resolves — someone left the workspace — the tool can see that
+        and return UNKNOWN, which stops the run loudly. A base holding a bare
+        user id gives it no way to notice: an id that no longer belongs to
+        anyone still compares equal or unequal perfectly well, so the run would
+        proceed against a ghost, silently. That is the same loud-beats-silent
+        asymmetry that ruled out storing raw strings and comparing them to
+        remote keys.
+      * The base can be written from any code path without a roster or a
+        token. save_base_snapshot() is a chokepoint reached from every command,
+        and a base that could only be written where an API session exists would
+        be either incomplete or a lie about what it recorded.
+
+    NOT a reason, though an earlier version of this comment claimed it was: a
+    frozen id going stale when someone's email changes. ClickUp user ids are
+    stable across an email change, so a base holding id 123 and a YAML string
+    resolving to id 123 would still agree. The argument was wrong, and a wrong
+    justification left in a comment gets applied somewhere it does not hold.
+
+    A story that does not manage assignees records no key, so it stays
+    unmanaged and an old snapshot is indistinguishable from it — see
+    _assignees_3way(), which treats both as UNKNOWN and fails loud.
+    """
     tasks: dict = {}
     for epic in data.get("epics", []):
         for story in epic.get("stories", []):
             cid = story.get("clickup_id")
             if cid:
-                tasks[cid] = comparable_local(story, status_map)
+                record = comparable_local(story, status_map)
+                declared = _normalised_assignees(story)
+                if declared is not None:
+                    record[BASE_ASSIGNEES_KEY] = declared
+                tasks[cid] = record
     return tasks
 
 
@@ -1462,6 +1700,26 @@ def _story_desired_tags(
     return out
 
 
+def managed_tag_universe_for(data: dict, yaml_path: str, list_id: str) -> set[str]:
+    """The full managed-tag universe for a run: what the YAML declares NOW,
+    unioned with what this tool managed as of the last base snapshot.
+
+    Both halves are required and the second is the easy one to forget. Without
+    it a tag DROPPED from the YAML since the last run is no longer in the
+    current universe, so it looks like an untouched UI tag and is preserved
+    forever -- the reconcile can only remove what it knows it owns.
+
+    This exists as one function because it previously existed as two call sites
+    and only one of them had the union: ``cmd_sync`` did, ``cmd_push`` did not,
+    so `push` silently never removed a dropped tag. Both halves were unit-tested;
+    the WIRING between them was not, which is exactly how they diverged. One
+    function means the next fix cannot land in only one of them.
+    """
+    universe = _collect_managed_tag_universe(data)
+    universe |= load_base_managed_tags(base_snapshot_path(yaml_path, str(list_id)))
+    return universe
+
+
 def _collect_managed_tag_universe(data: dict) -> set[str]:
     """All tags this tool considers under its management — used to decide
     which pre-existing ClickUp tags are stale vs untouched UI additions."""
@@ -1817,6 +2075,66 @@ def _pull_assignees(story: dict, cu_task: dict) -> bool:
         return False
     story["assignees"] = target
     return True
+
+
+# Outcomes of the assignee 3-way. "unknown" is its own answer and never
+# collapses into "none": that distinction is the whole safety property here.
+ASSIGNEES_AGREE = "none"
+ASSIGNEES_LOCAL_ONLY = "push"
+ASSIGNEES_REMOTE_ONLY = "pull"
+ASSIGNEES_CONFLICT = "conflict"
+ASSIGNEES_UNKNOWN = "unknown"
+
+
+def _assignees_3way(
+    base_task: dict, story: dict, cu_task: dict, resolver: dict[str, int]
+) -> str:
+    """Classify one task's assignee set as a 3-way merge, in ID SPACE.
+
+    All three sides are reduced to sets of ClickUp user ids before comparison —
+    base and local by resolving their YAML strings through the CURRENT roster,
+    remote from the task itself. Comparing YAML strings against ClickUp keys
+    directly would be a false-agreement generator, and a false agreement is a
+    silent overwrite of somebody's edit.
+
+    Returns UNKNOWN, never AGREE, whenever the baseline cannot be trusted:
+
+      * the story does not manage assignees (no key) — nothing to reason about;
+      * the snapshot predates assignee tracking, so it has no record;
+      * a name in the baseline no longer resolves (someone left the workspace),
+        which would silently shrink the base set and make a local-only change
+        look like a collision, or worse.
+
+    UNKNOWN keeps today's behaviour: the divergence is surfaced rather than
+    auto-resolved. That is deliberate and is the direction that fails LOUD — an
+    old snapshot must never read as "nothing changed".
+    """
+    if BASE_ASSIGNEES_KEY not in story:
+        return ASSIGNEES_UNKNOWN
+
+    local_ids, local_unresolved = _resolve_assignee_ids(story.get("assignees"), resolver)
+    remote_ids = _cu_assignee_ids(cu_task)
+    local, remote = set(local_ids), set(remote_ids)
+
+    if local == remote:
+        return ASSIGNEES_AGREE
+
+    base_declared = base_task.get(BASE_ASSIGNEES_KEY)
+    if base_declared is None:
+        return ASSIGNEES_UNKNOWN  # pre-change snapshot, or was unmanaged then
+    base_ids, base_unresolved = _resolve_assignee_ids(base_declared, resolver)
+    if base_unresolved or local_unresolved:
+        # A baseline we cannot fully resolve is not a baseline.
+        return ASSIGNEES_UNKNOWN
+    base = set(base_ids)
+
+    changed_local = local != base
+    changed_remote = remote != base
+    if changed_local and not changed_remote:
+        return ASSIGNEES_LOCAL_ONLY
+    if changed_remote and not changed_local:
+        return ASSIGNEES_REMOTE_ONLY
+    return ASSIGNEES_CONFLICT
 
 
 def _assignees_differ(story: dict, cu_task: dict, resolver: dict[str, int]) -> bool:
@@ -3057,7 +3375,7 @@ def cmd_push(
             backup_default=backup_default,
         )
 
-    managed_universe = _collect_managed_tag_universe(data)
+    managed_universe = managed_tag_universe_for(data, yaml_path, list_id)
     # Dedupe index — adopt an existing ClickUp task rather than create a
     # duplicate when a prior run was interrupted before id writeback (BUG #14).
     dedupe_index = _build_create_dedupe_index(cu_tasks)
@@ -3810,7 +4128,7 @@ def cmd_sync(
     seen_cu_ids: set[str] = set(t["id"] for t in cu_tasks)
     all_yaml_ids: set[str] = _all_yaml_story_ids(data)
     project_cfg = data.get("project", {})
-    managed_universe = _collect_managed_tag_universe(data)
+    managed_universe = managed_tag_universe_for(data, yaml_path, list_id)
     # Dedupe index: lets a create detect a task that already exists in ClickUp
     # (e.g. an orphan from a prior run killed before its id was written back),
     # so a retry adopts it instead of creating a duplicate (BUG #14).
@@ -3833,11 +4151,6 @@ def cmd_sync(
         )
         stats["errors"] += 1
         return stats
-    # Tags the tool managed as of the base snapshot are "known managed" too, so an
-    # epic/tag dropped from the YAML since then gets REMOVED instead of accumulating.
-    # (UI-added tags are never in our managed universe, so they stay preserved.)
-    managed_universe |= load_base_managed_tags(base_snapshot_path(yaml_path, list_id))
-
     base_exists = bool(base)
     if base_exists:
         log.info(f"3-way mode: base snapshot has {len(base)} task(s).")
@@ -3845,13 +4158,23 @@ def cmd_sync(
             data, cu_by_id, base, status_map, assignee_resolver
         )
         if conflicts and on_conflict == "stop":
+            untracked = sum(1 for c in conflicts if c.get("not_base_tracked"))
             log.info(f"\n{'='*80}")
-            log.info(f"SYNC ABORTED — {len(conflicts)} true conflict(s); NO changes made.")
+            log.info(f"SYNC ABORTED — {len(conflicts)} conflict(s); NO changes made.")
+            if untracked:
+                # Do not call these "true conflicts". Some of them are not, and
+                # saying so is what stops the flag being reached for blind.
+                log.info(
+                    f"  ({untracked} of them on fields that are NOT base-tracked "
+                    f"— see the notes below; those may be local-only edits.)"
+                )
             log.info(f"{'='*80}")
             for c in conflicts:
                 log.info(f"  [CONFLICT] '{c['task']}' {c['field']}:")
                 log.info(f"      local:  {_truncate(str(c['local']), 60)}")
                 log.info(f"      remote: {_truncate(str(c['remote']), 60)}")
+                if c.get("not_base_tracked"):
+                    log.info(NOT_BASE_TRACKED_NOTE)
             log.info(
                 "Resolve each (set the YAML to the intended value, or re-run with "
                 "--on-conflict local|remote), then sync again."
@@ -3985,16 +4308,54 @@ def cmd_sync(
                     # local/remote we apply that direction, but warn loudly since
                     # it can overwrite the side that didn't actually change (M1).
                     assignee_strategy = on_conflict if base_exists else conflict
-                    if base_exists and _assignees_differ(story, cu_task, assignee_resolver):
-                        log.warning(
-                            f"  Assignees on '{story_name}' differ and are NOT base-tracked; "
-                            f"applying --on-conflict={on_conflict} may overwrite the unchanged "
-                            f"side. local={story.get('assignees', '(unmanaged)')} "
-                            f"remote={_cu_assignee_keys(cu_task)}"
-                        )
+                    story_base = base.get(story["clickup_id"], {}) if base_exists else None
+                    _assignee_verdict = (
+                        _assignees_3way(story_base, story, cu_task, assignee_resolver)
+                        if story_base is not None else ASSIGNEES_UNKNOWN
+                    )
+                    if (
+                        base_exists
+                        and _assignee_verdict in (ASSIGNEES_CONFLICT, ASSIGNEES_UNKNOWN)
+                        and _assignees_differ(story, cu_task, assignee_resolver)
+                    ):
+                        # Name the values being DISCARDED, not just that a
+                        # divergence exists. Someone who skipped the report
+                        # above still sees, in the run log, exactly what this
+                        # run threw away and on which task.
+                        yaml_v = story.get("assignees", "(unmanaged)")
+                        remote_v = _cu_assignee_keys(cu_task)
+                        # Two very different situations reach here, and saying
+                        # which one it is changes what the operator should do.
+                        if _assignee_verdict == ASSIGNEES_CONFLICT:
+                            why = (
+                                "BOTH sides changed since the last sync, so one "
+                                "of these is a real edit you are discarding"
+                            )
+                        else:
+                            why = (
+                                "there is no trustworthy baseline for this task "
+                                "(snapshot predates assignee tracking, or a name "
+                                "no longer resolves), so the tool cannot tell "
+                                "which side changed"
+                            )
+                        if assignee_strategy == "local":
+                            log.warning(
+                                f"  OVERWRITING assignees on '{story_name}': discarding "
+                                f"ClickUp's {remote_v}, writing {yaml_v}. {why}."
+                            )
+                        elif assignee_strategy == "remote":
+                            log.warning(
+                                f"  OVERWRITING assignees on '{story_name}': discarding "
+                                f"YAML's {yaml_v}, taking ClickUp's {remote_v}. {why}."
+                            )
+                        else:
+                            log.warning(
+                                f"  Assignees on '{story_name}' differ: {why}. "
+                                f"local={yaml_v} remote={remote_v}"
+                            )
                     _reconcile_assignees_sync(
                         token, story, cu_task, assignee_resolver,
-                        assignee_strategy, story_name, stats,
+                        assignee_strategy, story_name, stats, base_task=story_base,
                     )
 
     # Phase 2.5: relationship-reconcile second pass (dependencies + relations).
@@ -4175,6 +4536,29 @@ def _resolve_conflicts(
                 stats["skipped"] += 1
 
 
+# Printed under any conflict on a field that is not base-tracked.
+#
+# The dangerous failure here is NOT the false conflict -- it is the operator's
+# way out of it. The only route forward is `--on-conflict local`, which is a
+# blunt overwrite, and someone who has seen the same spurious conflict three
+# times will reach for it without checking the remote. One day that lands on a
+# real edit somebody made in the ClickUp UI.
+#
+# A warning telling them to go and check is the thing that gets scrolled past.
+# So the report SHOWS both sides and says exactly what each flag would discard:
+# reading it IS the check they would otherwise do by hand against the API.
+NOT_BASE_TRACKED_NOTE = (
+    "      NOTE: assignees are not base-tracked, so the tool cannot tell which\n"
+    "            side changed. This may be an ordinary local edit rather than a\n"
+    "            collision -- reassigning in the YAML looks exactly like this.\n"
+    "            --on-conflict local  OVERWRITES the remote values above.\n"
+    "            --on-conflict remote OVERWRITES your YAML values above.\n"
+    "            If you did not change the assignees in the ClickUp UI, the\n"
+    "            remote value is just what a previous run wrote, and local is\n"
+    "            safe. If you are not sure, check the task in ClickUp first."
+)
+
+
 def _collect_3way_conflicts(
     data: dict,
     cu_by_id: dict,
@@ -4208,7 +4592,22 @@ def _collect_3way_conflicts(
                         "local": loc.get(field),
                         "remote": rem.get(field),
                     })
-            if _assignees_differ(story, cu_task, assignee_resolver):
+            verdict = _assignees_3way(base_task, story, cu_task, assignee_resolver)
+            if verdict == ASSIGNEES_UNKNOWN and _assignees_differ(
+                story, cu_task, assignee_resolver
+            ):
+                # No trustworthy baseline: surface it rather than guess, and say
+                # so. This is the pre-change-snapshot path and it must never
+                # read as agreement.
+                conflicts.append({
+                    "task": story.get("name", "?"),
+                    "field": "assignees",
+                    "local": story.get("assignees", "(unmanaged)"),
+                    "remote": _cu_assignee_keys(cu_task),
+                    "not_base_tracked": True,
+                })
+            elif verdict == ASSIGNEES_CONFLICT:
+                # Both sides moved, to different values. A genuine collision.
                 conflicts.append({
                     "task": story.get("name", "?"),
                     "field": "assignees",
@@ -4265,14 +4664,43 @@ def _reconcile_assignees_sync(
     conflict: str,
     task_name: str,
     stats: dict,
+    base_task: Optional[dict] = None,
 ) -> None:
-    """Reconcile assignees during ``sync``, honoring the conflict strategy.
+    """Reconcile assignees during ``sync``.
 
     Assignees are a set, not a scalar, so resolution is at the whole-set level
     (one decision per task) rather than per ClickUp user.
+
+    With a trustworthy baseline (``base_task``), a one-sided change is applied
+    in its own direction and never asks: reassigning in the YAML is an ordinary
+    edit, and making the operator pass ``--on-conflict local`` for it was the
+    whole defect — it trained people to reach for a blunt overwrite on a
+    routine operation. The conflict strategy still governs a genuine collision
+    and the no-baseline case.
     """
     if not _assignees_differ(story, cu_task, resolver):
         return
+
+    if base_task is not None:
+        verdict = _assignees_3way(base_task, story, cu_task, resolver)
+        if verdict == ASSIGNEES_LOCAL_ONLY:
+            if _sync_assignees(token, story["clickup_id"], cu_task, story, resolver):
+                log.info(
+                    f"  Assignees on '{task_name}': applied local change "
+                    f"(remote unchanged since last sync)"
+                )
+                stats["resolved_local"] += 1
+            return
+        if verdict == ASSIGNEES_REMOTE_ONLY:
+            if _pull_assignees(story, cu_task):
+                log.info(
+                    f"  Assignees on '{task_name}': pulled remote change "
+                    f"(YAML unchanged since last sync)"
+                )
+                stats["resolved_remote"] += 1
+            return
+        # CONFLICT or UNKNOWN fall through to the strategy below, which is
+        # where the loud warnings and the operator's decision live.
 
     if conflict == "local":
         if _sync_assignees(token, story["clickup_id"], cu_task, story, resolver):
@@ -4693,12 +5121,14 @@ def main() -> None:
     )
     parser.add_argument(
         "command",
-        choices=["push", "pull", "diff", "sync", "merge", "status", "lint", "with-lock"],
+        choices=["push", "pull", "diff", "sync", "merge", "status", "lint",
+                 "with-lock", "pin"],
         help="Command to execute",
     )
     parser.add_argument(
         "yaml_file",
-        help="Path to the YAML project file",
+        nargs="?",
+        help="Path to the YAML project file (not needed for 'pin')",
     )
     parser.add_argument(
         "--dry-run",
@@ -4739,6 +5169,19 @@ def main() -> None:
         action="store_true",
         help="Disable the automatic backup-before-push (ClickUp snapshot) and "
              "backup-before-pull (YAML-file copy).",
+    )
+    parser.add_argument(
+        "--version",
+        action=_VersionAction,
+        help="Print which clickup.py this is (path, commit, clean/modified, "
+             "content hash) and exit, so a run can be accounted for afterwards.",
+    )
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Run a writing command from an uncommitted clickup.py. The run is "
+             "still fully recorded -- its exact content hash is logged and it is "
+             "stamped as a bypass. Marked, not hidden. Prefer 'clickup.py pin'.",
     )
     parser.add_argument(
         "--strict",
@@ -4787,9 +5230,36 @@ def main() -> None:
     if args.sandbox:
         os.environ["CLICKUP_SANDBOX"] = "1"
 
+    if args.command == "pin":
+        sys.exit(cmd_pin())
+
+    if not args.yaml_file:
+        parser.error(f"{args.command} needs a YAML file")
     if not os.path.exists(args.yaml_file):
         log.error(f"YAML file not found: {args.yaml_file}")
         sys.exit(1)
+
+    # Provenance is stated on EVERY run, before anything is touched, so the log
+    # of any run says what produced it.
+    prov = tool_provenance()
+    bypassed = bool(args.allow_dirty and prov.get("dirty")
+                    and args.command in WRITING_COMMANDS)
+    log.info(format_provenance(prov, bypassed=bypassed))
+    if bypassed:
+        # Prominent and separate from the info line: a bypassed run must be
+        # obvious to anyone scanning output, not just present in a log.
+        print(
+            "\n!! --allow-dirty: running UNTESTED, uncommitted code. "
+            f"sha256 {(prov.get('sha256') or '?')[:12]} !!\n",
+            file=sys.stderr, flush=True,
+        )
+    try:
+        assert_attributable(prov, args.command, args.allow_dirty)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr, flush=True)
+        log.error(str(e))
+        sys.exit(PROVENANCE_EXIT_CODE)
+    head_before = prov.get("commit")
 
     if args.command == "with-lock":
         if not rest:
@@ -4826,7 +5296,7 @@ def main() -> None:
         )
 
     def _run() -> int:
-        return _dispatch(args, rest)
+        return _dispatch(args, rest, head_before)
 
     if not needs_lock:
         sys.exit(_run())
@@ -4858,7 +5328,7 @@ def _peek_list_id(yaml_path: str) -> Optional[str]:
         return None
 
 
-def _dispatch(args: argparse.Namespace, rest: list[str]) -> int:
+def _dispatch(args: argparse.Namespace, rest: list[str], head_before: Optional[str] = None) -> int:
     if args.command == "with-lock":
         return cmd_with_lock(rest)
 
@@ -4913,6 +5383,7 @@ def _dispatch(args: argparse.Namespace, rest: list[str]) -> int:
     # Edge failures first: a board missing its declared dependencies is a
     # structural problem, and it must not be buried under a lint report.
     report_edge_failures()
+    warn_if_head_moved(head_before, args.command)
     try:
         print_lint_report(lint_milestone_dates(data))
     except Exception as e:  # pragma: no cover - defensive

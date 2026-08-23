@@ -3834,6 +3834,606 @@ class TestEdgeFailureVisibility:
 
 
 # ---------------------------------------------------------------------------
+# Run provenance
+# ---------------------------------------------------------------------------
+#
+# The hazard is NOT a running process having its code swapped -- Python reads
+# this single file fully at interpreter start and git replaces files by rename.
+# It is that nobody can say which version ran. Witnessed 2026-08-21: an operator
+# prepared a client-board sync against one commit, the tree moved to another
+# while they prepared, and the only reason it was noticed was an unrelated
+# message.
+#
+# Two goals, deliberately kept apart, because conflating them makes the
+# mechanism drift:
+#   - ATTRIBUTION: say exactly what ran. A content hash does this completely,
+#     including for uncommitted code.
+#   - NOT WRITING UNTESTED CODE TO A CLIENT BOARD: the only goal that justifies
+#     a refusal.
+# Which is why the bypass MARKS a run and never blinds one.
+
+
+class TestToolProvenance:
+    def test_a_pinned_copy_outside_git_is_reported_not_refused(self):
+        """The recommended way to run this tool must stay frictionless."""
+        prov = {"path": "/home/x/bin/clickup-abc.py", "sha256": "deadbeef" * 8,
+                "commit": None, "dirty": None, "in_git": False}
+        line = clickup.format_provenance(prov)
+        assert "pinned copy" in line
+        assert "deadbeef" in line
+        clickup.assert_attributable(prov, "sync", allow_dirty=False)  # no raise
+
+    def test_a_clean_checkout_names_its_commit(self):
+        prov = {"path": "/repo/clickup.py", "sha256": "a" * 64,
+                "commit": "b451d96abc", "dirty": False, "in_git": True}
+        assert "b451d96" in clickup.format_provenance(prov)
+        assert "clean" in clickup.format_provenance(prov)
+
+    def test_every_run_can_state_a_content_hash(self):
+        """Attribution does not depend on being committed -- that is what lets
+        the bypass be a mark rather than a hole."""
+        assert clickup.tool_provenance()["sha256"]
+
+
+class TestWritingCommandRefusal:
+    DIRTY = {"path": "/repo/clickup.py", "sha256": "c" * 64,
+             "commit": "b451d96", "dirty": True, "in_git": True}
+
+    def test_a_writing_command_is_refused_on_uncommitted_code(self):
+        with pytest.raises(RuntimeError, match="never been tested"):
+            clickup.assert_attributable(self.DIRTY, "sync", allow_dirty=False)
+
+    def test_every_writing_command_is_covered(self):
+        for cmd in clickup.WRITING_COMMANDS:
+            with pytest.raises(RuntimeError):
+                clickup.assert_attributable(self.DIRTY, cmd, allow_dirty=False)
+
+    def test_read_only_commands_are_never_refused(self):
+        """Reading the world can always be accounted for by re-reading it."""
+        for cmd in ("status", "diff", "lint", "with-lock", "pin"):
+            clickup.assert_attributable(self.DIRTY, cmd, allow_dirty=False)
+
+    def test_the_refusal_names_the_easy_path_first_not_just_the_flag(self):
+        """An error that only says what you did wrong sends people straight to
+        the bypass. A guard with a convenient bypass is decoration."""
+        with pytest.raises(RuntimeError) as e:
+            clickup.assert_attributable(self.DIRTY, "sync", allow_dirty=False)
+        msg = str(e.value)
+        assert "pin" in msg
+        assert msg.index("pin") < msg.index("--allow-dirty"), \
+            "the pinned-copy path must be offered before the bypass"
+
+    def test_the_refusal_states_what_ran(self):
+        with pytest.raises(RuntimeError, match="sha256"):
+            clickup.assert_attributable(self.DIRTY, "sync", allow_dirty=False)
+
+
+class TestBypassMarksRatherThanBlinds:
+    DIRTY = {"path": "/repo/clickup.py", "sha256": "d" * 64,
+             "commit": "b451d96", "dirty": True, "in_git": True}
+
+    def test_allow_dirty_permits_the_run(self):
+        clickup.assert_attributable(self.DIRTY, "sync", allow_dirty=True)
+
+    def test_a_bypassed_run_is_still_fully_attributable(self):
+        """The whole reason the bypass is acceptable: the hash still identifies
+        the exact bytes that ran."""
+        line = clickup.format_provenance(self.DIRTY, bypassed=True)
+        assert "d" * 12 in line
+
+    def test_a_bypassed_run_is_stamped_as_one(self):
+        line = clickup.format_provenance(self.DIRTY, bypassed=True)
+        assert "BYPASS" in line
+        assert "untested" in line
+
+    def test_an_ordinary_run_carries_no_bypass_stamp(self):
+        assert "BYPASS" not in clickup.format_provenance(self.DIRTY, bypassed=False)
+
+
+class TestPinnedCopyPath:
+    def test_named_for_the_commit_it_pins(self):
+        prov = {"commit": "b451d96abcdef", "sha256": "e" * 64, "dirty": False}
+        assert clickup.pinned_copy_path(prov).name == "clickup-b451d96.py"
+
+    def test_a_dirty_pin_is_named_so_it_cannot_be_mistaken_for_a_release(self):
+        prov = {"commit": "b451d96abcdef", "sha256": "e" * 64, "dirty": True}
+        assert "dirty" in clickup.pinned_copy_path(prov).name
+
+    def test_pin_refuses_a_modified_tool(self, monkeypatch, tmp_path):
+        """A pinned copy is meant to be a known, committed version. Pinning a
+        dirty one would launder untested code into something that looks pinned."""
+        monkeypatch.setattr(clickup, "tool_provenance",
+                            lambda: {"commit": "abc", "sha256": "f" * 64,
+                                     "dirty": True, "in_git": True,
+                                     "path": str(tmp_path / "clickup.py")})
+        assert clickup.cmd_pin() == clickup.PROVENANCE_EXIT_CODE
+
+
+class TestHeadMovedDuringRun:
+    def test_a_moved_checkout_is_reported(self, capsys, monkeypatch):
+        """The exact event of 2026-08-21, which previously produced no signal."""
+        monkeypatch.setattr(clickup, "_git_out", lambda *a: "newsha1234567")
+        clickup.warn_if_head_moved("oldsha1234567", "sync")
+        assert "moved during this run" in capsys.readouterr().err
+
+    def test_an_unmoved_checkout_is_silent(self, capsys, monkeypatch):
+        monkeypatch.setattr(clickup, "_git_out", lambda *a: "samesha123456")
+        clickup.warn_if_head_moved("samesha123456", "sync")
+        assert capsys.readouterr().err == ""
+
+    def test_read_only_commands_do_not_report_it(self, capsys, monkeypatch):
+        monkeypatch.setattr(clickup, "_git_out", lambda *a: "newsha1234567")
+        clickup.warn_if_head_moved("oldsha1234567", "status")
+        assert capsys.readouterr().err == ""
+
+    def test_a_pinned_copy_has_no_head_to_compare(self, capsys):
+        clickup.warn_if_head_moved(None, "sync")
+        assert capsys.readouterr().err == ""
+
+
+# ---------------------------------------------------------------------------
+# push now strips a tag dropped from the YAML (it never used to)
+# ---------------------------------------------------------------------------
+#
+# `cmd_sync` unioned the base snapshot's managed_tags; `cmd_push` did not. So a
+# tag removed from `tags:` was stripped by sync and silently left behind by
+# push — for the whole life of the feature, on every board.
+#
+# Both halves were already unit-tested: _collect_managed_tag_universe has tests,
+# load_base_managed_tags has tests. What had no test was the WIRING between
+# them, which is exactly how the two call sites diverged. These tests cover the
+# join, and the two commands now share one function so a future fix cannot land
+# in only one of them.
+
+
+class TestManagedTagUniverseForRun:
+    def _data(self, tags: list[str]) -> dict:
+        return {
+            "project": {"name": "p", "clickup_list_id": "L1"},
+            "status_map": {},
+            "epics": [_epic_with("Delivery", [_story_with("card", tags=tags, clickup_id="T1")])],
+        }
+
+    def test_includes_what_the_yaml_declares_now(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        universe = clickup.managed_tag_universe_for(self._data(["alpha"]), str(f), "L1")
+        assert "alpha" in universe
+
+    def test_includes_what_was_managed_at_the_last_snapshot(self, tmp_path):
+        """The half that was missing from push. A tag dropped from the YAML is
+        no longer in the current universe, so without this it looks like an
+        untouched UI tag and is preserved forever — the reconcile can only
+        remove what it knows it owns."""
+        f = tmp_path / "project-tasks.yaml"
+        clickup.save_base_snapshot(
+            clickup.base_snapshot_path(str(f), "L1"), self._data(["dropped-later"]), {}
+        )
+        universe = clickup.managed_tag_universe_for(self._data(["kept"]), str(f), "L1")
+        assert "kept" in universe
+        assert "dropped-later" in universe, \
+            "a tag dropped since the last run must stay managed so it can be removed"
+
+    def test_a_ui_added_tag_is_never_in_the_universe(self, tmp_path):
+        """The guarantee this must not break: tags a human added in the ClickUp
+        UI are preserved, because they were never ours."""
+        f = tmp_path / "project-tasks.yaml"
+        universe = clickup.managed_tag_universe_for(self._data(["alpha"]), str(f), "L1")
+        assert "someones-ui-tag" not in universe
+
+    def test_no_snapshot_yet_is_not_an_error(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        assert "alpha" in clickup.managed_tag_universe_for(self._data(["alpha"]), str(f), "L1")
+
+
+class TestPushAndSyncShareOneUniverse:
+    def test_both_commands_call_the_same_function(self):
+        """The bug was two call sites where only one had the union. Pinning that
+        they now share one function is the thing that stops it recurring —
+        checking the outputs match would pass again the moment someone
+        reintroduces a second, subtly different call site."""
+        import inspect
+        push_src = inspect.getsource(clickup.cmd_push)
+        sync_src = inspect.getsource(clickup.cmd_sync)
+        assert "managed_tag_universe_for(" in push_src
+        assert "managed_tag_universe_for(" in sync_src
+        assert "_collect_managed_tag_universe(" not in push_src, \
+            "push must not compute the universe itself — that is how it drifted"
+        assert "_collect_managed_tag_universe(" not in sync_src
+        assert "load_base_managed_tags(" not in sync_src, \
+            "sync must not union the base itself either — one function, one place"
+
+
+# ---------------------------------------------------------------------------
+# Assignee conflicts: say they are not base-tracked, and show what is discarded
+# ---------------------------------------------------------------------------
+#
+# Issue #42. The reported cause was "the base snapshot records assignees as
+# None on create" — it does not: the key is ABSENT, because comparable_local()
+# returns seven scalar keys and assignees is not one of them. The real cause is
+# that assignees sit outside the 3-way model entirely, so _collect_3way_conflicts
+# reports ANY divergence as a conflict. That makes it broader than reported:
+# every deliberate reassignment made in the YAML is a conflict, which is the
+# exact operation someone runs `sync` to perform.
+#
+# This is the INTERIM. It does not fix the false conflict — it defuses the
+# thing that is actually dangerous, which is the operator's way out of it.
+# `--on-conflict local` is a blunt overwrite, and someone who has seen the same
+# spurious conflict three times reaches for it without checking the remote. One
+# day that lands on a real edit made in the ClickUp UI.
+
+
+# One id map shared by the fake roster and the fake ClickUp tasks. Getting these
+# out of step silently inverts every assertion — the divergent case reads as
+# agreement and vice versa — so they are derived from one source on purpose.
+_USER_IDS = {"wframe@brecslc.com": 101, "maurice@spark6.com": 102}
+_RESOLVER = dict(_USER_IDS)
+
+
+def _assignee_story(assignees=None, name="Confirm RealSynergy access", **extra):
+    s = _story_with(name, clickup_id="T1", **extra)
+    if assignees is not None:
+        s["assignees"] = assignees
+    return s
+
+
+def _cu_with_assignees(*emails, name="Confirm RealSynergy access"):
+    return {
+        "id": "T1", "name": name,
+        "status": {"status": "backlog"}, "description": "", "tags": [],
+        "priority": None, "due_date": None, "start_date": None,
+        "custom_fields": [], "date_updated": "1", "url": "u",
+        "assignees": [{"id": _USER_IDS[e], "email": e, "username": e.split("@")[0]}
+                      for e in emails],
+    }
+
+
+class TestBaseSnapshotAssigneeKey:
+    """These pinned the corrected diagnosis of #42 while the bug was open: the
+    base recorded NO assignee key (the report said "records assignees as None",
+    which would have implied a create-time defect rather than assignees being
+    outside the model entirely).
+
+    That behaviour is now deliberately changed — assignees are base-tracked —
+    so the assertions are inverted here rather than deleted. The distinction
+    they were written to protect still matters and is kept: a MISSING key is
+    what an old snapshot and an unmanaged story both look like, and both must
+    read as UNKNOWN rather than as agreement.
+    """
+
+    def test_a_managed_story_now_records_its_assignees(self):
+        data = _lint_data(_epic_with("E", [_assignee_story(["maurice@spark6.com"])]))
+        record = clickup.build_base_from_yaml(data, {})["T1"]
+        assert record["assignees"] == ["maurice@spark6.com"]
+
+    def test_the_scalar_field_set_is_unchanged(self):
+        """The seven scalars are untouched; assignees rides alongside them and
+        is classified separately, never by the scalar comparer."""
+        data = _lint_data(_epic_with("E", [_assignee_story(["maurice@spark6.com"])]))
+        record = clickup.build_base_from_yaml(data, {})["T1"]
+        assert set(record) - {"assignees"} == {
+            "name", "status", "description", "priority",
+            "milestone", "due_date", "start_date",
+        }
+
+
+class TestAssigneeConflictIsFlagged:
+    def _conflicts(self, story, cu):
+        return clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])),
+            {"T1": cu},
+            {"T1": clickup.comparable_local(story, {})},   # base agrees on scalars
+            {},
+            _RESOLVER,
+        )
+
+    def test_the_fixture_ids_line_up(self):
+        """Guard on the fixtures themselves: if the fake roster and the fake
+        ClickUp task disagree on ids, every assertion in this class silently
+        inverts and still 'passes' something."""
+        cu = _cu_with_assignees("maurice@spark6.com")
+        assert clickup._cu_assignee_ids(cu) == {_RESOLVER["maurice@spark6.com"]}
+
+    def test_a_diverging_assignee_set_is_marked_not_base_tracked(self):
+        c = self._conflicts(_assignee_story(["wframe@brecslc.com"]),
+                            _cu_with_assignees("maurice@spark6.com"))
+        assert len(c) == 1
+        assert c[0]["field"] == "assignees"
+        assert c[0]["not_base_tracked"] is True
+
+    def test_it_still_carries_both_sides(self):
+        """Showing the two sets IS the check the operator would otherwise do by
+        hand against the API."""
+        c = self._conflicts(_assignee_story(["wframe@brecslc.com"]),
+                            _cu_with_assignees("maurice@spark6.com"))
+        assert c[0]["local"] == ["wframe@brecslc.com"]
+        assert "maurice@spark6.com" in c[0]["remote"]
+
+    def test_agreeing_assignees_are_not_a_conflict(self):
+        assert self._conflicts(_assignee_story(["maurice@spark6.com"]),
+                               _cu_with_assignees("maurice@spark6.com")) == []
+
+    def test_a_scalar_conflict_is_not_marked_not_base_tracked(self):
+        """Only the untracked fields get the note. Marking everything would
+        make it noise and it would stop being read."""
+        story = _assignee_story(["maurice@spark6.com"], name="Local name")
+        cu = _cu_with_assignees("maurice@spark6.com", name="Remote name")
+        c = clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])), {"T1": cu},
+            {"T1": {"name": "Base name"}}, {}, _RESOLVER,
+        )
+        names = [x for x in c if x["field"] == "name"]
+        assert names and not names[0].get("not_base_tracked")
+
+
+class TestNotBaseTrackedNote:
+    def test_it_says_this_may_not_be_a_collision(self):
+        note = clickup.NOT_BASE_TRACKED_NOTE
+        assert "not base-tracked" in note
+        assert "may be an ordinary local edit" in note
+
+    def test_it_names_what_each_flag_destroys(self):
+        """A warning that says 'be careful' gets scrolled past. One that says
+        which values each flag discards is the check itself."""
+        note = clickup.NOT_BASE_TRACKED_NOTE
+        assert "--on-conflict local  OVERWRITES the remote" in note
+        assert "--on-conflict remote OVERWRITES your YAML" in note
+
+    def test_it_tells_the_operator_how_to_decide(self):
+        assert "did not change the assignees in the ClickUp UI" in clickup.NOT_BASE_TRACKED_NOTE
+        assert "check the task in ClickUp first" in clickup.NOT_BASE_TRACKED_NOTE
+
+
+# ---------------------------------------------------------------------------
+# CHARACTERISATION: assignee behaviour BEFORE base-tracking (#42)
+# ---------------------------------------------------------------------------
+#
+# Written before anything moved, per the refactor condition. These pin what the
+# tool does today so the diff proves what changed rather than what was hoped.
+#
+# Several of these assert BEHAVIOUR THAT IS WRONG. That is the point: they are
+# a baseline, not an endorsement. The ones that describe the bug are named for
+# it and are replaced in the same commit that fixes it.
+
+
+class TestCharacterisationAssigneesToday:
+    def test_base_now_records_assignees(self):
+        """WAS the defect: nothing about assignees reached the snapshot, so the
+        3-way merge had no prior state to reason from. Now recorded."""
+        data = _lint_data(_epic_with("E", [_assignee_story(["wframe@brecslc.com"])]))
+        assert clickup.build_base_from_yaml(data, {})["T1"]["assignees"] == [
+            "wframe@brecslc.com"]
+
+    def test_assignees_are_not_in_the_synced_scalar_fields(self):
+        """Which is why three_way_plan() never classifies them — it iterates
+        SYNCED_FIELDS. Pinned because base-tracking must NOT change this: a set
+        compared as a scalar string is its own bug."""
+        assert "assignees" not in clickup.SYNCED_FIELDS
+
+    def test_a_divergence_with_no_baseline_is_still_reported(self):
+        """WAS the defect for every divergence; now only when the baseline is
+        untrustworthy. The base here is a pre-change snapshot (scalars only),
+        which must fail LOUD rather than read as agreement."""
+        story = _assignee_story(["wframe@brecslc.com"])
+        conflicts = clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])),
+            {"T1": _cu_with_assignees("maurice@spark6.com")},
+            {"T1": clickup.comparable_local(story, {})},   # no assignees key
+            {}, _RESOLVER,
+        )
+        assert [c["field"] for c in conflicts] == ["assignees"]
+        assert conflicts[0]["not_base_tracked"] is True
+
+    def test_matching_assignees_produce_no_conflict(self):
+        """CORRECT TODAY and must stay correct."""
+        story = _assignee_story(["maurice@spark6.com"])
+        assert clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])),
+            {"T1": _cu_with_assignees("maurice@spark6.com")},
+            {"T1": clickup.comparable_local(story, {})},
+            {}, _RESOLVER,
+        ) == []
+
+    def test_an_unmanaged_story_differs_only_if_clickup_has_assignees(self):
+        """CORRECT TODAY and must stay correct: a story with no `assignees` key
+        is UNMANAGED — ClickUp is left alone, and the divergence only exists so
+        `sync ask` can offer to capture remote assignees into the YAML."""
+        unmanaged = _assignee_story(None)
+        assert clickup._assignees_differ(unmanaged, _cu_with_assignees(), _RESOLVER) is False
+        assert clickup._assignees_differ(
+            unmanaged, _cu_with_assignees("maurice@spark6.com"), _RESOLVER) is True
+
+    def test_comparison_happens_in_id_space_not_string_space(self):
+        """CORRECT TODAY and the property base-tracking must preserve. YAML
+        strings are resolved through the workspace roster to ClickUp user ids
+        before comparison, because a YAML email and a ClickUp key need not be
+        the same string. Comparing strings to remote keys would trade a false
+        conflict for a false AGREEMENT, which is silent."""
+        story = {"assignees": ["MAURICE@spark6.com  "]}   # case and whitespace
+        cu = _cu_with_assignees("maurice@spark6.com")
+        assert clickup._assignees_differ(story, cu, _RESOLVER) is False
+
+    def test_an_unresolvable_assignee_is_reported_not_silently_dropped(self):
+        ids, unresolved = clickup._resolve_assignee_ids(["nobody@nowhere.com"], _RESOLVER)
+        assert ids == []
+        assert unresolved == ["nobody@nowhere.com"]
+
+
+# ---------------------------------------------------------------------------
+# Assignees are base-tracked: the 3-way itself (#42)
+# ---------------------------------------------------------------------------
+#
+# Comparison happens in ID SPACE. Base and local are resolved through the
+# CURRENT workspace roster; remote comes from the task. Comparing YAML strings
+# against ClickUp keys would be a false-agreement generator, and a false
+# agreement is a silent overwrite of somebody's edit — which is why option A
+# (store raw YAML strings and compare them to the remote) was refused outright.
+
+
+def _base_with(*assignees):
+    return {"assignees": sorted(a.lower() for a in assignees)}
+
+
+class TestAssignees3Way:
+    def _verdict(self, base, local, remote):
+        story = {"assignees": list(local)} if local is not None else {}
+        return clickup._assignees_3way(base, story, _cu_with_assignees(*remote), _RESOLVER)
+
+    def test_local_only_change_is_applied_not_conflicted(self):
+        """The BREC case: created on a placeholder owner, reassigned in the
+        YAML an hour later, remote untouched. This is the whole bug."""
+        assert self._verdict(_base_with("maurice@spark6.com"),
+                             ["wframe@brecslc.com"],
+                             ["maurice@spark6.com"]) == clickup.ASSIGNEES_LOCAL_ONLY
+
+    def test_remote_only_change_is_pulled(self):
+        assert self._verdict(_base_with("maurice@spark6.com"),
+                             ["maurice@spark6.com"],
+                             ["wframe@brecslc.com"]) == clickup.ASSIGNEES_REMOTE_ONLY
+
+    def test_both_sides_changed_is_a_genuine_conflict(self):
+        assert self._verdict(_base_with(),
+                             ["wframe@brecslc.com"],
+                             ["maurice@spark6.com"]) == clickup.ASSIGNEES_CONFLICT
+
+    def test_agreement_is_agreement(self):
+        assert self._verdict(_base_with("maurice@spark6.com"),
+                             ["maurice@spark6.com"],
+                             ["maurice@spark6.com"]) == clickup.ASSIGNEES_AGREE
+
+    def test_order_and_case_do_not_matter(self):
+        """A set compared as a scalar string would call these different."""
+        assert self._verdict(_base_with("maurice@spark6.com", "wframe@brecslc.com"),
+                             ["WFRAME@brecslc.com", " maurice@spark6.com "],
+                             ["maurice@spark6.com", "wframe@brecslc.com"]
+                             ) == clickup.ASSIGNEES_AGREE
+
+    def test_clearing_assignees_locally_is_a_local_change_not_a_conflict(self):
+        """`assignees: []` is MANAGED-AND-EMPTY, which is a real instruction."""
+        assert self._verdict(_base_with("maurice@spark6.com"), [],
+                             ["maurice@spark6.com"]) == clickup.ASSIGNEES_LOCAL_ONLY
+
+
+class TestAssignees3WayFailsLoud:
+    """UNKNOWN is its own answer and must never collapse into AGREE.
+
+    Every one of these would otherwise be a silent overwrite of a client's edit
+    on a live board. This is the condition the whole change was gated on.
+    """
+
+    def _verdict(self, base, local, remote):
+        story = {"assignees": list(local)} if local is not None else {}
+        return clickup._assignees_3way(base, story, _cu_with_assignees(*remote), _RESOLVER)
+
+    def test_a_snapshot_written_before_this_change_is_unknown(self):
+        """The migration case. Every existing board's snapshot looks like this
+        on the first run after upgrading, and it must NOT read as agreement."""
+        pre_change_base = {"name": "x", "status": "backlog"}
+        assert self._verdict(pre_change_base, ["wframe@brecslc.com"],
+                             ["maurice@spark6.com"]) == clickup.ASSIGNEES_UNKNOWN
+
+    def test_an_unmanaged_story_is_unknown(self):
+        assert clickup._assignees_3way(
+            _base_with("maurice@spark6.com"), {},
+            _cu_with_assignees("maurice@spark6.com"), _RESOLVER
+        ) == clickup.ASSIGNEES_UNKNOWN
+
+    def test_an_unresolvable_baseline_name_is_unknown(self):
+        """Someone left the workspace.
+
+        **Silently dropping them would shrink the base set, which can make a
+        genuine both-sides collision look one-sided** — and a one-sided verdict
+        is applied without asking. That is the refused design (a silent false
+        agreement) arriving through a different door, so it is closed here
+        rather than left to be noticed later.
+
+        This is also why the base stores YAML strings rather than resolved ids:
+        an unresolvable name is visible, whereas a bare id that no longer
+        belongs to anyone compares perfectly well against a ghost."""
+        assert self._verdict({"assignees": ["gone@nowhere.com"]},
+                             ["wframe@brecslc.com"],
+                             ["maurice@spark6.com"]) == clickup.ASSIGNEES_UNKNOWN
+
+    def test_an_unresolvable_local_name_is_unknown(self):
+        assert clickup._assignees_3way(
+            _base_with("maurice@spark6.com"),
+            {"assignees": ["gone@nowhere.com"]},
+            _cu_with_assignees("maurice@spark6.com"), _RESOLVER
+        ) == clickup.ASSIGNEES_UNKNOWN
+
+    def test_unknown_still_stops_the_run_when_the_sides_differ(self):
+        story = _assignee_story(["wframe@brecslc.com"])
+        conflicts = clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])),
+            {"T1": _cu_with_assignees("maurice@spark6.com")},
+            {"T1": {"name": "x"}}, {}, _RESOLVER,
+        )
+        assert conflicts and conflicts[0]["not_base_tracked"] is True
+
+
+class TestAssigneeConflictReporting:
+    def _conflicts(self, base, local, remote):
+        story = _assignee_story(list(local))
+        return clickup._collect_3way_conflicts(
+            _lint_data(_epic_with("E", [story])),
+            {"T1": _cu_with_assignees(*remote)},
+            {"T1": {**clickup.comparable_local(story, {}), **base}},
+            {}, _RESOLVER,
+        )
+
+    def test_a_local_only_change_no_longer_stops_the_run(self):
+        """The headline fix. Reassigning in the YAML is an ordinary edit."""
+        assert self._conflicts(_base_with("maurice@spark6.com"),
+                               ["wframe@brecslc.com"],
+                               ["maurice@spark6.com"]) == []
+
+    def test_a_remote_only_change_no_longer_stops_the_run(self):
+        assert self._conflicts(_base_with("maurice@spark6.com"),
+                               ["maurice@spark6.com"],
+                               ["wframe@brecslc.com"]) == []
+
+    def test_a_genuine_conflict_still_stops_the_run(self):
+        c = self._conflicts(_base_with(), ["wframe@brecslc.com"], ["maurice@spark6.com"])
+        assert [x["field"] for x in c] == ["assignees"]
+
+    def test_a_genuine_conflict_is_not_labelled_not_base_tracked(self):
+        """It IS base-tracked now, and both sides really did move. Calling it
+        'may be a local-only edit' would be the opposite lie from before."""
+        c = self._conflicts(_base_with(), ["wframe@brecslc.com"], ["maurice@spark6.com"])
+        assert not c[0].get("not_base_tracked")
+
+
+class TestBaseSnapshotAssigneeRecord:
+    def test_recorded_normalised_and_sorted(self):
+        data = _lint_data(_epic_with("E", [
+            _assignee_story(["  MAURICE@spark6.com ", "wframe@brecslc.com"])]))
+        assert clickup.build_base_from_yaml(data, {})["T1"]["assignees"] == [
+            "maurice@spark6.com", "wframe@brecslc.com"]
+
+    def test_an_unmanaged_story_records_no_key(self):
+        """None and [] are different: no key is UNMANAGED (ClickUp untouched),
+        [] is MANAGED-AND-EMPTY (clear them). Collapsing them would silently
+        start managing assignees on stories that never asked."""
+        data = _lint_data(_epic_with("E", [_assignee_story(None)]))
+        assert "assignees" not in clickup.build_base_from_yaml(data, {})["T1"]
+
+    def test_a_managed_empty_story_records_an_empty_list(self):
+        data = _lint_data(_epic_with("E", [_assignee_story([])]))
+        assert clickup.build_base_from_yaml(data, {})["T1"]["assignees"] == []
+
+    def test_assignees_stay_out_of_the_scalar_field_set(self):
+        """three_way_plan() iterates SYNCED_FIELDS. A set compared as a scalar
+        string is its own bug, so this must never be added there."""
+        assert "assignees" not in clickup.SYNCED_FIELDS
+
+    def test_the_snapshot_round_trips_through_disk(self, tmp_path):
+        f = tmp_path / "project-tasks.yaml"
+        data = _lint_data(_epic_with("E", [_assignee_story(["maurice@spark6.com"])]))
+        clickup.save_base_snapshot(clickup.base_snapshot_path(str(f), "L1"), data, {})
+        loaded = clickup.load_base_snapshot(clickup.base_snapshot_path(str(f), "L1"))
+        assert loaded["T1"]["assignees"] == ["maurice@spark6.com"]
+
+
+# ---------------------------------------------------------------------------
 # depends_on / related may reference stories by NAME
 # ---------------------------------------------------------------------------
 #

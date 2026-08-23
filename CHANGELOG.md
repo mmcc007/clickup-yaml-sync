@@ -35,6 +35,121 @@
 
 ### Fixed
 
+- **Assignees are base-tracked, so reassigning in the YAML is no longer a
+  conflict** (#42).
+
+  Assignees sat outside the 3-way model, so `sync` reported *any* YAML-vs-remote
+  divergence as a conflict — including the ordinary case of changing an owner in
+  the task file, which is the operation `sync` exists to perform. The only way
+  past it was `--on-conflict local`, a blunt overwrite, and being trained to
+  reach for that on a routine edit is how a real UI change eventually gets
+  destroyed.
+
+  A one-sided change now applies in its own direction and never asks. Only a
+  genuine both-sides change is a conflict.
+
+  - **Comparison happens in id space, never string space.** Base and local are
+    resolved through the *current* workspace roster; remote comes from the task.
+    Storing raw YAML strings and comparing them against ClickUp keys was
+    considered and **refused**: it would trade a loud false conflict for a
+    silent false agreement, which is an unnoticed overwrite of someone's edit.
+  - **The base stores the YAML strings and resolves at compare time**, rather
+    than storing resolved ids, because an unresolvable baseline entry is then
+    **detectable**: a name that no longer resolves returns UNKNOWN and stops the
+    run, where a bare user id would compare cleanly against a ghost and proceed
+    silently. Same loud-beats-silent asymmetry as above. It also lets the base
+    be written from code paths that have no roster or token.
+  - **An untrustworthy baseline reads as UNKNOWN, never as agreement**, and
+    keeps the previous surface-it-loudly behaviour. That covers a snapshot
+    written before this change (every existing board, on its first run after
+    upgrading), a story that does not manage assignees, and a baseline naming
+    someone who has since left the workspace.
+  - `assignees` is deliberately **not** added to `SYNCED_FIELDS`: it is a set,
+    and letting the scalar comparer treat it as a string would be its own bug.
+
+- **An assignee conflict now says it may not be a conflict, and names what each
+  flag would destroy** (#42, interim).
+
+  Assignees sit outside the 3-way model — `comparable_local()` returns seven
+  scalar keys and assignees is not one of them, so the base snapshot has no
+  assignee record at all (the key is **absent**, not null). `sync` therefore
+  reports *any* YAML-vs-remote divergence as a conflict. That makes it broader
+  than a create-time defect: **every deliberate reassignment made in the YAML is
+  a conflict**, which is the exact operation someone runs `sync` to perform.
+  Creates just guarantee you meet it in week one.
+
+  **The danger is the way out, not the false alarm.** The only route forward is
+  `--on-conflict local`, a blunt overwrite. Someone who has seen the same
+  spurious conflict three times reaches for it without checking the remote, and
+  one day that lands on a real edit made in the ClickUp UI. So:
+  - the abort report says how many conflicts are on non-base-tracked fields and
+    that those may be local-only edits — they are no longer called "true
+    conflicts", because some of them are not;
+  - each carries a note stating that the tool cannot tell which side moved, that
+    `--on-conflict local` overwrites the remote values shown and
+    `--on-conflict remote` overwrites the YAML values shown, and how to decide;
+  - at the moment of overwrite the log names the values being **discarded**, so
+    an operator who skipped the report still sees what the run threw away.
+
+  This does not fix the false conflict. Base-tracking assignees properly is a
+  separate change, deliberately kept separate so the safe fix is not held up by
+  the correct one.
+
+- **`push` now strips a tag dropped from the YAML. It never used to.**
+  `cmd_sync` unioned the base snapshot's `managed_tags` into its managed-tag
+  universe; `cmd_push` did not. A tag removed from `tags:` (or a removed
+  `milestone_label`) was therefore stripped by `sync` and **silently left behind
+  by `push`** — for the whole life of the feature, on every board. The reconcile
+  can only remove what it knows it owns, and a tag no longer in the YAML looked
+  to `push` like an untouched UI tag.
+
+  Both halves were already unit-tested — `_collect_managed_tag_universe` and
+  `load_base_managed_tags` each had coverage. What had no test was the **wiring**
+  between them, which is exactly how two call sites diverged with a fix in only
+  one. They now share a single `managed_tag_universe_for()`, and a test asserts
+  neither command computes the universe itself, so the next fix cannot land in
+  only one of them.
+
+  Unchanged: a tag a human added in the ClickUp UI is still never in the managed
+  universe and is still preserved.
+
+### Added
+
+- **Run provenance: every run states which code produced it.** The line
+  (path, commit, clean/modified, content hash) is logged before anything is
+  touched, and `--version` prints the same.
+
+  The hazard is **unattributable runs**, not torn reads: Python loads this
+  single file fully at interpreter start and git replaces files by rename, so a
+  running process cannot have its code swapped. On 2026-08-21 an operator
+  prepared a client-board sync against one commit, the tree moved to another
+  while they prepared, and the only reason it was noticed was an unrelated
+  message. Every corpus board is invoked from a live development checkout.
+
+- **`clickup.py pin`** — writes an immutable copy to `~/bin/clickup-<commit>.py`
+  and prints how to use it. The recommended way to run a board: it cannot change
+  under you when someone merges, and it reports its own hash. One argument-free
+  command, deliberately easier than the bypass below — a guard with a convenient
+  bypass becomes decoration.
+
+- **A writing command (`push`/`pull`/`sync`/`merge`) refuses to run from a
+  modified `clickup.py`.** Attribution is already solved by the content hash;
+  what the refusal buys is separate and is the only thing that justifies a stop:
+  **untested code does not write to a client's board.** `status`, `diff`,
+  `lint`, `with-lock` and `pin` are never refused.
+  - `--allow-dirty` bypasses it. **The bypass marks a run; it never blinds one**
+    — the exact content hash is still logged and the run is stamped as a bypass
+    of untested code, on stderr and in the log.
+  - **Behaviour change for anyone running from a checkout they edit:** a local
+    modification to `clickup.py` now stops the next writing command until you
+    pin, commit, or pass the flag.
+
+- **A checkout that moves during a writing run is reported on the way out**,
+  naming the commit that actually ran. That is the 2026-08-21 event, which
+  previously produced no signal at all.
+
+### Fixed
+
 - **A failed dependency or linked-task edge is no longer easy to miss.** Two
   separate problems, both of which made a board silently end up without the
   structure its YAML declares:
