@@ -561,19 +561,42 @@ the ClickUp UI, the next `pull`/`sync` reflects it in YAML. Under `sync`, the
 
 ## Dependencies (waiting_on edges)
 
-Each story can declare a `depends_on` list — the ClickUp ids of tasks it
-**waits on** (a "waiting on" dependency). Targets are referenced by the same id
-stored in another story's `clickup_id`:
+Each story can declare a `depends_on` list — the tasks it **waits on** (a
+"waiting on" dependency). Targets may be referenced **by story name** or by raw
+`clickup_id`:
 
 ```yaml
 stories:
   - name: Ingestion adapter
-    clickup_id: 860000002
-    points: 3
-    status: backlog
     depends_on:
-      - 860000003   # waits on the design-doc sign-off
+      - Design doc sign-off      # a story in this file, by name — preferred
+      - 860000003                # a raw id, for a target outside this YAML
 ```
+
+**Prefer names.** An id does not exist until the run that creates it, so on a
+brand-new board an id reference cannot be written at all — which used to force
+two passes: one to create the tasks, a second to add the edges once the ids
+existed. A name reference links two brand-new tasks on the **first** sync,
+because the reconcile pass runs after creates. This is the same reasoning
+`parent` has always used (see [Parent / child](#parent--child-subtasks)); it now
+applies to all three reference fields.
+
+Resolution is identical to `parent`'s: an explicit `clickup_id` in this file
+wins, then a story name (case-insensitive, trimmed), then a bare token is
+treated as a literal id for a target outside the file.
+
+**It refuses rather than guesses**, and never applies part of an edge set:
+
+| situation | behaviour |
+|---|---|
+| two stories share the name | error naming the count — reference it by `clickup_id` |
+| a name matching no story | error — a value with whitespace was meant as a name, and pushing it as an id returns an opaque 400 instead of naming your typo |
+| a name resolving to the story itself | skipped with a warning (a no-op, not a hole in the graph) |
+| a name pending create, under `--dry-run` | reported as resolving after create |
+| a name pending create, in a real run | error — the reconcile pass runs after creates, so this should be impossible |
+
+The first two abort **the whole edge set for that story** and count as an error.
+A half-applied dependency graph is worse than none, because it looks complete.
 
 Only the **waiting_on** direction is modeled; ClickUp maintains the mirrored
 "blocking" edge on the other task automatically. Semantics mirror assignees:
@@ -585,9 +608,9 @@ Only the **waiting_on** direction is modeled; ClickUp maintains the mirrored
 | `depends_on: [id, …]` | **Authoritative** — ClickUp reconciled to exactly this set |
 
 Edges are reconciled in a **second pass**, after the create/update pass, so a
-task created in the same run already has its `clickup_id` and can be referenced.
-A target that doesn't exist yet (no `clickup_id`) can't be referenced — declare
-the edge once both tasks exist and it resolves on the next run. `pull` reads
+task created in the same run already has its `clickup_id` and can be referenced
+— which is why a **name** reference works on a first sync where an id could not.
+`pull` reads
 remote waiting_on edges back into `depends_on`; `diff` shows mismatches. Requires
 the **Dependencies ClickApp** enabled on the Space.
 
@@ -608,15 +631,23 @@ the footgun note under Relations).
 Each story can also declare a `related` list — ClickUp's non-blocking
 "linked tasks" (the relate/link feature, `POST /task/{id}/link/{links_to}`).
 Unlike `depends_on`, a link implies **no ordering or blocking** — it's a plain
-association. Targets are referenced by `clickup_id`, exactly like `depends_on`:
+association. Targets are referenced **by story name or `clickup_id`**, exactly
+like `depends_on` — same resolution rules, same refusals:
 
 ```yaml
 stories:
   - name: Ingestion adapter
-    clickup_id: 860000002
     related:
-      - 860000004   # see-also: a related spike
+      - Retrieval spike     # by name
+      - 860000004           # or a raw id, for a target outside this YAML
 ```
+
+> **Names make the symmetry footgun easier to reach.** A link is non-directional
+> and ClickUp records it on both endpoints, so declaring it on *both* stories is
+> redundant — and the union semantics below exist because two managed stories
+> disagreeing about a mutual link used to make it oscillate every sync. Writing
+> both sides by hand is now easier than it was, so it is worth restating:
+> **declare a link on one endpoint.** The other end still round-trips.
 
 A link is **non-directional** — ClickUp records it on both endpoints — so the
 reader collapses each link to "the other end," and the relation round-trips

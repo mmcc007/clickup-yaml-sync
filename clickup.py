@@ -2203,29 +2203,117 @@ def _cu_waiting_on_ids(cu_task: dict) -> set[str]:
     return out
 
 
-def _resolve_dependency_ids(
-    raw: Optional[list], self_id: Optional[str]
-) -> tuple[list[str], list[str]]:
-    """Normalize a YAML ``depends_on`` list to ``(desired_ids, unresolved)``.
+class EdgeRefUnresolved(ValueError):
+    """A ``depends_on``/``related`` reference that cannot be resolved.
 
-    Drops blanks, dedups (order-preserving), and refuses a self-dependency.
-    Rejected entries come back as ``unresolved`` so the caller can warn.
+    Raised, never guessed at, and never partially applied: the caller aborts the
+    whole edge set for that story. A half-applied dependency graph is worse than
+    none, because it looks complete.
+    """
+
+
+class EdgeRefPendingCreate(EdgeRefUnresolved):
+    """Names a story this run will create, which therefore has no id yet.
+
+    Expected under ``--dry-run`` on a fresh board (nothing has been created, so
+    nothing has an id). In a real run it should be impossible -- the reconcile
+    pass runs AFTER creates -- so there it is a genuine error.
+    """
+
+
+def _resolve_edge_ref(ref: str, ctx: dict, field: str) -> str:
+    """Resolve one ``depends_on``/``related`` entry to a ClickUp task id.
+
+    Precedence is deliberately identical to ``parent``: an explicit
+    ``clickup_id`` of a story in this file, then a story NAME, then a bare token
+    treated as a literal id (a target outside this YAML).
+
+    Names matter because **an id does not exist until the run that creates it**.
+    The reconcile pass runs after creates, so a name reference links two
+    brand-new tasks on the FIRST sync where an id reference could not -- which
+    is the common case for any new board, and previously forced a second pass.
+    """
+    if ref in ctx.get("ids", ()):
+        return ref
+
+    candidates = ctx.get("names", {}).get(ref.lower(), [])
+    if len(candidates) > 1:
+        raise EdgeRefUnresolved(
+            f"{field}: '{ref}' is ambiguous — {len(candidates)} stories share "
+            f"that name; reference it by clickup_id instead"
+        )
+    if candidates:
+        cid = candidates[0].get("clickup_id")
+        if not cid:
+            raise EdgeRefPendingCreate(
+                f"{field}: story '{ref}' has no clickup_id yet"
+            )
+        return str(cid)
+
+    if not ref or any(c.isspace() for c in ref):
+        # Whitespace means it was meant as a name. Refusing beats pushing it to
+        # ClickUp as an id and getting an opaque 400 back.
+        raise EdgeRefUnresolved(
+            f"{field}: '{ref}' — no story named that in this YAML"
+        )
+    # No name match, no whitespace: a literal id outside this file. Push it as
+    # given; ClickUp rejects a bad id loudly.
+    return ref
+
+
+def _resolve_dependency_ids(
+    raw: Optional[list],
+    self_id: Optional[str],
+    ctx: Optional[dict] = None,
+    field: str = "depends_on",
+) -> tuple[list[str], list[str], list[str]]:
+    """Normalize a ``depends_on``/``related`` list to
+    ``(desired_ids, skipped, pending)``.
+
+    Drops blanks, dedups (order-preserving), and refuses a self-edge. With
+    ``ctx`` (from ``_build_parent_context``) entries may also be story NAMES.
+
+    Three outcomes, deliberately distinct:
+
+    - ``desired``  -- resolved ids, ready to apply.
+    - ``skipped``  -- a self-edge or a blank. Harmless and warned about; NOT a
+      reason to abandon the story's other edges, because dropping a self-link
+      is a no-op rather than a hole in the graph.
+    - ``pending``  -- names a story this run will create. Expected under
+      dry-run; the caller decides.
+
+    An ambiguous or unknown NAME raises :class:`EdgeRefUnresolved` instead, so
+    the caller abandons the whole edge set rather than applying part of it.
+
+    The self-check runs AFTER resolution, so ``depends_on: [My Own Name]`` is
+    caught too -- resolving it first and checking the raw string would have let
+    a story depend on itself by name.
     """
     desired: list[str] = []
-    unresolved: list[str] = []
+    skipped: list[str] = []
+    pending: list[str] = []
     seen: set[str] = set()
+    self_id = str(self_id) if self_id else None
     for entry in raw or []:
         s = str(entry).strip()
         if not s:
             continue
-        if s == self_id:
-            unresolved.append(s)
+        if ctx:
+            try:
+                resolved = _resolve_edge_ref(s, ctx, field)
+            except EdgeRefPendingCreate:
+                pending.append(s)
+                continue
+        else:
+            resolved = s
+        if self_id and resolved == self_id:
+            skipped.append(s)
             continue
-        if s in seen:
+        if resolved in seen:
             continue
-        seen.add(s)
-        desired.append(s)
-    return desired, unresolved
+        seen.add(resolved)
+        desired.append(resolved)
+    return desired, skipped, pending
 
 
 # Edge failures are per-edge and easy to lose: a 13-card board can emit 13
@@ -2317,6 +2405,32 @@ def _warn_edge_removal(kind: str, task_id: str, rem: list[str], dry_run: bool) -
     )
 
 
+def _handle_pending_edge_refs(
+    field: str, pending: list[str], story: dict, dry_run: bool
+) -> None:
+    """A name pointing at a story this run will create.
+
+    Under ``--dry-run`` that is the expected state of a fresh board -- nothing
+    has been created, so nothing has an id -- and the right response is to say
+    the edge WOULD be applied, not to error. In a real run it should be
+    impossible, because the reconcile pass runs after creates; if it happens
+    anyway something is wrong and the story's edges must not be half-applied.
+    """
+    if not pending:
+        return
+    if dry_run:
+        for ref in pending:
+            log.info(
+                f"    [DRY RUN] {field}: '{ref}' resolves after it is created "
+                f"this run"
+            )
+        return
+    raise EdgeRefUnresolved(
+        f"{field}: {pending} still had no clickup_id after the create pass — "
+        f"refusing to apply a partial edge set for '{story.get('name', '?')}'"
+    )
+
+
 def _sync_dependencies(
     token: str,
     task_id: str,
@@ -2324,6 +2438,7 @@ def _sync_dependencies(
     story: dict,
     dry_run: bool = False,
     warn_on_remove: bool = False,
+    ref_ctx: Optional[dict] = None,
 ) -> bool:
     """Reconcile a task's waiting_on edges to match the story's ``depends_on``.
 
@@ -2333,9 +2448,12 @@ def _sync_dependencies(
     """
     if "depends_on" not in story:
         return False
-    desired_ids, unresolved = _resolve_dependency_ids(story.get("depends_on"), task_id)
-    for u in unresolved:
+    desired_ids, skipped, pending = _resolve_dependency_ids(
+        story.get("depends_on"), task_id, ref_ctx, "depends_on"
+    )
+    for u in skipped:
         log.warning(f"    Invalid depends_on target, skipping: '{u}'")
+    _handle_pending_edge_refs("depends_on", pending, story, dry_run)
     desired = set(desired_ids)
     current = _cu_waiting_on_ids(cu_task)
     add = sorted(desired - current)
@@ -2433,7 +2551,33 @@ def _cu_linked_ids(cu_task: dict) -> set[str]:
     return out
 
 
-def _build_declared_relations(data: dict) -> dict[str, set[str]]:
+def _resolve_edge_refs_lenient(
+    raw: Optional[list], ctx: Optional[dict], field: str
+) -> set[str]:
+    """Resolve a declared edge list to ids, dropping anything unresolvable.
+
+    For the auxiliary indexes only — the peer-relation union and the
+    both-edges-declared warning. Those are advisory, and the authoritative
+    complaint about a bad reference belongs to ``_sync_dependencies`` /
+    ``_sync_relations``, which raise. Raising here too would report the same
+    typo twice and let an index-building failure abort a whole run.
+    """
+    out: set[str] = set()
+    for x in raw or []:
+        ref = str(x).strip()
+        if not ref:
+            continue
+        if not ctx:
+            out.add(ref)
+            continue
+        try:
+            out.add(_resolve_edge_ref(ref, ctx, field))
+        except EdgeRefUnresolved:
+            continue
+    return out
+
+
+def _build_declared_relations(data: dict, ctx: Optional[dict] = None) -> dict[str, set[str]]:
     """Map each relation-managed story's ``clickup_id`` -> the ids it declares in
     ``related``. A story is relation-managed only with BOTH a ``clickup_id`` and a
     ``related`` key. Lets ``_sync_relations`` preserve a symmetric link declared by
@@ -2446,11 +2590,11 @@ def _build_declared_relations(data: dict) -> dict[str, set[str]]:
             cid = story.get("clickup_id")
             if not cid or "related" not in story:
                 continue
-            ids = {
-                str(x).strip()
-                for x in (story.get("related") or [])
-                if str(x).strip()
-            }
+            # Resolved, because `related` may name stories: comparing a name
+            # against an id would silently stop matching, and the peer-union
+            # semantics this index exists for would quietly revert to
+            # this-side-authoritative — bringing back the oscillation footgun.
+            ids = _resolve_edge_refs_lenient(story.get("related"), ctx, "related")
             ids.discard(str(cid))
             declared[str(cid)] = ids
     return declared
@@ -2464,6 +2608,7 @@ def _sync_relations(
     dry_run: bool = False,
     warn_on_remove: bool = False,
     peer_declared: Optional[dict[str, set[str]]] = None,
+    ref_ctx: Optional[dict] = None,
 ) -> bool:
     """Reconcile a task's links to match the story's ``related`` list.
 
@@ -2482,9 +2627,12 @@ def _sync_relations(
     if "related" not in story:
         return False
     # Same normalizer as depends_on: drops blanks, dedups, refuses self-link.
-    desired_ids, unresolved = _resolve_dependency_ids(story.get("related"), task_id)
-    for u in unresolved:
+    desired_ids, skipped, pending = _resolve_dependency_ids(
+        story.get("related"), task_id, ref_ctx, "related"
+    )
+    for u in skipped:
         log.warning(f"    Invalid related target, skipping: '{u}'")
+    _handle_pending_edge_refs("related", pending, story, dry_run)
     desired = set(desired_ids)
     current = _cu_linked_ids(cu_task)
     add = sorted(desired - current)
@@ -2843,12 +2991,16 @@ def _pull_parent(story: dict, cu_task: dict, parent_ctx: dict) -> bool:
     return True
 
 
-def _declared_edge_ids(story: dict, key: str) -> set[str]:
-    """The non-blank ids a story declares under ``key`` (``depends_on``/``related``)."""
-    return {str(x).strip() for x in (story.get(key) or []) if str(x).strip()}
+def _declared_edge_ids(story: dict, key: str, ctx: Optional[dict] = None) -> set[str]:
+    """The ids a story declares under ``key`` (``depends_on``/``related``),
+    resolving story names when ``ctx`` is given — otherwise a name on one side
+    and an id on the other would not be recognised as the same target."""
+    return _resolve_edge_refs_lenient(story.get(key), ctx, key)
 
 
-def _warn_edge_target_overlap(story: dict, task_id: str) -> None:
+def _warn_edge_target_overlap(
+    story: dict, task_id: str, ctx: Optional[dict] = None
+) -> None:
     """Flag a target declared as BOTH a dependency and a relation.
 
     ClickUp permits both edges on one pair and we apply exactly what the YAML
@@ -2858,7 +3010,8 @@ def _warn_edge_target_overlap(story: dict, task_id: str) -> None:
     have to be found and cleaned up separately.
     """
     both = sorted(
-        _declared_edge_ids(story, "depends_on") & _declared_edge_ids(story, "related")
+        _declared_edge_ids(story, "depends_on", ctx)
+        & _declared_edge_ids(story, "related", ctx)
     )
     if not both:
         return
@@ -2887,8 +3040,12 @@ def _preview_pending_create_edges(
     cu_task = {
         "id": PENDING_CREATE_ID, "dependencies": [], "linked_tasks": [], "parent": None,
     }
-    _sync_dependencies(token, PENDING_CREATE_ID, cu_task, story, dry_run=True)
-    _sync_relations(token, PENDING_CREATE_ID, cu_task, story, dry_run=True)
+    _sync_dependencies(
+        token, PENDING_CREATE_ID, cu_task, story, dry_run=True, ref_ctx=parent_ctx
+    )
+    _sync_relations(
+        token, PENDING_CREATE_ID, cu_task, story, dry_run=True, ref_ctx=parent_ctx
+    )
     if "parent" in story:
         try:
             _sync_parent(
@@ -2932,11 +3089,12 @@ def _reconcile_edges_pass(
     deletions — push leaves it False (authoritative overwrite is its contract);
     sync/merge pass True so a destructive removal is never silent.
     """
-    declared_related = _build_declared_relations(data)
-    # Built once: `parent` references stories by NAME, so resolution needs the
-    # whole-file view (and the ids the create pass just wrote back). cu_by_id
-    # makes the same-list check free for any parent already fetched.
+    # Built FIRST, and shared by `parent`, `depends_on` and `related` — all three
+    # reference stories by NAME, so resolution needs the whole-file view (and
+    # the ids the create pass just wrote back). cu_by_id makes the same-list
+    # check free for any parent already fetched.
     parent_ctx = _build_parent_context(data, cu_by_id)
+    declared_related = _build_declared_relations(data, parent_ctx)
     for epic in data["epics"]:
         for story in epic.get("stories", []):
             cid = story.get("clickup_id")
@@ -2946,7 +3104,7 @@ def _reconcile_edges_pass(
                 and "parent" not in story
             ):
                 continue
-            _warn_edge_target_overlap(story, cid or PENDING_CREATE_ID)
+            _warn_edge_target_overlap(story, cid or PENDING_CREATE_ID, parent_ctx)
             if not cid:
                 # No id yet. In a real run the create pass has already written
                 # one back, so this is the dry-run case: preview the edges
@@ -2961,6 +3119,7 @@ def _reconcile_edges_pass(
                 _sync_dependencies(
                     token, cid, cu_task, story,
                     dry_run=dry_run, warn_on_remove=warn_on_remove,
+                    ref_ctx=parent_ctx,
                 )
             except Exception as e:
                 log.error(
@@ -2972,6 +3131,7 @@ def _reconcile_edges_pass(
                     token, cid, cu_task, story,
                     dry_run=dry_run, warn_on_remove=warn_on_remove,
                     peer_declared=declared_related,
+                    ref_ctx=parent_ctx,
                 )
             except Exception as e:
                 log.error(
