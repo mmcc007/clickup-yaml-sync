@@ -30,3 +30,24 @@ jobs:
           CLICKUP_API_TOKEN: pk_ci_fake_token
           OPENAI_API_KEY: sk_ci_fake_key
         run: python -m pytest tests -q
+
+  # The lock hooks are Node, and they are the reason this job exists: they lived
+  # outside any CI for their whole life, which is how one kept a hardcoded path
+  # long after a second project needed it. Being unreachable by the CI of the
+  # thing they guard was the cause, not the symptom.
+  hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax-check the hooks
+        run: |
+          node --check hooks/pre-edit-diamond-lock.js
+          node --check hooks/stop-diamond-lock-release.js
+
+      - name: Run the lock-hook tests
+        run: node tests/hooks/diamond-lock.test.js

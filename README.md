@@ -446,6 +446,35 @@ nothing for it.
 repo's `.gitignore`.** It is per-machine runtime state; committing it has already
 caused confusion elsewhere.
 
+### The hooks live here (`hooks/`)
+
+This repo ships the two Claude Code hooks that guard hand-edits to a task file:
+
+| file | hook | what it does |
+|---|---|---|
+| `hooks/pre-edit-diamond-lock.js` | `PreToolUse` (Edit/Write/MultiEdit) | blocks an edit to `project-tasks.yaml` while a *different* session holds a fresh lock; records each lock it claims in a per-session registry |
+| `hooks/stop-diamond-lock-release.js` | `Stop` | releases every lock that session claimed, so the files are free immediately instead of after the 5-minute TTL |
+
+Register them in `~/.claude/settings.json`:
+
+```json
+{ "type": "command",
+  "command": "node \"/path/to/clickup-yaml-sync/hooks/pre-edit-diamond-lock.js\"" }
+```
+
+**Why they are in this repo rather than alongside other hooks.** They encode *this
+tool's* file format (`project-tasks.yaml`) and *this tool's* lock protocol — the same
+path, the same JSON, the same TTL, the same identity. Living somewhere else meant they
+were versioned separately from the thing they guard and unreachable by its CI, and
+that is not a tidiness argument: it is why one of them kept a hardcoded path to a
+single project long after a second project had a task file, and why they ran for their
+whole life with **zero tests**. Both are fixed, and `tests/hooks/diamond-lock.test.js`
+runs in CI so they cannot drift from the tool again.
+
+"Diamond" in the filenames is EM Marketing's nickname for the **task file**. It has
+nothing to do with ClickUp milestone diamonds, which are a different thing and now
+appear on real boards.
+
 ### Interop with the Claude Code hook
 
 The file lock is deliberately the *same* lock the hook uses — same path, same JSON
