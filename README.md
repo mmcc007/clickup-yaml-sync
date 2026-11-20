@@ -224,6 +224,28 @@ suppression flag with no rationale tells the next reader nothing, and by the tim
 anyone asks, whoever set it has moved on. Accepted findings are still **counted** in
 the report, so suppressed is not the same as gone.
 
+## `local_only: true` — a card that stays in the file and never reaches the board
+
+Set `local_only: true` on a story to keep it in the task file only. Use it for internal
+work on a list the client can see: the card is tracked with the rest of the file, but no
+command ever creates, updates, archives, links or pulls it.
+
+```yaml
+- name: Internal metric audit
+  status: done
+  local_only: true
+```
+
+- **Skipped in every command.** The file is read with flagged stories lifted out, so no
+  code path can reach them. `sync --dry-run` prints `Skipped (local_only): '<name>'` for each.
+- **Written back untouched.** A save puts each flagged story back at its original position.
+  The 3-way base snapshot is written without them.
+- **Only the literal `true` counts.** Any other value leaves the card syncing normally.
+- **Not a privacy control.** The card is still in the file and in git. It only keeps it off ClickUp.
+- **Names pointing at it.** A `depends_on` or `related` entry that names a flagged story by
+  name resolves to nothing and is skipped with a warning, so do not link a synced card to one.
+- Removing the flag makes the next sync create the card.
+
 ## Story `notes:` — context that stays out of ClickUp
 
 A per-story field that lives in the YAML and **never reaches ClickUp**. Nothing

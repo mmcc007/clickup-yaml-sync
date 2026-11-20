@@ -327,6 +327,15 @@ properties:
                   Set this when a story belongs (visually) to one epic but
                   should be tagged as a different epic in Clarisse's field.
 
+              local_only:
+                type: boolean
+                description: >
+                  When true the story stays in this file only. Every command
+                  ignores it (never created, updated, archived or linked) and
+                  a save writes it back unchanged. For internal work that must
+                  not appear on a list the client can see.
+                default: false
+
               archived_in_clickup:
                 type: boolean
                 description: Set to true by pull command when task is deleted from ClickUp but remains in YAML
