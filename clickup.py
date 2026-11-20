@@ -431,25 +431,64 @@ class _VersionAction(argparse.Action):
 YAML_ONLY_STORY_FIELDS = ("notes",)
 
 
+# Stories flagged ``local_only: true`` are invisible to every command: they are
+# lifted out of the data at load time (so no walker can create, update, archive
+# or link them) and put back at their original position when the file is saved.
+# Keyed by absolute path so a save can only restore what its own load removed.
+_LOCAL_ONLY_STASH: dict[str, list[tuple[int, int, dict]]] = {}
+
+
+def _strip_local_only(data: dict) -> list[tuple[int, int, dict]]:
+    stash: list[tuple[int, int, dict]] = []
+    for ei, epic in enumerate(data.get("epics", [])):
+        stories = epic.get("stories") or []
+        before = len(stash)
+        for si, story in enumerate(stories):
+            if isinstance(story, dict) and story.get("local_only") is True:
+                stash.append((ei, si, story))
+        if len(stash) > before:
+            epic["stories"] = [
+                st for st in stories
+                if not (isinstance(st, dict) and st.get("local_only") is True)
+            ]
+    return stash
+
+
+def _restore_local_only(data: dict, stash: list[tuple[int, int, dict]]) -> dict:
+    data = copy.deepcopy(data)
+    for ei, si, story in stash:  # ascending, so original indexes line up
+        if ei < len(data["epics"]):
+            stories = data["epics"][ei].setdefault("stories", [])
+            stories.insert(min(si, len(stories)), copy.deepcopy(story))
+    return data
+
+
 def load_yaml(path: str) -> dict:
     with open(path, "r") as f:
         data = yaml.safe_load(f)
     if not data or "epics" not in data:
         log.error("Invalid YAML: missing 'epics' key")
         sys.exit(1)
+    stash = _strip_local_only(data)
+    _LOCAL_ONLY_STASH[os.path.abspath(path)] = stash
+    for _, _, story in stash:
+        log.info(f"  Skipped (local_only): '{story.get('name', '?')}'")
     return data
 
 
 def save_yaml(data: dict, path: str) -> None:
     data = copy.deepcopy(data)
     data["project"]["last_synced"] = datetime.now(timezone.utc).isoformat()
+    # The base snapshot below is written from `data` (local_only stories left
+    # out); the file on disk gets them back.
+    file_data = _restore_local_only(data, _LOCAL_ONLY_STASH.get(os.path.abspath(path), []))
     # Atomic: the task file is the source of truth for a whole project, and
     # push/sync flush it once per created task. A crash partway through a plain
     # truncate-and-write would leave it truncated.
     tmp = Path(path).with_suffix(Path(path).suffix + f".tmp{os.getpid()}")
     try:
         with open(tmp, "w") as f:
-            yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False, width=120)
+            yaml.dump(file_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False, width=120)
         os.replace(tmp, path)
     except Exception:
         try:

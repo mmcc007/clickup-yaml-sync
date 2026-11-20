@@ -4558,3 +4558,87 @@ class TestEdgeRefsInAuxiliaryIndexes:
         story = _story_with("D", clickup_id="T1", related=["No Such Story"])
         ctx = _edge_ctx(story)
         assert clickup._declared_edge_ids(story, "related", ctx) == set()
+
+
+# ---------------------------------------------------------------------------
+# local_only: a story that stays in the file and never reaches the board
+# ---------------------------------------------------------------------------
+
+
+class TestLocalOnly:
+    def _write(self, tmp_path, stories_a, stories_b=None):
+        data = _data_with({"A": stories_a, "B": stories_b or [_story_with("b1")]})
+        path = tmp_path / "tasks.yaml"
+        path.write_text(yaml.safe_dump(data, sort_keys=False))
+        return str(path)
+
+    def test_load_lifts_flagged_story_out(self, tmp_path):
+        path = self._write(tmp_path, [
+            _story_with("keep1"),
+            _story_with("internal", local_only=True),
+            _story_with("keep2"),
+        ])
+        data = clickup.load_yaml(path)
+        names = [s["name"] for s in data["epics"][0]["stories"]]
+        assert names == ["keep1", "keep2"]
+
+    def test_only_literal_true_counts(self, tmp_path):
+        path = self._write(tmp_path, [
+            _story_with("a", local_only=False),
+            _story_with("b", local_only="yes"),
+            _story_with("c"),
+        ])
+        data = clickup.load_yaml(path)
+        assert [s["name"] for s in data["epics"][0]["stories"]] == ["a", "b", "c"]
+
+    def test_save_puts_flagged_story_back_in_place(self, tmp_path):
+        path = self._write(tmp_path, [
+            _story_with("keep1"),
+            _story_with("internal", local_only=True, description="note"),
+            _story_with("keep2"),
+        ])
+        data = clickup.load_yaml(path)
+        data["epics"][0]["stories"][0]["clickup_id"] = "abc123"
+        clickup.save_yaml(data, path)
+        saved = yaml.safe_load(open(path))
+        stories = saved["epics"][0]["stories"]
+        assert [s["name"] for s in stories] == ["keep1", "internal", "keep2"]
+        assert stories[1]["local_only"] is True
+        assert stories[1]["description"] == "note"
+        assert stories[0]["clickup_id"] == "abc123"
+
+    def test_flagged_story_absent_from_base_snapshot(self, tmp_path):
+        path = self._write(tmp_path, [
+            _story_with("keep1", clickup_id="t1"),
+            _story_with("internal", local_only=True, clickup_id="t2"),
+        ])
+        data = clickup.load_yaml(path)
+        clickup.save_yaml(data, path)
+        base = clickup.load_base_snapshot(clickup.base_snapshot_path(path, "999999"))
+        assert "t1" in base
+        assert "t2" not in base
+
+    def _dry_sync(self, path):
+        data = clickup.load_yaml(path)
+        with mock.patch.object(clickup, "get_clickup_token", return_value="tok"), \
+             mock.patch.object(clickup, "clickup_list_tasks", return_value=[]), \
+             mock.patch.object(clickup, "clickup_get_list_members", return_value=[]):
+            return clickup.cmd_sync(data, path, dry_run=True)
+
+    def test_dry_sync_does_not_create_flagged_story(self, tmp_path):
+        path = self._write(tmp_path, [
+            _story_with("normal"),
+            _story_with("internal", local_only=True),
+        ])
+        stats = self._dry_sync(path)
+        # Positive control: the unflagged story is counted as a create, so a
+        # zero here for the flagged one is the flag working, not a dead path.
+        assert stats["created_in_clickup"] == 2  # normal + B's b1
+
+    def test_unflagged_story_is_created(self, tmp_path):
+        path = self._write(tmp_path, [
+            _story_with("normal"),
+            _story_with("internal"),
+        ])
+        stats = self._dry_sync(path)
+        assert stats["created_in_clickup"] == 3  # normal + internal + b1
